@@ -1,0 +1,18 @@
+[package]
+name = "miniagent-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miniagent-core = { path = "../core" }
+miniagent-provider = { path = "../provider" }
+miniagent-tool = { path = "../tool" }
+miniagent-memory = { path = "../memory" }
+miniagent-checkpoint = { path = "../checkpoint" }
+miniagent-self-improve = { path = "../self-improve" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

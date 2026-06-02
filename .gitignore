@@ -1,0 +1,13 @@
+/target/
+.env
+**/*.rs.bk
+.DS_Store
+result/
+miniagent_audit/
+miniagent_debate/
+miniagent_workflow/
+miniagent_context/
+.claude/
+*.py
+scripts/
+*_key_findings.md

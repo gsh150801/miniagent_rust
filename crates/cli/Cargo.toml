@@ -1,0 +1,32 @@
+[package]
+name = "miniagent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "miniagent"
+path = "src/main.rs"
+
+[dependencies]
+miniagent-core = { path = "../core" }
+miniagent-provider = { path = "../provider" }
+miniagent-agent = { path = "../agent" }
+miniagent-tool = { path = "../tool" }
+miniagent-memory = { path = "../memory" }
+miniagent-checkpoint = { path = "../checkpoint" }
+miniagent-workflow = { path = "../workflow" }
+miniagent-kg = { path = "../kg" }
+miniagent-hypothesis = { path = "../hypothesis" }
+miniagent-self-improve = { path = "../self-improve" }
+miniagent-telemetry = { path = "../telemetry" }
+miniagent-skill = { path = "../skill" }
+miniagent-planning = { path = "../planning" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util.workspace = true
+serde_json.workspace = true
+dotenvy.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
