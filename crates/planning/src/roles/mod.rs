@@ -265,10 +265,45 @@ pub fn parse_llm_json(text: &str) -> Result<serde_json::Value, String> {
         return Err("LLM returned empty response".into());
     }
 
-    serde_json::from_str(json_str).map_err(|e| {
-        // Try to extract a useful snippet for debugging
+    // Try direct parse first
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+        return Ok(v);
+    }
+
+    // Try to fix truncated JSON: close open strings and braces
+    let mut fixed = json_str.to_string();
+
+    // Count unclosed braces/brackets
+    let mut open_curly = 0i32;
+    let mut open_square = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for ch in fixed.chars() {
+        if escape_next { escape_next = false; continue; }
+        if ch == '\\' { escape_next = true; continue; }
+        if ch == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        match ch {
+            '{' => open_curly += 1,
+            '}' => open_curly -= 1,
+            '[' => open_square += 1,
+            ']' => open_square -= 1,
+            _ => {}
+        }
+    }
+
+    // Close truncated string
+    if in_string {
+        fixed.push('"');
+    }
+
+    // Close open brackets and braces
+    for _ in 0..open_square.max(0) { fixed.push(']'); }
+    for _ in 0..open_curly.max(0) { fixed.push('}'); }
+
+    serde_json::from_str(&fixed).map_err(|e| {
         let snippet: String = json_str.chars().take(200).collect();
-        format!("JSON parse error: {e}. Response starts with: {snippet}")
+        format!("[ERROR] JSON parse error: {e}. Response starts with: {snippet}")
     })
 }
 

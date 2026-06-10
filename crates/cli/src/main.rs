@@ -688,7 +688,8 @@ async fn run_command(
             };
 
             if let Some(content) = final_content {
-                let filepath = task_dir.join("output.md");
+                let output_filename = format!("{}.md", task_brief);
+                let filepath = task_dir.join(&output_filename);
                 match std::fs::write(&filepath, &content) {
                     Ok(_) => eprintln!("\n📄 Final output: {}", filepath.display()),
                     Err(e) => eprintln!("\n\x1b[33mWarning: Could not write output file: {e}\x1b[0m"),
@@ -845,12 +846,25 @@ fn demo_self_improve() {
     println!("   Retrieval: {:?}", decision.retrieval_depth);
     println!("   Stats: {} entries after {} steps", improver.q_router.stats().total_entries, improver.q_router.stats().total_steps);
 
-    // Simulate learning
+    // Simulate learning with reward feedback
     for i in 0..50 {
         let s = improver.decide_routing(i % 10, 100 - i);
-        let _d = improver.q_router.decide(&s);
+        let d = improver.q_router.decide(&s);
+        // Simulate reward: flash gets higher reward for simple tasks, pro for complex
+        let reward = match d.model {
+            miniagent_self_improve::online::q_router::RouterAction::UseFlash if s.complexity_level < 5 => 1.0,
+            miniagent_self_improve::online::q_router::RouterAction::UsePro if s.complexity_level >= 5 => 1.0,
+            _ => 0.2,
+        };
+        let next_s = improver.decide_routing((i + 1) % 10, 100 - i - 1);
+        improver.q_router.update(&s, d.model, reward, &next_s);
+        improver.q_router.decay_exploration();
     }
-    println!("   After 50 iterations: {} Q-table entries", improver.q_router.stats().total_entries);
+    println!("   After 50 iterations: {} Q-table entries, {} steps, epsilon={:.3}",
+        improver.q_router.stats().total_entries,
+        improver.q_router.stats().total_steps,
+        improver.q_router.stats().epsilon,
+    );
 
     // 2. Experience Graph
     println!("\n2. Experience Graph:");

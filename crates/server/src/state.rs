@@ -27,6 +27,9 @@ pub struct TaskInfo {
     pub created_at: String,
     pub result_dir: PathBuf,
     pub files: Vec<String>,
+    /// AI response text (stored for history replay)
+    #[serde(default)]
+    pub response: String,
 }
 
 impl AppState {

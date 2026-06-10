@@ -172,17 +172,62 @@ impl StageHandler for AgentStage {
                         .unwrap_or_default()
                 };
 
-                // Also collect tool results from history
+                // Build structured tool call info by pairing ToolUse blocks with Tool results
+                let mut tool_call_map: std::collections::HashMap<String, (String, serde_json::Value)> = std::collections::HashMap::new();
+                for msg in &history {
+                    if msg.role == miniagent_core::message::MessageRole::Assistant {
+                        for block in &msg.content {
+                            if let miniagent_core::event::ContentBlock::ToolUse { id, name, input } = block {
+                                tool_call_map.insert(format!("{}", id.0), (name.clone(), input.clone()));
+                            }
+                        }
+                    }
+                }
+
                 let tool_results: Vec<String> = history.iter()
                     .filter(|m| m.role == miniagent_core::message::MessageRole::Tool)
                     .map(|m| m.text_content())
                     .collect();
+
+                // Build per-tool structured entries
+                let tool_entries: Vec<serde_json::Value> = tool_results.iter().map(|r| {
+                    // Parse "[toolu_vrtx_{id}] {content}" format
+                    let (call_id, content) = if let Some(idx) = r.find("] ") {
+                        let id_part = &r[1..idx]; // skip '['
+                        let content = &r[idx + 2..];
+                        (id_part.trim_start_matches("toolu_vrtx_").to_string(), content.to_string())
+                    } else {
+                        (String::new(), r.clone())
+                    };
+                    let (name, input) = tool_call_map.get(&call_id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), serde_json::Value::Null));
+                    let input_preview = match &input {
+                        serde_json::Value::String(s) => s.chars().take(200).collect(),
+                        serde_json::Value::Object(m) => {
+                            let pairs: Vec<String> = m.iter()
+                                .take(5)
+                                .map(|(k,v)| format!("{}: {}", k, v))
+                                .collect();
+                            pairs.join(", ")
+                        }
+                        other => format!("{:.200}", other),
+                    };
+                    let result_preview: String = content.chars().take(300).collect();
+                    serde_json::json!({
+                        "name": name,
+                        "input_preview": input_preview,
+                        "result_preview": result_preview,
+                        "is_error": content.contains("Error:") || content.contains("error:"),
+                    })
+                }).collect();
 
                 // Persist full output to disk so downstream stages get complete context
                 let output_data = serde_json::json!({
                     "response": text,
                     "tool_calls": tool_results.len(),
                     "tool_results": tool_results,
+                    "tool_entries": tool_entries,
                     "tokens_in": delta.usage.input_tokens,
                     "tokens_out": delta.usage.output_tokens,
                     "stop_reason": format!("{:?}", delta.stop_reason),

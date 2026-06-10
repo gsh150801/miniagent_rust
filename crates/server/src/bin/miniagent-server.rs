@@ -33,7 +33,7 @@ async fn main() {
 
     let config = ServerConfig {
         host: "0.0.0.0".into(),
-        port: 3000,
+        port: 3002,
         agent,
         memory: None,
         checkpoint_store: None,

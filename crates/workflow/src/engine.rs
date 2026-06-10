@@ -116,6 +116,107 @@ impl Workflow {
         Ok(order)
     }
 
+    /// Run the workflow with a sync callback invoked before and after each stage.
+    pub async fn run_with_progress<F>(
+        &self,
+        checkpoint_store: Option<&CheckpointStore>,
+        cancel: CancellationToken,
+        mut on_progress: F,
+    ) -> Result<WorkflowResult, AgentError>
+    where
+        F: FnMut(&str, &str, Option<&serde_json::Value>) + Send,
+    {
+        let order = self
+            .topological_order()
+            .map_err(AgentError::invalid_config)?;
+
+        let run_id = RunId::new();
+        let mut outputs: HashMap<StageId, StageOutput> = HashMap::new();
+        let mut step_count = 0;
+
+        for &stage_idx in &order {
+            let stage = &self.stages[stage_idx];
+
+            on_progress(&stage.name, "running", None);
+
+            let mut previous_outputs: HashMap<StageId, serde_json::Value> = stage
+                .depends_on
+                .iter()
+                .filter_map(|dep_id| {
+                    outputs.get(dep_id).map(|o| (*dep_id, o.data.clone()))
+                })
+                .collect();
+
+            for (from, to) in &self.edges {
+                if *to == stage.id
+                    && let Some(output) = outputs.get(from) {
+                        previous_outputs.insert(*from, output.data.clone());
+                    }
+            }
+
+            let stage_input = if stage.depends_on.is_empty() && self.edges.iter().all(|(_, to)| *to != stage.id) {
+                self.initial_input.clone()
+            } else {
+                // Pass task_dir to non-root stages so they write to the correct directory
+                let mut input = serde_json::Value::Null;
+                if let Some(task_dir) = self.initial_input.get("task_dir").and_then(|v| v.as_str()) {
+                    input = serde_json::json!({ "task_dir": task_dir });
+                }
+                input
+            };
+
+            let ctx = StageContext {
+                stage_id: stage.id,
+                input: stage_input,
+                previous_outputs,
+            };
+
+            let handler = stage.handler.clone();
+            let result = self.execute_stage_with_retry(&handler, &ctx, &self.retry_policy).await;
+
+            match result {
+                Ok(output) => {
+                    let data = output.data.clone();
+                    outputs.insert(stage.id, output);
+                    on_progress(&stage.name, "completed", Some(&data));
+                }
+                Err(e) => {
+                    on_progress(&stage.name, "failed", None);
+                    return Err(e);
+                }
+            }
+
+            step_count += 1;
+
+            if step_count % self.checkpoint_interval == 0
+                && let (Some(store), Some(pid)) = (checkpoint_store, self.project_id) {
+                    let ckpt = Checkpoint::new(
+                        run_id,
+                        StepId::new(),
+                        step_count,
+                        vec![],
+                    )
+                    .with_project(pid)
+                    .with_progress(serde_json::json!({
+                        "completed_stages": step_count,
+                        "total_stages": order.len(),
+                        "last_stage": stage.name,
+                    }));
+                    let _ = store.save(&ckpt);
+                }
+
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+        }
+
+        Ok(WorkflowResult {
+            run_id,
+            stage_outputs: outputs,
+            total_stages: order.len(),
+        })
+    }
+
     /// Run the workflow
     pub async fn run(
         &self,
@@ -154,7 +255,12 @@ impl Workflow {
             let stage_input = if stage.depends_on.is_empty() && self.edges.iter().all(|(_, to)| *to != stage.id) {
                 self.initial_input.clone()
             } else {
-                serde_json::Value::Null
+                // Pass task_dir to non-root stages so they write to the correct directory
+                let mut input = serde_json::Value::Null;
+                if let Some(task_dir) = self.initial_input.get("task_dir").and_then(|v| v.as_str()) {
+                    input = serde_json::json!({ "task_dir": task_dir });
+                }
+                input
             };
 
             let ctx = StageContext {

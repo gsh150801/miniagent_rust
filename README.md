@@ -6,7 +6,7 @@
 ## 核心能力 / Core Capabilities
 
 - **动态工作流规划 / Dynamic Workflow Planning**: LLM 分析用户意图 → 自动规划多阶段工作流 (研究→批判→综合) → DAG 并行执行
-- **Web UI**: 内嵌 ChatGPT 风格界面，WebSocket 流式输出，文件上传/下载
+- **Web UI**: ChatGPT 风格界面，实时显示工作流规划、逐条工具调用详情、流式输出；文件上传解析 (CSV/TSV/MD/TXT)、结果下载、任务搜索/删除
 - **文献综述 / Literature Review**: 搜索 PubMed 等数据库 → 抓取摘要 → 知识图谱构建 → 链路预测 → 假设生成
 - **知识图谱 / Knowledge Graph**: LLM 实体关系抽取 → TransE 嵌入 → 混合评分链路预测 → GIVE 可信度外推
 - **假设生成 / Hypothesis Generation**: 图谱候选 → DeepSeek Pro 深度推理验证 → 机制解释 + 实验设计 → 多维排序
@@ -40,12 +40,12 @@
 | 层 Layer | Crate | 用途 Purpose |
 |----------|-------|-------------|
 | 基础 Foundation | `core` | 共享类型、预算、事件、错误 |
-| LLM | `provider` | DeepSeek Flash/Pro + 深度推理 + 多供应商路由 |
+| LLM | `provider` | DeepSeek Flash/Pro + 深度推理 + 流式输出 + 多供应商路由 |
 | 运行时 Runtime | `agent` | 无状态 Agent Loop + 工具循环 + 历史压缩 |
 | 工具 Tools | `tool` | 9 个内置工具 (read/write/edit/glob/grep/bash/fetch/search/pubmed) + 多后端搜索回退 |
 | 记忆 Memory | `memory` | 4 层: L0 工作 → L1 情景 (SQLite FTS5) → L2 语义 (向量) → L3 技能 |
 | 持久化 Persistence | `checkpoint` | SQLite 检查点 + 恢复 |
-| 工作流 Workflow | `workflow` | DAG 引擎 + 动态规划器 + 6 Stage + 重试 + Mermaid 可视化 |
+| 工作流 Workflow | `workflow` | DAG 引擎 + 动态规划器 + 6 Stage + 重试 + Mermaid 可视化 + 进度回调 |
 | 规划 Planning | `planning` | 任务分解 + 角色 + 黑板 + Hook + StateGraph + 控制壳 |
 | 知识图谱 KG | `kg` | 实体抽取、TransE/RotatE 嵌入、GIVE 链路预测 |
 | 假设 Hypothesis | `hypothesis` | LLM 验证假设 + 实验设计 |
@@ -54,7 +54,7 @@
 | Python | `python` | PyO3 科学计算桥接 (接口占位) |
 | 沙箱 Sandbox | `sandbox` | WASM 沙箱 deny-by-default (接口占位) |
 | 遥测 Telemetry | `telemetry` | 结构化 JSON 日志、原子指标计数器 |
-| 服务 Server | `server` | axum REST API + WebSocket + 内嵌前端 |
+| 服务 Server | `server` | axum 0.8 REST API + WebSocket 流式 + 内嵌前端 (单文件 HTML) |
 | CLI | `cli` | 所有命令入口 |
 
 ## 快速开始 / Quick Start
@@ -67,7 +67,7 @@
 ### 安装 / Setup
 
 ```bash
-git clone <repo>
+git clone https://github.com/gsh150801/miniagent_rust.git
 cd miniagent_rust
 
 # 配置 API 密钥
@@ -85,7 +85,13 @@ cargo run -p miniagent-server
 # 浏览器打开 http://localhost:3000
 ```
 
-功能：WebSocket 流式输出、文件上传/解析、结果文件下载、任务历史管理。
+Web UI 功能：
+- **工作流规划可视化**: 自动显示 LLM 规划的阶段流程图 (handler 类型 + 模型层级)
+- **实时执行追踪**: 每个 Stage 的状态实时更新；工具调用逐条独立展示 (工具名、参数、结果预览)
+- **流式输出**: WebSocket 逐 token 输出最终报告，支持 Markdown 渲染
+- **文件上传**: 拖拽或点击上传，支持 .txt / .md / .csv / .tsv / .json / .py 等格式 (CSV/TSV 自动转为表格)
+- **结果下载**: 任务完成后一键下载 .md / .json 等结果文件
+- **任务管理**: 历史任务列表 + 搜索 + 删除，结果按内容自动命名
 
 ### CLI 使用 / CLI Usage
 
@@ -125,6 +131,32 @@ miniagent metrics
 miniagent config
 ```
 
+## Web UI 技术细节 / Web UI Details
+
+```
+浏览器 ←→ WebSocket (/ws/chat) ←→ Server
+  ↕                                    ↕
+上传文件  POST /api/upload        PlannerStage → WorkflowBuilder → Workflow.run()
+下载结果  GET /api/download/{id}/{file}
+```
+
+| 路由 Route | 方法 Method | 用途 Purpose |
+|------------|------------|-------------|
+| `/` | GET | 内嵌前端页面 |
+| `/ws/chat` | WebSocket | 流式对话 + 进度推送 |
+| `/api/upload` | POST | 文件上传 (multipart) |
+| `/api/tasks` | GET | 任务列表 |
+| `/api/tasks/{id}` | GET / DELETE | 查看/删除任务 |
+| `/api/download/{id}/{file}` | GET | 下载结果文件 |
+| `/api/health` | GET | 健康检查 |
+
+WebSocket 消息流：
+1. 客户端发送 `{"type": "run", "prompt": "...", "files": [...]}`
+2. 服务端 LLM 规划工作流 → 推送 `plan` 消息 (含阶段列表)
+3. 每个 Stage 执行 → 推送 `progress` (状态) + `stage_output` (工具调用详情)
+4. 最终 Stage 流式输出 → 推送 `stream` (逐 token)
+5. 完成后推送 `complete` + 结果文件列表
+
 ## 动态工作流规划 / Dynamic Workflow Planning
 
 用户输入不匹配任何预设模板时，系统自动调用 LLM 分析任务并生成自定义工作流：
@@ -138,7 +170,9 @@ WorkflowSpec JSON (自定义阶段 + 边)
     ↓
 WorkflowBuilder → DAG
     ↓
-Workflow.run() → 结果
+Workflow.run_with_progress() → 实时进度回调 → WebSocket 推送
+    ↓
+结果
 ```
 
 内置工作流模板（由 LLM 参考，非关键词匹配）：
@@ -245,11 +279,10 @@ miniagent/
 │   ├── python/          # Python 桥接 / Bridge
 │   ├── sandbox/         # WASM 沙箱 / Sandbox
 │   ├── telemetry/       # 可观测性 / Observability
-│   ├── server/          # Web 服务器 + 前端 / Server + Frontend
+│   ├── server/          # Web 服务器 + 内嵌前端 / Server + Frontend
 │   └── cli/             # CLI 入口 / Entry Point
 ├── skills/              # 142 技能定义 / Skill Definitions
 ├── docs/                # 设计文档 / Design Docs
-├── scripts/             # 迁移脚本 / Migration Scripts
 └── .env.example         # 配置模板 / Config Template
 ```
 

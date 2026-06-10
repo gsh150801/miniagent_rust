@@ -537,6 +537,11 @@ impl CompiledGraph {
     ) -> String {
         let mut context = String::new();
 
+        // 0. Original user task/query
+        if let Some(user_msg) = state.messages.first() {
+            context.push_str(&format!("## Task\n{}\n\n", user_msg.content));
+        }
+
         // 1. Todo attention anchor (refreshed every iteration)
         context.push_str(&todo.refresh());
         context.push_str("\n\n");
@@ -561,9 +566,13 @@ impl CompiledGraph {
 
             // Last 3 outputs: include content (bounded)
             for (name, content) in outputs.iter().rev().take(3) {
-                let content: &str = content.as_str();
                 let truncated: String = if content.len() > 500 {
-                    format!("{}...(see {name}/last_output.json)", &content[..500])
+                    let safe_end = content.char_indices()
+                        .take_while(|(i, _)| *i < 500)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    format!("{}...(see {name}/last_output.json)", &content[..safe_end])
                 } else {
                     content.to_string()
                 };

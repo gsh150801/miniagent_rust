@@ -1,16 +1,18 @@
 use std::collections::HashMap;
+use std::path::Path as StdPath;
 
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
     http::{StatusCode, header},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use miniagent_agent::context::RunContext;
-use miniagent_core::config::TaskComplexity;
+use miniagent_core::config::{InferenceConfig, TaskComplexity};
 use miniagent_core::message::Message as AgentMessage;
 use miniagent_provider::deepseek::DeepSeekFlash;
+use miniagent_provider::traits::{CompletionRequest, LlmProvider, StreamChunk};
 use miniagent_core::types::StageId;
 use miniagent_workflow::builder::{WorkflowBuilder, WorkflowSpec};
 use miniagent_workflow::stage::{StageContext, StageHandler as _};
@@ -34,7 +36,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/upload", post(upload_handler))
         .route("/api/tasks", get(tasks_handler))
         .route("/api/download/{task_id}/{filename}", get(download_handler))
-        .route("/api/tasks/{task_id}", delete(delete_task_handler))
+        .route("/api/tasks/{task_id}", get(get_task_handler).delete(delete_task_handler))
         // Keep legacy routes
         .route("/api/health", get(health_handler))
         .route("/api/metrics", get(metrics_handler))
@@ -141,11 +143,20 @@ async fn tasks_handler(State(state): State<AppState>) -> Json<serde_json::Value>
     Json(serde_json::Value::Object(map))
 }
 
+async fn get_task_handler(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<TaskInfo>, StatusCode> {
+    let task = state.tasks.get(&task_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(task.value().clone()))
+}
+
 async fn delete_task_handler(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> StatusCode {
-    if state.tasks.remove(&task_id).is_some() {
+    if let Some((_, info)) = state.tasks.remove(&task_id) {
+        let _ = std::fs::remove_dir_all(&info.result_dir);
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -217,17 +228,18 @@ async fn upload_handler(
         })?;
 
         let id = Uuid::new_v4().to_string()[..8].to_string();
-        let path = upload_dir.join(&id);
 
-        std::fs::write(&path, &data).map_err(|e| {
+        // Save original filename as metadata
+        let meta_path = upload_dir.join(format!("{id}.meta"));
+        let _ = std::fs::write(&meta_path, &name);
+
+        // Save raw bytes
+        std::fs::write(upload_dir.join(&id), &data).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: format!("Write error: {e}") }),
             )
         })?;
-
-        // Also save with original name for reference
-        let _ = std::fs::write(upload_dir.join(format!("{id}_{}", name)), &data);
 
         files.push(FileInfo {
             id: id.clone(),
@@ -256,12 +268,33 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                     "run" => {
                         handle_run(&mut socket, &state, req.prompt, req.files).await;
                     }
+                    "get_task" => {
+                        if let Some(task) = state.tasks.get(&req.task_id) {
+                            let _ = ws_send(&mut socket, serde_json::json!({
+                                "type": "task_messages",
+                                "task_id": req.task_id,
+                                "prompt": task.prompt,
+                                "response": task.response,
+                                "status": task.status,
+                                "files": task.files,
+                            }))
+                            .await;
+                        }
+                    }
                     "list_tasks" => {
                         let mut tasks = serde_json::Map::new();
                         for entry in state.tasks.iter() {
+                            // Send summary only (no response text) to keep message small
                             tasks.insert(
                                 entry.key().clone(),
-                                serde_json::to_value(entry.value()).unwrap_or_default(),
+                                serde_json::json!({
+                                    "id": entry.value().id,
+                                    "brief": entry.value().brief,
+                                    "prompt": entry.value().prompt,
+                                    "status": entry.value().status,
+                                    "created_at": entry.value().created_at,
+                                    "files": entry.value().files,
+                                }),
                             );
                         }
                         let _ = ws_send(&mut socket, serde_json::json!({
@@ -284,6 +317,8 @@ struct WsRequest {
     prompt: String,
     #[serde(default)]
     files: Vec<String>,
+    #[serde(default)]
+    task_id: String,
 }
 
 async fn handle_run(
@@ -303,19 +338,16 @@ async fn handle_run(
     let task_dir_name = format!("{}_{}", task_id, task_brief);
     let task_dir = state.task_dir.join(&task_dir_name);
     let task_workflow_dir = task_dir.join(".workflow");
+    // Clean task-specific workflow dir to prevent stale data from previous runs
+    let _ = std::fs::remove_dir_all(&task_workflow_dir);
     let _ = std::fs::create_dir_all(&task_workflow_dir);
+    // Also clean the shared workflow dir (legacy fallback) to prevent cross-task contamination
+    let shared_wf = state.task_dir.join(".workflow");
+    let _ = std::fs::remove_dir_all(&shared_wf);
+    let _ = std::fs::create_dir_all(&shared_wf);
 
-    // Read uploaded files and append content to prompt
-    let mut enriched_prompt = prompt.clone();
-    if !file_ids.is_empty() {
-        let upload_dir = state.task_dir.join("_uploads");
-        for fid in &file_ids {
-            let path = upload_dir.join(fid);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                enriched_prompt.push_str(&format!("\n\n--- Attached file ({fid}) ---\n{content}\n--- End file ---"));
-            }
-        }
-    }
+    // Read and parse uploaded files
+    let enriched_prompt = enrich_prompt_with_files(&prompt, &file_ids, &state.task_dir);
 
     // Register task
     let task_info = TaskInfo {
@@ -326,6 +358,7 @@ async fn handle_run(
         created_at: chrono::Utc::now().to_rfc3339(),
         result_dir: task_dir.clone(),
         files: vec![],
+        response: String::new(),
     };
     state.tasks.insert(task_id.clone(), task_info);
 
@@ -396,124 +429,530 @@ async fn handle_run(
 
     let cancel = CancellationToken::new();
 
-    // Send progress for each stage
-    let stage_names: Vec<String> = spec.stages.iter().map(|s| s.name.clone()).collect();
-    for name in &stage_names {
-        let _ = ws_send(socket, serde_json::json!({
-            "type": "progress",
-            "stage": name,
-            "status": "running",
-        }))
-        .await;
-    }
+    // Determine if last stage is a pure-LLM stage that can be streamed
+    let last_stage = spec.stages.last();
+    let stream_last = last_stage.map_or(false, |s|
+        matches!(s.handler_type.as_str(), "synthesizer" | "critic" | "llm")
+    );
 
-    // Execute workflow
-    match workflow.run(None, cancel).await {
-        Ok(result) => {
-            // Mark all stages completed
-            for name in &stage_names {
+    if stream_last && spec.stages.len() > 1 {
+        // Multi-stage: run all stages except the last with progress,
+        // then stream the final synthesis stage directly.
+        run_multi_stage_with_streaming(
+            socket, workflow, &spec, &task_workflow_dir, &api_key,
+            &task_id, &task_brief, &task_dir, state, cancel,
+        ).await;
+    } else {
+        // Single-stage or agent-only last stage: run with progress callback
+        run_with_progress(socket, workflow, &spec, &task_workflow_dir,
+            &task_id, &task_brief, &task_dir, state, cancel,
+        ).await;
+    }
+}
+
+/// Run workflow with per-stage progress (non-streaming response).
+async fn run_with_progress(
+    socket: &mut WebSocket,
+    workflow: miniagent_workflow::Workflow,
+    spec: &WorkflowSpec,
+    task_workflow_dir: &StdPath,
+    task_id: &str,
+    task_brief: &str,
+    task_dir: &StdPath,
+    state: &AppState,
+    cancel: CancellationToken,
+) {
+    let stage_names: Vec<String> = spec.stages.iter().map(|s| s.name.clone()).collect();
+
+    // Channel for progress updates + final result from workflow
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ProgressMsg>(32);
+
+    // Spawn workflow execution
+    let wf_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let result = workflow.run_with_progress(None, wf_cancel, |name, status, data| {
+            let _ = progress_tx.try_send(ProgressMsg::Stage {
+                name: name.to_string(),
+                status: status.to_string(),
+                data: data.cloned(),
+            });
+        }).await;
+        let _ = progress_tx.send(ProgressMsg::Done(result)).await;
+    });
+
+    // Forward progress to WebSocket and wait for result
+    let mut final_result: Option<Result<miniagent_workflow::engine::WorkflowResult, miniagent_core::error::AgentError>> = None;
+    while let Some(msg) = progress_rx.recv().await {
+        match msg {
+            ProgressMsg::Stage { name, status, data } => {
                 let _ = ws_send(socket, serde_json::json!({
                     "type": "progress",
                     "stage": name,
-                    "status": "completed",
-                }))
-                .await;
+                    "status": status,
+                })).await;
+                // Send detailed stage output when stage completes
+                if status == "completed" {
+                    if let Some(ref d) = data {
+                        let summary = extract_stage_summary(&name, d);
+                        let _ = ws_send(socket, serde_json::json!({
+                            "type": "stage_output",
+                            "stage": name,
+                            "summary": summary,
+                        })).await;
+                    }
+                }
             }
+            ProgressMsg::Done(result) => {
+                final_result = Some(result);
+                break;
+            }
+        }
+    }
 
+    match final_result.unwrap_or(Err(miniagent_core::error::AgentError::internal("workflow task panicked"))) {
+        Ok(result) => {
             // Collect response text
-            let mut response_text = String::new();
+            let response_text = collect_response_text(&result.stage_outputs, task_workflow_dir);
 
-            for output in result.stage_outputs.values() {
-                let data = &output.data;
-
-                if let Some(text) = data["response"].as_str() {
-                    if !text.is_empty() {
-                        response_text = text.to_string();
-                    }
-                }
-            }
-
-            // Try reading synthesis from disk if response_text is empty
-            if response_text.is_empty() {
-                let synth_path = task_workflow_dir.join("synthesis.md");
-                if let Ok(content) = std::fs::read_to_string(&synth_path) {
-                    response_text = content;
-                }
-            }
-
-            // Stream the response
+            // Send response in one stream message
             if !response_text.is_empty() {
-                // Send in chunks for streaming effect
-                let chars: Vec<char> = response_text.chars().collect();
-                let chunk_size = 20usize.max(chars.len() / 50);
-                for chunk in chars.chunks(chunk_size) {
-                    let text: String = chunk.iter().collect();
-                    let _ = ws_send(socket, serde_json::json!({
-                        "type": "stream",
-                        "text": text,
-                    }))
-                    .await;
-                    // Small delay for streaming feel (non-blocking)
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "stream",
+                    "text": response_text,
+                })).await;
             }
 
-            // Save output.md
-            let mut result_files = vec![];
-            if !response_text.is_empty() {
-                let output_path = task_dir.join("output.md");
-                if std::fs::write(&output_path, &response_text).is_ok() {
-                    result_files.push("output.md".into());
-                }
-            }
-
-            // List any workflow artifacts
-            if let Ok(entries) = std::fs::read_dir(&task_workflow_dir) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(".md") || name.ends_with(".json") {
-                            result_files.push(name.to_string());
-                        }
-                    }
-                }
-            }
-
-            // Update task
-            if let Some(mut task) = state.tasks.get_mut(&task_id) {
-                task.status = "completed".into();
-                task.files = result_files.clone();
-            }
-
-            // Send completion
-            let _ = ws_send(socket, serde_json::json!({
-                "type": "complete",
-                "task_id": task_id,
-                "files": result_files,
-            }))
-            .await;
+            finalize_task(socket, state, task_id, &task_brief, task_dir, task_workflow_dir, &stage_names, response_text).await;
         }
         Err(e) => {
-            // Mark stages as failed
             for name in &stage_names {
                 let _ = ws_send(socket, serde_json::json!({
                     "type": "progress",
                     "stage": name,
                     "status": "failed",
-                }))
-                .await;
+                })).await;
             }
-
-            if let Some(mut task) = state.tasks.get_mut(&task_id) {
+            if let Some(mut task) = state.tasks.get_mut(task_id) {
                 task.status = "failed".into();
             }
-
             let _ = ws_send(socket, serde_json::json!({
                 "type": "error",
                 "message": format!("{e}"),
-            }))
-            .await;
+            })).await;
         }
     }
+}
+
+/// Multi-stage: run all but last stage via workflow, then stream the final stage.
+async fn run_multi_stage_with_streaming(
+    socket: &mut WebSocket,
+    workflow: miniagent_workflow::Workflow,
+    spec: &WorkflowSpec,
+    task_workflow_dir: &StdPath,
+    api_key: &str,
+    task_id: &str,
+    task_brief: &str,
+    task_dir: &StdPath,
+    state: &AppState,
+    cancel: CancellationToken,
+) {
+    let stage_names: Vec<String> = spec.stages.iter().map(|s| s.name.clone()).collect();
+
+    // Run the full workflow with progress
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ProgressMsg>(32);
+
+    let wf_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let result = workflow.run_with_progress(None, wf_cancel, |name, status, data| {
+            let _ = progress_tx.try_send(ProgressMsg::Stage {
+                name: name.to_string(),
+                status: status.to_string(),
+                data: data.cloned(),
+            });
+        }).await;
+        let _ = progress_tx.send(ProgressMsg::Done(result)).await;
+    });
+
+    // Forward progress to WebSocket and wait for result
+    let mut final_result: Option<Result<miniagent_workflow::engine::WorkflowResult, miniagent_core::error::AgentError>> = None;
+    while let Some(msg) = progress_rx.recv().await {
+        match msg {
+            ProgressMsg::Stage { name, status, data } => {
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "progress",
+                    "stage": name,
+                    "status": status,
+                })).await;
+                // Send detailed stage output when stage completes
+                if status == "completed" {
+                    if let Some(ref d) = data {
+                        let summary = extract_stage_summary(&name, d);
+                        let _ = ws_send(socket, serde_json::json!({
+                            "type": "stage_output",
+                            "stage": name,
+                            "summary": summary,
+                        })).await;
+                    }
+                }
+            }
+            ProgressMsg::Done(result) => {
+                final_result = Some(result);
+                break;
+            }
+        }
+    }
+
+    match final_result.unwrap_or(Err(miniagent_core::error::AgentError::internal("workflow task panicked"))) {
+        Ok(_result) => {
+            // Read the synthesis from disk and re-stream it via provider.stream()
+            let response_text = std::fs::read_to_string(task_workflow_dir.join("synthesis.md"))
+                .or_else(|_| std::fs::read_to_string(task_workflow_dir.join(format!("{}.md", stage_names.last().unwrap_or(&String::new())))))
+                .unwrap_or_default();
+
+            if !response_text.is_empty() {
+                // Stream the synthesis text token by token via the pro model
+                let stream_result = stream_synthesis(socket, api_key, &response_text, cancel).await;
+                if !stream_result {
+                    // Fallback: send as one chunk
+                    let _ = ws_send(socket, serde_json::json!({
+                        "type": "stream",
+                        "text": response_text,
+                    })).await;
+                }
+            } else {
+                // Try collecting from stage outputs
+                let fallback_text = collect_response_text(&_result.stage_outputs, task_workflow_dir);
+                if !fallback_text.is_empty() {
+                    let _ = ws_send(socket, serde_json::json!({
+                        "type": "stream",
+                        "text": fallback_text,
+                    })).await;
+                }
+            }
+
+            let final_text = if !response_text.is_empty() { response_text }
+                else { collect_response_text(&_result.stage_outputs, task_workflow_dir) };
+
+            finalize_task(socket, state, task_id, &task_brief, task_dir, task_workflow_dir, &stage_names, final_text).await;
+        }
+        Err(e) => {
+            for name in &stage_names {
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "progress",
+                    "stage": name,
+                    "status": "failed",
+                })).await;
+            }
+            if let Some(mut task) = state.tasks.get_mut(task_id) {
+                task.status = "failed".into();
+            }
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error",
+                "message": format!("{e}"),
+            })).await;
+        }
+    }
+}
+
+/// Re-stream synthesis text through provider.stream() for real token-by-token output.
+async fn stream_synthesis(
+    socket: &mut WebSocket,
+    api_key: &str,
+    synthesis_text: &str,
+    cancel: CancellationToken,
+) -> bool {
+    let pro = miniagent_provider::deepseek::DeepSeekPro::new(api_key);
+    let request = CompletionRequest {
+        system: "You are presenting final research output. Output the following text faithfully, maintaining all structure and content. Do not add or remove information.".into(),
+        messages: vec![AgentMessage::user(format!("Present this output:\n\n{synthesis_text}"))],
+        tools: vec![],
+        config: InferenceConfig {
+            max_tokens: Some(16_000),
+            ..Default::default()
+        },
+    };
+
+    let stream = match pro.stream(&request, cancel).await {
+        Ok(s) => s.content_receiver,
+        Err(_) => return false,
+    };
+
+    let mut receiver = stream;
+    let mut got_text = false;
+    while let Some(chunk) = receiver.recv().await {
+        match chunk {
+            Ok(StreamChunk::TextDelta { text }) => {
+                got_text = true;
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "stream",
+                    "text": text,
+                })).await;
+            }
+            Ok(StreamChunk::Stop(_)) => break,
+            Ok(StreamChunk::Error(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    got_text
+}
+
+/// Collect response text from stage outputs.
+fn collect_response_text(
+    stage_outputs: &HashMap<StageId, miniagent_workflow::stage::StageOutput>,
+    task_workflow_dir: &StdPath,
+) -> String {
+    let mut response_text = String::new();
+
+    for output in stage_outputs.values() {
+        if let Some(text) = output.data["response"].as_str() {
+            if !text.is_empty() {
+                response_text = text.to_string();
+            }
+        }
+    }
+
+    if response_text.is_empty() {
+        let synth_path = task_workflow_dir.join("synthesis.md");
+        if let Ok(content) = std::fs::read_to_string(&synth_path) {
+            response_text = content;
+        }
+    }
+
+    response_text
+}
+
+/// Finalize task: save output, update state, send completion.
+async fn finalize_task(
+    socket: &mut WebSocket,
+    state: &AppState,
+    task_id: &str,
+    task_brief: &str,
+    task_dir: &StdPath,
+    task_workflow_dir: &StdPath,
+    _stage_names: &[String],
+    response_text: String,
+) {
+    // Save result file with content-based name: {brief}.md
+    let output_filename = format!("{}.md", task_brief);
+    let mut result_files = vec![];
+    if !response_text.is_empty() {
+        let output_path = task_dir.join(&output_filename);
+        if std::fs::write(&output_path, &response_text).is_ok() {
+            result_files.push(output_filename.clone());
+        }
+    }
+
+    // List workflow artifacts
+    if let Ok(entries) = std::fs::read_dir(task_workflow_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".md") || name.ends_with(".json") {
+                    result_files.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    // Update task
+    if let Some(mut task) = state.tasks.get_mut(task_id) {
+        task.status = "completed".into();
+        task.files = result_files.clone();
+        task.response.clone_from(&response_text);
+    }
+
+    // Send completion
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "complete",
+        "task_id": task_id,
+        "files": result_files,
+    }))
+    .await;
+}
+
+// ── Progress message types ──
+
+enum ProgressMsg {
+    Stage {
+        name: String,
+        status: String,
+        data: Option<serde_json::Value>,
+    },
+    Done(Result<miniagent_workflow::engine::WorkflowResult, miniagent_core::error::AgentError>),
+}
+
+/// Extract human-readable info from stage output data for frontend display.
+fn extract_stage_summary(name: &str, data: &serde_json::Value) -> serde_json::Value {
+    let mut summary = serde_json::json!({ "stage": name });
+
+    // Structured tool entries (from agent stages)
+    if let Some(entries) = data["tool_entries"].as_array() {
+        if !entries.is_empty() {
+            summary["tool_count"] = serde_json::json!(entries.len());
+            summary["tool_entries"] = serde_json::json!(entries);
+        }
+    } else if let Some(tool_calls) = data["tool_calls"].as_u64() {
+        // Fallback: legacy flat format
+        summary["tool_count"] = serde_json::json!(tool_calls);
+        if let Some(results) = data["tool_results"].as_array() {
+            let previews: Vec<serde_json::Value> = results.iter()
+                .filter_map(|r| r.as_str())
+                .take(5)
+                .map(|r| {
+                    let s = r.trim();
+                    let preview: String = s.chars().take(200).collect();
+                    let is_error = s.contains("Error:") || s.contains("error:");
+                    serde_json::json!({ "name": "", "input_preview": "", "result_preview": preview, "is_error": is_error })
+                })
+                .collect();
+            if !previews.is_empty() {
+                summary["tool_entries"] = serde_json::json!(previews);
+            }
+        }
+    }
+
+    // Token usage
+    if let Some(tokens_in) = data["tokens_in"].as_u64() {
+        summary["tokens_in"] = serde_json::json!(tokens_in);
+    }
+    if let Some(tokens_out) = data["tokens_out"].as_u64() {
+        summary["tokens_out"] = serde_json::json!(tokens_out);
+    }
+
+    // Response preview
+    if let Some(response) = data["response"].as_str() {
+        if !response.is_empty() {
+            let preview: String = response.chars().take(300).collect();
+            summary["response_preview"] = serde_json::json!(preview);
+        }
+    }
+
+    // Critique/review content
+    if let Some(critique) = data["critique"].as_str() {
+        let preview: String = critique.chars().take(300).collect();
+        summary["critique_preview"] = serde_json::json!(preview);
+    }
+
+    summary
+}
+
+// ── File parsing ──
+
+/// Read uploaded files, parse CSV/TSV into markdown tables, and append to prompt.
+fn enrich_prompt_with_files(prompt: &str, file_ids: &[String], task_dir: &StdPath) -> String {
+    if file_ids.is_empty() {
+        return prompt.to_string();
+    }
+
+    let upload_dir = task_dir.join("_uploads");
+    let mut enriched = prompt.to_string();
+
+    for fid in file_ids {
+        let path = upload_dir.join(fid);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Read original filename from metadata
+        let filename = std::fs::read_to_string(upload_dir.join(format!("{fid}.meta")))
+            .unwrap_or_else(|_| fid.clone());
+
+        let parsed = parse_file_content(&content, &filename);
+        enriched.push_str(&format!("\n\n--- Attached file: {} ---\n{}\n--- End file ---", filename, parsed));
+    }
+
+    enriched
+}
+
+/// Parse file content based on extension. CSV/TSV → markdown table; others → raw text.
+fn parse_file_content(content: &str, filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "csv" => parse_delimited(content, ','),
+        "tsv" => parse_delimited(content, '\t'),
+        _ => content.to_string(),
+    }
+}
+
+/// Parse delimited text (CSV/TSV) into a markdown table.
+fn parse_delimited(content: &str, delimiter: char) -> String {
+    let lines: Vec<&str> = content.lines().take(200).collect();
+    if lines.is_empty() {
+        return content.to_string();
+    }
+
+    let rows: Vec<Vec<String>> = lines.iter()
+        .map(|l| parse_csv_line(l, delimiter))
+        .collect();
+
+    if rows.is_empty() || rows[0].is_empty() {
+        return content.to_string();
+    }
+
+    let col_count = rows[0].len();
+    let mut table = String::new();
+
+    // Header row
+    table.push_str("| ");
+    table.push_str(&rows[0].join(" | "));
+    table.push_str(" |\n");
+
+    // Separator
+    table.push_str("| ");
+    for _ in 0..col_count {
+        table.push_str("--- | ");
+    }
+    table.push('\n');
+
+    // Data rows
+    for row in rows.iter().skip(1) {
+        // Pad or trim to match column count
+        let padded: Vec<String> = (0..col_count)
+            .map(|i| row.get(i).cloned().unwrap_or_default())
+            .collect();
+        table.push_str("| ");
+        table.push_str(&padded.join(" | "));
+        table.push_str(" |\n");
+    }
+
+    if lines.len() < content.lines().count() {
+        table.push_str(&format!("\n*... {} more rows truncated*\n", content.lines().count() - lines.len()));
+    }
+
+    table
+}
+
+/// Parse a single CSV/TSV line, handling quoted fields.
+fn parse_csv_line(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == delimiter {
+            fields.push(current.trim().to_string());
+            current = String::new();
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
 }
 
 async fn ws_send(socket: &mut WebSocket, msg: serde_json::Value) -> Result<(), ()> {

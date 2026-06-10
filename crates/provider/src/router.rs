@@ -2,7 +2,7 @@ use miniagent_core::config::{InferenceConfig, TaskComplexity};
 use miniagent_core::error::AgentError;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::{CompletionRequest, CompletionResponse, LlmProvider};
+use crate::traits::{CompletionRequest, CompletionResponse, LlmProvider, StreamResponse};
 
 pub struct ProviderRouter {
     flash: Box<dyn LlmProvider>,
@@ -66,6 +66,16 @@ impl ProviderRouter {
         cancel: CancellationToken,
     ) -> Result<CompletionResponse, AgentError> {
         self.select(complexity, force).complete(request, cancel).await
+    }
+
+    pub async fn stream(
+        &self,
+        request: &CompletionRequest,
+        complexity: TaskComplexity,
+        force: Option<ProviderChoice>,
+        cancel: CancellationToken,
+    ) -> Result<StreamResponse, AgentError> {
+        self.select(complexity, force).stream(request, cancel).await
     }
 }
 
