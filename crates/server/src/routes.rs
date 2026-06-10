@@ -276,7 +276,9 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                                 "prompt": task.prompt,
                                 "response": task.response,
                                 "status": task.status,
-                                "files": task.files,
+                                "files": task.files.clone(),
+                                "plan": task.plan,
+                                "stage_outputs": task.stage_outputs.clone(),
                             }))
                             .await;
                         }
@@ -359,6 +361,8 @@ async fn handle_run(
         result_dir: task_dir.clone(),
         files: vec![],
         response: String::new(),
+        plan: None,
+        stage_outputs: Vec::new(),
     };
     state.tasks.insert(task_id.clone(), task_info);
 
@@ -397,14 +401,31 @@ async fn handle_run(
         .unwrap_or_else(|_| WorkflowSpec::single_agent());
 
     // Send plan info
+    let plan_data = serde_json::json!({
+        "workflow": spec.task_type,
+        "stages": spec.stages.iter().map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "handler": s.handler_type,
+                "tier": s.model_tier,
+                "description": s.description,
+                "sub_tasks": s.sub_tasks,
+                "tools": s.tools,
+            })
+        }).collect::<Vec<_>>(),
+        "edges": spec.edges,
+    });
     let _ = ws_send(socket, serde_json::json!({
         "type": "plan",
         "workflow": spec.task_type,
-        "stages": spec.stages.iter().map(|s| {
-            serde_json::json!({"name": s.name, "handler": s.handler_type, "tier": s.model_tier})
-        }).collect::<Vec<_>>(),
+        "stages": plan_data["stages"],
     }))
     .await;
+
+    // Persist plan for history replay
+    if let Some(mut task) = state.tasks.get_mut(&task_id) {
+        task.plan = Some(plan_data);
+    }
 
     // Build workflow
     let builder = WorkflowBuilder::new(agent_arc.clone(), api_key)
@@ -494,6 +515,13 @@ async fn run_with_progress(
                 if status == "completed" {
                     if let Some(ref d) = data {
                         let summary = extract_stage_summary(&name, d);
+                        // Persist stage output for history replay
+                        if let Some(mut task) = state.tasks.get_mut(task_id) {
+                            task.stage_outputs.push(serde_json::json!({
+                                "stage": name,
+                                "summary": summary,
+                            }));
+                        }
                         let _ = ws_send(socket, serde_json::json!({
                             "type": "stage_output",
                             "stage": name,
@@ -587,6 +615,13 @@ async fn run_multi_stage_with_streaming(
                 if status == "completed" {
                     if let Some(ref d) = data {
                         let summary = extract_stage_summary(&name, d);
+                        // Persist stage output for history replay
+                        if let Some(mut task) = state.tasks.get_mut(task_id) {
+                            task.stage_outputs.push(serde_json::json!({
+                                "stage": name,
+                                "summary": summary,
+                            }));
+                        }
                         let _ = ws_send(socket, serde_json::json!({
                             "type": "stage_output",
                             "stage": name,
@@ -654,6 +689,52 @@ async fn run_multi_stage_with_streaming(
     }
 }
 
+/// Filter `<thinking>...</thinking>` tags from streamed text.
+/// DeepSeek Pro emits reasoning as `<thinking>` wrapped TextDelta chunks.
+fn filter_thinking_tags(text: &str, in_thinking: &mut bool, buf: &mut String) -> String {
+    let mut result = String::new();
+    buf.push_str(text);
+
+    let input = buf.clone();
+    let mut chars = input.as_str();
+    buf.clear();
+
+    while !chars.is_empty() {
+        if *in_thinking {
+            if let Some(pos) = chars.find("</thinking>") {
+                *in_thinking = false;
+                chars = &chars[pos + "</thinking>".len()..];
+            } else {
+                // Still inside thinking, buffer remainder
+                buf.push_str(chars);
+                break;
+            }
+        } else if let Some(pos) = chars.find("<thinking>") {
+            // Output everything before the tag
+            if pos > 0 {
+                result.push_str(&chars[..pos]);
+            }
+            *in_thinking = true;
+            chars = &chars[pos + "<thinking>".len()..];
+        } else {
+            // No tag found — but check if a partial tag is at the end
+            if let Some(last_lt) = chars.rfind('<') {
+                let tail = &chars[last_lt..];
+                if "<thinking>".starts_with(tail) {
+                    // Partial tag at end — buffer it
+                    result.push_str(&chars[..last_lt]);
+                    buf.push_str(tail);
+                    break;
+                }
+            }
+            result.push_str(chars);
+            break;
+        }
+    }
+
+    result
+}
+
 /// Re-stream synthesis text through provider.stream() for real token-by-token output.
 async fn stream_synthesis(
     socket: &mut WebSocket,
@@ -679,14 +760,22 @@ async fn stream_synthesis(
 
     let mut receiver = stream;
     let mut got_text = false;
+    // Track <thinking> state to filter out DeepSeek Pro reasoning tokens
+    let mut in_thinking = false;
+    let mut think_buf = String::new();
+
     while let Some(chunk) = receiver.recv().await {
         match chunk {
             Ok(StreamChunk::TextDelta { text }) => {
-                got_text = true;
-                let _ = ws_send(socket, serde_json::json!({
-                    "type": "stream",
-                    "text": text,
-                })).await;
+                // Filter <thinking>...</thinking> blocks from DeepSeek Pro reasoning
+                let filtered = filter_thinking_tags(&text, &mut in_thinking, &mut think_buf);
+                if !filtered.is_empty() {
+                    got_text = true;
+                    let _ = ws_send(socket, serde_json::json!({
+                        "type": "stream",
+                        "text": filtered,
+                    })).await;
+                }
             }
             Ok(StreamChunk::Stop(_)) => break,
             Ok(StreamChunk::Error(_)) => break,

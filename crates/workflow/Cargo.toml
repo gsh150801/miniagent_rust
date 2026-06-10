@@ -20,3 +20,4 @@ async-trait.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+regex-lite = "0.1"

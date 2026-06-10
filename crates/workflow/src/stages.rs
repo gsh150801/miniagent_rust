@@ -214,10 +214,24 @@ impl StageHandler for AgentStage {
                         other => format!("{:.200}", other),
                     };
                     let result_preview: String = content.chars().take(300).collect();
+                    let result_expanded: String = content.chars().take(2000).collect();
+                    // Extract URLs from result text
+                    let url_pattern = regex_lite::Regex::new(r"https?://[^\s\)\]>,;]+").unwrap();
+                    let urls: Vec<String> = url_pattern.find_iter(&content)
+                        .map(|m| m.as_str().to_string())
+                        .collect();
+                    // Extract input URL for fetch tools
+                    let input_url = match &input {
+                        serde_json::Value::Object(m) => m.get("url").and_then(|v| v.as_str()).map(String::from),
+                        _ => None,
+                    };
                     serde_json::json!({
                         "name": name,
                         "input_preview": input_preview,
+                        "input_url": input_url,
                         "result_preview": result_preview,
+                        "result_expanded": result_expanded,
+                        "urls": urls,
                         "is_error": content.contains("Error:") || content.contains("error:"),
                     })
                 }).collect();
@@ -829,6 +843,11 @@ impl StageHandler for PlannerStage {
     {{
       "name": "stage_name",
       "handler_type": "agent|critic|synthesizer|llm",
+      "description": "One sentence describing this stage's role in the workflow",
+      "sub_tasks": [
+        "Specific sub-task 1 delegated to this stage",
+        "Specific sub-task 2 delegated to this stage"
+      ],
       "system_prompt": "Custom instructions for this stage (empty string for default behavior)",
       "tools": ["web_search", "web_fetch"],
       "model_tier": "flash|pro",

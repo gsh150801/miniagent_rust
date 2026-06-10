@@ -34,6 +34,12 @@ pub struct StageSpec {
     pub max_iterations: usize,
     #[serde(default)]
     pub enable_skills: bool,
+    /// Human-readable description of what this stage does
+    #[serde(default)]
+    pub description: String,
+    /// Sub-tasks delegated to this stage's agent
+    #[serde(default)]
+    pub sub_tasks: Vec<String>,
 }
 
 pub struct WorkflowBuilder {
@@ -169,6 +175,8 @@ impl WorkflowSpec {
                 model_tier: "flash".into(),
                 max_iterations: 50,
                 enable_skills: true,
+                description: String::new(),
+                sub_tasks: vec![],
             }],
             edges: vec![],
         }
@@ -186,6 +194,8 @@ impl WorkflowSpec {
                     model_tier: "flash".into(),
                     max_iterations: 50,
                     enable_skills: true,
+                    description: String::new(),
+                    sub_tasks: vec![],
                 },
                 StageSpec {
                     name: "critique".into(),
@@ -195,6 +205,8 @@ impl WorkflowSpec {
                     model_tier: "flash".into(),
                     max_iterations: 1,
                     enable_skills: false,
+                    description: String::new(),
+                    sub_tasks: vec![],
                 },
                 StageSpec {
                     name: "synthesize".into(),
@@ -204,6 +216,8 @@ impl WorkflowSpec {
                     model_tier: "pro".into(),
                     max_iterations: 1,
                     enable_skills: false,
+                    description: String::new(),
+                    sub_tasks: vec![],
                 },
             ],
             edges: vec![
@@ -225,6 +239,8 @@ impl WorkflowSpec {
                     model_tier: "flash".into(),
                     max_iterations: 30,
                     enable_skills: true,
+                    description: String::new(),
+                    sub_tasks: vec![],
                 },
                 StageSpec {
                     name: "writer".into(),
@@ -234,6 +250,8 @@ impl WorkflowSpec {
                     model_tier: "pro".into(),
                     max_iterations: 1,
                     enable_skills: false,
+                    description: String::new(),
+                    sub_tasks: vec![],
                 },
             ],
             edges: vec![["research".into(), "writer".into()]],

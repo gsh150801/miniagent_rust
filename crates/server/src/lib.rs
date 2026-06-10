@@ -128,6 +128,8 @@ fn restore_tasks_from_disk(state: &AppState) {
             result_dir: dir,
             files,
             response,
+            plan: None,
+            stage_outputs: Vec::new(),
         };
 
         state.tasks.insert(task_id.to_string(), info);

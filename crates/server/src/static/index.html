@@ -232,6 +232,21 @@ html,body{height:100%;font-family:var(--font);background:var(--bg);color:var(--t
 .exec-tool .fade{position:absolute;bottom:0;left:0;right:0;height:30px;
   background:linear-gradient(transparent,var(--bg3))}
 .exec-preview{color:var(--text3);font-style:italic;font-size:12px;margin-top:6px;line-height:1.5}
+.tool-expand-toggle{cursor:pointer;color:var(--text3);font-size:10px;margin-left:auto;user-select:none;
+  transition:transform .2s;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+  border-radius:4px}
+.tool-expand-toggle:hover{background:var(--bg3);color:var(--text)}
+.tool-detail{margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+.tool-links{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
+.tool-link{display:flex;align-items:flex-start;gap:6px;padding:5px 8px;border-radius:6px;
+  background:var(--accent-dim);border:1px solid rgba(108,92,231,.12);
+  font-size:12px;color:var(--text);text-decoration:none;transition:all .15s;line-height:1.4}
+.tool-link:hover{background:rgba(108,92,231,.14);border-color:rgba(108,92,231,.3);transform:translateY(-1px)}
+.tool-link-icon{flex-shrink:0;font-size:12px;margin-top:1px}
+.tool-link-text{flex:1;min-width:0;word-break:break-all}
+.tool-expanded{background:var(--bg3);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;font-size:11px;font-family:var(--mono);color:var(--text2);
+  max-height:300px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5}
 
 /* ── Mobile ── */
 .menu-btn{display:none;width:40px;height:40px;border:1px solid var(--border);border-radius:8px;
@@ -331,7 +346,7 @@ function handleMsg(msg) {
     case 'complete': finishStream(msg.task_id, msg.files); break;
     case 'error': finishStreamError(msg.message); break;
     case 'tasks': tasks = msg.tasks; renderTaskList(); break;
-    case 'task_messages': renderHistory(msg.prompt, msg.response, msg.status, msg.files, msg.task_id); break;
+    case 'task_messages': renderHistory(msg.prompt, msg.response, msg.status, msg.files, msg.task_id, msg.plan, msg.stage_outputs); break;
   }
 }
 
@@ -416,13 +431,29 @@ function selectTask(id) {
     ws.send(JSON.stringify({ type: 'get_task', task_id: id }));
 }
 
-function renderHistory(prompt, response, status, files, taskId) {
+function renderHistory(prompt, response, status, files, taskId, plan, stageOutputs) {
   const el = document.getElementById('messages');
   const pills = document.getElementById('stagePills');
   el.innerHTML = '<div class="messages-inner"></div>';
   pills.innerHTML = '';
   const inner = el.querySelector('.messages-inner');
   if (prompt) inner.appendChild(makeUserBubble(prompt));
+
+  // Render workflow plan card
+  if (plan && plan.stages) {
+    showPlan(plan.workflow, plan.stages);
+  }
+
+  // Render stage output cards (execution details)
+  if (stageOutputs && stageOutputs.length > 0) {
+    for (const so of stageOutputs) {
+      if (so.stage && so.summary) {
+        showStageOutput(so.stage, so.summary);
+      }
+    }
+  }
+
+  // Render final response after execution cards
   if (response) {
     const div = document.createElement('div');
     div.className = 'msg msg-ai';
@@ -582,21 +613,48 @@ function showPlan(workflow, stages) {
       : s.handler === 'critic' ? '&#128270;'
       : '&#9881;';
     const tierBadge = s.tier ? `<span style="font-size:10px;background:var(--bg3);padding:2px 6px;border-radius:4px;color:var(--text3)">${escHtml(s.tier)}</span>` : '';
-    const arrow = i < stages.length - 1 ? '<span style="color:var(--text3);font-size:16px">&#8595;</span>' : '';
-    return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-      <span style="font-size:14px">${handlerIcon}</span>
-      <span style="font-weight:500;font-size:13px">${escHtml(s.name)}</span>
-      ${tierBadge}
-      ${arrow}
-    </div>`;
+
+    // Description
+    let descHtml = '';
+    if (s.description) {
+      descHtml = `<div style="font-size:12px;color:var(--text2);margin:2px 0 2px 22px;line-height:1.4">${escHtml(s.description)}</div>`;
+    }
+
+    // Sub-tasks
+    let subTasksHtml = '';
+    if (s.sub_tasks && s.sub_tasks.length > 0) {
+      const items = s.sub_tasks.map(t => `<li>${escHtml(t)}</li>`).join('');
+      subTasksHtml = `<ul style="margin:3px 0 2px 22px;padding-left:16px;font-size:11px;color:var(--text2);line-height:1.5">${items}</ul>`;
+    }
+
+    // Tools
+    let toolsHtml = '';
+    if (s.tools && s.tools.length > 0) {
+      const badges = s.tools.map(t => `<span style="font-size:10px;background:var(--bg3);padding:1px 5px;border-radius:3px;color:var(--text3);margin-right:3px">${escHtml(t)}</span>`).join('');
+      toolsHtml = `<div style="margin:3px 0 0 22px;display:flex;flex-wrap:wrap;gap:2px">${badges}</div>`;
+    }
+
+    const arrow = i < stages.length - 1
+      ? '<div style="text-align:center;color:var(--text3);font-size:14px;margin:2px 0">&#8595;</div>'
+      : '';
+
+    return `<div style="padding:6px 0">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:14px">${handlerIcon}</span>
+        <span style="font-weight:600;font-size:13px">${escHtml(s.name)}</span>
+        ${tierBadge}
+        <span style="font-size:10px;color:var(--text3);font-style:italic">${escHtml(s.handler)}</span>
+      </div>
+      ${descHtml}${subTasksHtml}${toolsHtml}
+    </div>${arrow}`;
   }).join('');
 
   card.innerHTML = `<div class="exec-card" style="border-left:3px solid var(--accent)">
     <div class="exec-card-header">
-      <span class="icon">${typeIcon}</span> Workflow Plan
+      <span class="icon">${typeIcon}</span> Task Plan
       <span style="font-weight:400;color:var(--text3);font-size:11px;margin-left:auto">${escHtml(workflow || 'auto')}</span>
     </div>
-    <div style="display:flex;flex-direction:column;gap:2px;margin-top:4px">
+    <div style="margin-top:6px">
       ${stagesHtml}
     </div>
   </div>`;
@@ -606,6 +664,17 @@ function showPlan(workflow, stages) {
 function updateStagePill(name, status) {
   const pill = document.getElementById('stage-' + name);
   if (pill) pill.className = 'stage-pill ' + status;
+}
+function toggleToolDetail(uid) {
+  const detail = document.getElementById(uid + '_detail');
+  const toggle = document.getElementById(uid + '_toggle');
+  const preview = document.getElementById(uid + '_preview');
+  if (!detail) return;
+  const shown = detail.style.display !== 'none';
+  detail.style.display = shown ? 'none' : 'block';
+  if (toggle) toggle.innerHTML = shown ? '&#9660;' : '&#9650;';
+  if (preview) preview.style.display = shown ? '' : 'none';
+  scrollBottom();
 }
 
 function showStageOutput(stage, summary) {
@@ -655,24 +724,72 @@ function showStageOutput(stage, summary) {
     const toolCard = document.createElement('div');
     toolCard.className = 'exec-panel';
     const nameStr = entry.name || 'unknown';
-    const nameIcon = nameStr.includes('search') || nameStr.includes('pubmed') || nameStr.includes('tavily') ? '&#128269;'
-      : nameStr.includes('fetch') ? '&#127760;'
+    const isSearch = nameStr.includes('search') || nameStr.includes('pubmed') || nameStr.includes('tavily');
+    const isFetch = nameStr.includes('fetch');
+    const nameIcon = isSearch ? '&#128269;'
+      : isFetch ? '&#127760;'
       : nameStr.includes('bash') || nameStr.includes('exec') ? '&#128187;'
       : nameStr.includes('read') || nameStr.includes('glob') || nameStr.includes('grep') ? '&#128196;'
       : nameStr.includes('write') || nameStr.includes('edit') ? '&#9997;'
       : '&#128295;';
     const errorCls = entry.is_error ? ' style="border-left:3px solid var(--red)"' : ' style="border-left:3px solid var(--green)"';
+    const uid = 'tool_' + Math.random().toString(36).slice(2, 8);
     let toolHtml = `<div class="exec-card"${errorCls}>`;
     toolHtml += `<div class="exec-card-header" style="font-size:12px">`;
     toolHtml += `<span class="icon">${nameIcon}</span> <span style="font-family:var(--mono);font-size:11px;background:var(--bg3);padding:2px 6px;border-radius:4px">${escHtml(nameStr)}</span>`;
-    if (entry.input_preview) {
+    if (isFetch && entry.input_url) {
+      toolHtml += ` <a href="${escHtml(entry.input_url)}" target="_blank" rel="noopener" style="color:var(--accent);font-size:11px;text-decoration:none;max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle">${escHtml(entry.input_url)}</a>`;
+    } else if (entry.input_preview) {
       toolHtml += `<span style="font-weight:400;color:var(--text3);font-size:11px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"> ${escHtml(entry.input_preview)}</span>`;
     }
+    // Expand toggle for cards with content
+    if (entry.result_expanded || (entry.urls && entry.urls.length > 0)) {
+      toolHtml += ` <span class="tool-expand-toggle" onclick="toggleToolDetail('${uid}')" id="${uid}_toggle" title="Expand">&#9660;</span>`;
+    }
     toolHtml += `</div>`;
+
+    // Collapsed preview
     if (entry.result_preview) {
       const cls = entry.is_error ? 'exec-tool error' : 'exec-tool';
-      toolHtml += `<div class="${cls}">${escHtml(entry.result_preview)}<div class="fade"></div></div>`;
+      toolHtml += `<div class="${cls}" id="${uid}_preview">${escHtml(entry.result_preview)}<div class="fade"></div></div>`;
     }
+
+    // Expandable detail section (hidden by default)
+    const urls = entry.urls || [];
+    if (urls.length > 0 || entry.result_expanded) {
+      toolHtml += `<div class="tool-detail" id="${uid}_detail" style="display:none">`;
+      // Clickable links list for search tools
+      if (urls.length > 0) {
+        toolHtml += `<div class="tool-links">`;
+        // Extract titles from result text for each URL
+        const expandedText = entry.result_expanded || '';
+        for (const url of urls) {
+          // Try to find a title preceding the URL in the expanded text
+          const urlIdx = expandedText.indexOf(url);
+          let title = '';
+          if (urlIdx > 0) {
+            // Look backwards for a line starting with a number or **
+            const before = expandedText.substring(Math.max(0, urlIdx - 200), urlIdx);
+            const titleMatch = before.match(/(?:^|\n)\s*\d+\.\s*\*\*([^*]+)\*\*\s*$/);
+            if (titleMatch) {
+              title = titleMatch[1].trim();
+            }
+          }
+          const displayTitle = title || url.replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
+          toolHtml += `<a class="tool-link" href="${escHtml(url)}" target="_blank" rel="noopener">`;
+          toolHtml += `<span class="tool-link-icon">&#128279;</span>`;
+          toolHtml += `<span class="tool-link-text">${escHtml(displayTitle)}</span>`;
+          toolHtml += `</a>`;
+        }
+        toolHtml += `</div>`;
+      }
+      // Full expanded result text
+      if (entry.result_expanded) {
+        toolHtml += `<div class="tool-expanded">${escHtml(entry.result_expanded)}</div>`;
+      }
+      toolHtml += `</div>`;
+    }
+
     toolHtml += `</div>`;
     toolCard.innerHTML = toolHtml;
     inner.appendChild(toolCard);

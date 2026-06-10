@@ -30,6 +30,12 @@ pub struct TaskInfo {
     /// AI response text (stored for history replay)
     #[serde(default)]
     pub response: String,
+    /// Workflow plan data for replaying execution cards
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
+    /// Per-stage execution data for replaying tool cards
+    #[serde(default)]
+    pub stage_outputs: Vec<serde_json::Value>,
 }
 
 impl AppState {
