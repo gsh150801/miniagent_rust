@@ -1,0 +1,6 @@
+   🔍 Health check: 3/4 backends healthy
+      ✅ serper (1255ms)
+      ✅ tavily (731ms)
+      ❌ bocha (368ms): HTTP 404 Not Found
+      ✅ pubmed (979ms)
+   ──

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Miniagent</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+   <aside class="sidebar" id="sidebar">
+     <div class="sidebar-header">
+       <h2>Miniagent</h2>
+       <button class="btn-new" onclick="newTask()" title="New Task">+ New</button>
+     </div>
+    <div class="search-wrap">
+      <span class="search-icon">&#128269;</span>
+      <input class="search-input" id="searchInput" type="text" placeholder="Search tasks..." oninput="filterTasks()">
+    </div>
+    <div class="task-list" id="taskList"></div>
+    <div class="sidebar-footer"><span class="dot"></span> Miniagent v0.1</div>
+  </aside>
+
+  <div class="main">
+    <div class="chat-header">
+      <button class="btn-header" id="btnToggleSidebar" onclick="toggleSidebar()" title="Toggle sidebar">&#9776;</button>
+      <button class="menu-btn" onclick="toggleSidebarMobile()">&#9776;</button>
+      <div class="stage-pills" id="stagePills"></div>
+      <h3 id="chatTitle"></h3>
+      <button class="btn-cancel" id="btnCancel" onclick="cancelTask()" title="Cancel running task">&#9632; Stop</button>
+      <button class="btn-header" id="btnToggleRight" onclick="toggleRightPanel()" title="Toggle progress / files panel">&#9776;&#9776;</button>
+    </div>
+    <div class="conn-bar" id="connBar"></div>
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">&#129302;</div>
+        <h2>Miniagent</h2>
+        <p>AI Agent with dynamic workflow planning, tool execution, and multi-stage research.</p>
+        <div class="welcome-tips">
+          <div class="welcome-tip" onclick="useTip('Summarize recent advances in CRISPR gene editing')">CRISPR Research</div>
+          <div class="welcome-tip" onclick="useTip('Compare BERT and GPT architectures')">BERT vs GPT</div>
+          <div class="welcome-tip" onclick="useTip('Analyze the pros and cons of Rust vs Go')">Rust vs Go</div>
+        </div>
+      </div>
+    </div>
+    <div class="input-area">
+      <div class="file-chips" id="fileChips"></div>
+      <div class="input-row">
+        <button class="btn-upload" onclick="document.getElementById('fileInput').click()" title="Upload file">&#128206;</button>
+        <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.pdf,.csv,.json,.py,.rs,.js,.ts,.html,.css">
+        <div class="input-wrap">
+          <textarea id="input" rows="1" placeholder="Ask anything..." onkeydown="handleKey(event)"></textarea>
+        </div>
+        <button class="btn-send" id="btnSend" onclick="sendMessage()">&#9654;</button>
+      </div>
+    </div>
+  </div>
+
+  <aside class="right-panel" id="rightPanel">
+    <div class="rp-tabs">
+      <button class="rp-tab active" data-tab="progress" onclick="switchRightTab('progress')">&#128202; Progress</button>
+      <button class="rp-tab" data-tab="files" onclick="switchRightTab('files')">&#128193; Files</button>
+    </div>
+    <div class="rp-content">
+      <div id="rpProgress"></div>
+      <div id="rpFiles" style="display:none"></div>
+    </div>
+  </aside>
+
+  <!-- Floating reopen buttons (visible when the respective panel is collapsed) -->
+  <button id="sidebarReopen" class="float-reopen left" onclick="expandSidebar()" title="Show sidebar" style="display:none">&#9776;</button>
+  <button id="rightReopen" class="float-reopen right" onclick="expandRightPanel()" title="Show files panel" style="display:none">&#128193;</button>
+</div>
+
+<div class="drag-overlay" id="dragOverlay">
+  <div class="inner">
+    <div style="font-size:40px">&#128196;</div>
+    <p>Drop files here</p>
+  </div>
+</div>
+
+<div class="preview-overlay" id="previewOverlay" onclick="if(event.target===this)closePreview()">
+  <div class="preview-drawer">
+    <div class="preview-head">
+      <span class="picon">&#128196;</span>
+      <div style="flex:1;min-width:0">
+        <div class="ptitle" id="previewTitle"></div>
+        <div class="pmeta" id="previewMeta"></div>
+      </div>
+      <button class="btn-header" onclick="document.getElementById('previewDownload').click()" title="Download" style="width:30px;height:30px;font-size:13px">&#11015;</button>
+      <button class="preview-close" onclick="closePreview()" title="Close">&times;</button>
+    </div>
+    <div class="preview-body" id="previewBody"></div>
+    <a id="previewDownload" style="display:none"></a>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

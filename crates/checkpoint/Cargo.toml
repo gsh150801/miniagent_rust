@@ -1,0 +1,14 @@
+[package]
+name = "miniagent-checkpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miniagent-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
