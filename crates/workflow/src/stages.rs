@@ -267,6 +267,475 @@ impl StageHandler for AgentStage {
     }
 }
 
+// ── Role helpers (self-contained to avoid cyclic deps) ─────────
+
+fn role_tools(role: &str) -> &'static [&'static str] {
+    match role {
+        "researcher" => &["web_search", "web_fetch", "pubmed_search", "patent_search", "clinical_trials_search", "read"],
+        "analyst"    => &["read", "grep", "glob", "bash"],
+        _            => &[],
+    }
+}
+
+fn role_system_prompt_local(role: &str, task_desc: &str, expected_output: &str) -> String {
+    let role_guide = match role {
+        "researcher" =>
+            "Use **web_search** and **web_fetch** to gather online information. \
+             Use **pubmed_search** for scientific literature. \
+             Use **patent_search** to search patents (Google Patents, USPTO). \
+             Use **clinical_trials_search** to find clinical studies. \
+             Use **read** to examine local files. \
+             Cite all sources with URLs, PMIDs, or patent numbers.",
+        "analyst" =>
+            "Use **read** to examine data files. \
+             Use **grep** to find patterns in data. \
+             Use **glob** to discover relevant files. \
+             Use **bash** to run Python scripts for data analysis and chart generation (matplotlib, plotly, etc.). \
+             Save charts as PNG/SVG files. Be thorough and precise.",
+        _ => "",
+    };
+
+    format!(
+        r#"You are a {role_uppercase}.
+
+## Task Execution Principles
+ - **Read before modifying.** Do not propose changes to code or files you haven't read. Understand existing content before suggesting modifications.
+ - **Don't over-engineer.** Don't add features, error handling, or abstractions beyond what the task requires. Do the minimum needed to complete the task well — no more, no less.
+ - **Don't gold-plate.** A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add comments/docstrings to code you didn't change.
+ - **Be careful with security.** Avoid command injection, XSS, SQL injection. If you notice insecure code, fix it immediately.
+ - **If an approach fails, diagnose why before switching.** Read the error, check assumptions, try a focused fix. Don't retry blindly.
+
+## Tool Usage Preferences
+ - Use **read** instead of cat/head/tail to read files.
+ - Use **edit** instead of sed/awk to modify files.
+ - Use **write** instead of echo redirection to create files.
+ - Use **glob** instead of find/ls to search for files.
+ - Use **grep** instead of shell grep/rg to search file contents.
+ - Reserve **bash** for system commands that require shell execution.
+ - Call multiple independent tools in parallel for efficiency.
+
+## Risk Assessment
+ - Local, reversible actions (editing files, running tests) are fine to do freely.
+ - For hard-to-reverse or destructive actions (deleting files, force push, dropping tables), verify before executing.
+ - When uncertain, describe the action and its risks rather than executing blindly.
+
+## Output Efficiency
+ - Go straight to the point. Lead with the answer or result, not the reasoning.
+ - Skip filler words, preamble, and unnecessary transitions.
+ - If you can say it in one sentence, don't use three.
+ - Focus output on: decisions, status updates, errors, and key findings.
+
+## Your Task
+{task_desc}
+
+## Expected Output
+{expected_output}
+
+## Tool Usage
+{role_guide}
+
+## Critical Rules
+1. **USE tools — do not simulate.** Always call a tool rather than fabricating results.
+2. Report actual findings, not invented information.
+3. If a tool returns an error, describe the error honestly — do not guess.
+4. When citing sources, include URLs, PMIDs, or file paths.
+5. Complete the task thoroughly before reporting."#,
+        role_uppercase = capitalize_role(role),
+        task_desc = task_desc,
+        expected_output = expected_output,
+        role_guide = role_guide,
+    )
+}
+
+fn capitalize_role(role: &str) -> String {
+    let mut chars = role.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
+// ── Researcher Stage ────────────────────────────────────────────
+
+/// A tool-using research agent that gathers information from the web and local files.
+///
+/// Unlike the generic AgentStage, ResearcherStage:
+/// - Uses the "researcher" role system prompt (emphasizes citations and sources)
+/// - Restricts available tools to the researcher set (web_search, web_fetch, pubmed_search, etc.)
+/// - Saves output to research_output.json for downstream stages
+pub struct ResearcherStage {
+    agent: Arc<Agent>,
+    max_iterations: usize,
+    max_tokens: Option<u32>,
+}
+
+impl ResearcherStage {
+    pub fn new(agent: Arc<Agent>) -> Self {
+        Self { agent, max_iterations: 35, max_tokens: None }
+    }
+
+    pub fn with_limits(mut self, max_iterations: usize, max_tokens: u32) -> Self {
+        self.max_iterations = max_iterations;
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+}
+
+#[async_trait]
+impl StageHandler for ResearcherStage {
+    fn name(&self) -> &str { "researcher" }
+    fn description(&self) -> &str { "Gather information from web and local sources with citations" }
+
+    async fn execute(&self, ctx: &StageContext) -> Result<StageOutput, StageError> {
+        let prompt = ctx.input["prompt"].as_str().unwrap_or("");
+        let system = role_system_prompt_local(
+            "researcher",
+            prompt,
+            "A well-sourced research document with citations (URLs, PMIDs, patent numbers).",
+        );
+
+        // Augment system prompt with matching skills
+        let augmented_system = self.build_researcher_prompt(&system, prompt).await;
+
+        let complexity = match ctx.input["complexity"].as_str().unwrap_or("moderate") {
+            "simple" => TaskComplexity::Simple,
+            "complex" => TaskComplexity::Complex,
+            "deep" => TaskComplexity::DeepResearch,
+            _ => TaskComplexity::Moderate,
+        };
+        let provider = match ctx.input["provider"].as_str().unwrap_or("flash") {
+            "pro" => ProviderChoice::Pro,
+            _ => ProviderChoice::Flash,
+        };
+
+        let allowed = role_tools("researcher")
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        let mut history: Vec<Message> = Vec::new();
+        history.push(Message::user(prompt));
+
+        let mut context = RunContext::new(augmented_system)
+            .with_complexity(complexity)
+            .with_provider(provider)
+            .with_allowed_tools(allowed);
+        context.max_tool_iterations = self.max_iterations;
+        context.max_tokens = self.max_tokens;
+
+        match self.agent.run_with_loop(&mut history, &context, ctx.cancel.clone()).await {
+            Ok(delta) => {
+                let text = if !delta.new_messages.is_empty() {
+                    delta.new_messages.iter()
+                        .map(|m| m.text_content())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    history.iter()
+                        .rev()
+                        .find(|m| m.role == miniagent_core::message::MessageRole::Assistant)
+                        .map(|m| m.text_content())
+                        .unwrap_or_default()
+                };
+
+                let mut tool_call_map: std::collections::HashMap<String, (String, serde_json::Value)> = std::collections::HashMap::new();
+                for msg in &history {
+                    if msg.role == miniagent_core::message::MessageRole::Assistant {
+                        for block in &msg.content {
+                            if let miniagent_core::event::ContentBlock::ToolUse { id, name, input } = block {
+                                tool_call_map.insert(format!("{}", id.0), (name.clone(), input.clone()));
+                            }
+                        }
+                    }
+                }
+
+                let tool_results: Vec<String> = history.iter()
+                    .filter(|m| m.role == miniagent_core::message::MessageRole::Tool)
+                    .map(|m| m.text_content())
+                    .collect();
+
+                let tool_entries: Vec<serde_json::Value> = tool_results.iter().map(|r| {
+                    let (call_id, content) = if let Some(idx) = r.find("] ") {
+                        let id_part = &r[1..idx];
+                        let content = &r[idx + 2..];
+                        (id_part.trim_start_matches("toolu_vrtx_").to_string(), content.to_string())
+                    } else {
+                        (String::new(), r.clone())
+                    };
+                    let (name, input) = tool_call_map.get(&call_id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), serde_json::Value::Null));
+                    let input_preview = match &input {
+                        serde_json::Value::String(s) => s.chars().take(200).collect(),
+                        serde_json::Value::Object(m) => {
+                            let pairs: Vec<String> = m.iter()
+                                .take(5)
+                                .map(|(k,v)| format!("{}: {}", k, v))
+                                .collect();
+                            pairs.join(", ")
+                        }
+                        other => format!("{:.200}", other),
+                    };
+                    let result_preview: String = content.chars().take(300).collect();
+                    let result_expanded: String = content.chars().take(2000).collect();
+                    let url_pattern = regex_lite::Regex::new(r"https?://[^\s\)\]>,;]+").unwrap();
+                    let urls: Vec<String> = url_pattern.find_iter(&content)
+                        .map(|m| m.as_str().to_string())
+                        .collect();
+                    let input_url = match &input {
+                        serde_json::Value::Object(m) => m.get("url").and_then(|v| v.as_str()).map(String::from),
+                        _ => None,
+                    };
+                    serde_json::json!({
+                        "name": name,
+                        "input_preview": input_preview,
+                        "input_url": input_url,
+                        "result_preview": result_preview,
+                        "result_expanded": result_expanded,
+                        "urls": urls,
+                        "is_error": content.contains("Error:") || content.contains("error:"),
+                    })
+                }).collect();
+
+                let output_data = serde_json::json!({
+                    "response": text,
+                    "tool_calls": tool_results.len(),
+                    "tool_results": tool_results,
+                    "tool_entries": tool_entries,
+                    "tokens_in": delta.usage.input_tokens,
+                    "tokens_out": delta.usage.output_tokens,
+                    "stop_reason": format!("{:?}", delta.stop_reason),
+                });
+                save_stage_output(ctx, "research_output.json", &output_data);
+
+                Ok(StageOutput {
+                    data: output_data,
+                    metadata: StageMetadata {
+                        duration_ms: 0,
+                        items_processed: tool_results.len() + 1,
+                        success: true,
+                        error: None,
+                    },
+                })
+            }
+            Err(e) => Err(StageError::Failed(format!("Researcher error: {e}"))),
+        }
+    }
+}
+
+impl ResearcherStage {
+    /// Build system prompt augmented with relevant skills (same as AgentStage).
+    async fn build_researcher_prompt(&self, base_system: &str, user_prompt: &str) -> String {
+        use miniagent_skill::discovery::SkillDiscovery;
+        use miniagent_skill::registry::SkillRegistry;
+
+        let mut augmented = base_system.to_string();
+
+        let discovery = SkillDiscovery::new();
+        let bundles = discovery.discover();
+        if bundles.is_empty() {
+            return augmented;
+        }
+
+        let mut registry = SkillRegistry::new();
+        for b in bundles {
+            registry.register(b);
+        }
+
+        let matches = registry.find_matching(user_prompt, 3);
+        if matches.is_empty() {
+            return augmented;
+        }
+
+        for skill in &matches {
+            let _ = self.agent.emit_event(
+                miniagent_core::event::AgentEvent::SkillInvoked {
+                    skill_name: skill.metadata.name.clone(),
+                    trigger: user_prompt.to_string(),
+                }
+            ).await;
+        }
+
+        let skill_names: Vec<&str> = matches.iter().map(|s| s.metadata.name.as_str()).collect();
+        tracing::debug!(skills = %skill_names.join(", "), "Matched skills for researcher");
+
+        augmented.push_str("\n\n## Available Skills for this Task\n");
+        augmented.push_str("You have access to the following specialized skills. \
+                            Follow their methodology when relevant:\n\n");
+
+        for skill in matches {
+            let body_preview: String = skill.body
+                .lines()
+                .take(30)
+                .collect::<Vec<_>>()
+                .join("\n");
+            augmented.push_str(&format!(
+                "### Skill: {}\n{}\n\n",
+                skill.metadata.name,
+                body_preview,
+            ));
+        }
+
+        augmented.push_str("\nUse the skill methodologies above to guide your approach. \
+                           Execute the skill's steps using the available tools.\n");
+
+        augmented
+    }
+}
+
+// ── Analyst Stage ───────────────────────────────────────────────
+
+/// A data analysis agent that reads files, analyzes data, generates charts, and saves results.
+///
+/// Unlike the generic AgentStage, AnalystStage:
+/// - Uses the "analyst" role system prompt (emphasizes file reading, pattern finding, visualization)
+/// - Restricts available tools to the analyst set (read, grep, glob, bash for Python/matplotlib)
+/// - Reads data from previous stage outputs or local files
+/// - Can execute Python scripts via bash to generate charts (matplotlib, plotly, etc.)
+/// - Saves analysis report to analysis_output.md and chart files to the task directory
+pub struct AnalystStage {
+    agent: Arc<Agent>,
+    max_iterations: usize,
+    max_tokens: Option<u32>,
+}
+
+impl AnalystStage {
+    pub fn new(agent: Arc<Agent>) -> Self {
+        Self { agent, max_iterations: 35, max_tokens: None }
+    }
+
+    pub fn with_limits(mut self, max_iterations: usize, max_tokens: u32) -> Self {
+        self.max_iterations = max_iterations;
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+}
+
+#[async_trait]
+impl StageHandler for AnalystStage {
+    fn name(&self) -> &str { "analyst" }
+    fn description(&self) -> &str { "Analyze data files, generate charts, and save visualizations" }
+
+    async fn execute(&self, ctx: &StageContext) -> Result<StageOutput, StageError> {
+        let user_prompt = ctx.input["prompt"].as_str().unwrap_or("");
+
+        // Gather upstream data outputs for context
+        let upstream_data: String = ctx.previous_outputs.values()
+            .filter_map(|v| {
+                let resp = v["response"].as_str()?;
+                let tool_results = v["tool_results"].as_array()?
+                    .iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join("\n");
+                Some(format!("## Previous Output\n{resp}\n\n## Tool Results\n{tool_results}\n"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n\n");
+
+        let analysis_prompt = if upstream_data.is_empty() {
+            format!(
+                "Analyze the data and produce insights with visualizations.\n\n\
+                 ## Task\n{user_prompt}\n\n\
+                 ## Instructions\n\
+                 1. Use **read**, **glob**, **grep** to discover and examine data files in the task directory.\n\
+                 2. Use **bash** to run Python scripts for data analysis and chart generation (matplotlib, plotly, etc.).\n\
+                 3. Save charts as PNG/SVG files in the task directory.\n\
+                 4. Write your analysis report to analysis_output.md with embedded chart references.\n\
+                 5. Include data tables, statistical summaries, and key findings."
+            )
+        } else {
+            format!(
+                "Analyze the following data and produce insights with visualizations.\n\n\
+                 ## Task\n{user_prompt}\n\n\
+                 ## Data from Previous Stages\n{upstream_data}\n\n\
+                 ## Instructions\n\
+                 1. Use **read**, **glob**, **grep** to examine the data files referenced above or in the task directory.\n\
+                 2. Use **bash** to run Python scripts for data analysis and chart generation (matplotlib, plotly, etc.).\n\
+                 3. Save charts as PNG/SVG files in the task directory.\n\
+                 4. Write your analysis report to analysis_output.md with embedded chart references.\n\
+                 5. Include data tables, statistical summaries, and key findings."
+            )
+        };
+
+        let system = role_system_prompt_local(
+            "analyst",
+            &analysis_prompt,
+            "Analysis report (analysis_output.md) with data tables, statistical summaries, \
+             chart file paths, and key findings. All sources referenced.",
+        );
+
+        let complexity = match ctx.input["complexity"].as_str().unwrap_or("moderate") {
+            "simple" => TaskComplexity::Simple,
+            "complex" => TaskComplexity::Complex,
+            "deep" => TaskComplexity::DeepResearch,
+            _ => TaskComplexity::Moderate,
+        };
+        let provider = match ctx.input["provider"].as_str().unwrap_or("flash") {
+            "pro" => ProviderChoice::Pro,
+            _ => ProviderChoice::Flash,
+        };
+
+        let allowed = role_tools("analyst")
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        let mut history: Vec<Message> = Vec::new();
+        history.push(Message::user(&analysis_prompt));
+
+        let mut context = RunContext::new(system)
+            .with_complexity(complexity)
+            .with_provider(provider)
+            .with_allowed_tools(allowed);
+        context.max_tool_iterations = self.max_iterations;
+        context.max_tokens = self.max_tokens;
+
+        match self.agent.run_with_loop(&mut history, &context, ctx.cancel.clone()).await {
+            Ok(delta) => {
+                let text = if !delta.new_messages.is_empty() {
+                    delta.new_messages.iter()
+                        .map(|m| m.text_content())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    history.iter()
+                        .rev()
+                        .find(|m| m.role == miniagent_core::message::MessageRole::Assistant)
+                        .map(|m| m.text_content())
+                        .unwrap_or_default()
+                };
+
+                let tool_results: Vec<String> = history.iter()
+                    .filter(|m| m.role == miniagent_core::message::MessageRole::Tool)
+                    .map(|m| m.text_content())
+                    .collect();
+
+                let output_data = serde_json::json!({
+                    "response": text,
+                    "tool_calls": tool_results.len(),
+                    "tool_results": tool_results,
+                    "tokens_in": delta.usage.input_tokens,
+                    "tokens_out": delta.usage.output_tokens,
+                    "stop_reason": format!("{:?}", delta.stop_reason),
+                });
+
+                // Persist analysis report
+                let dir = task_workflow_dir(ctx);
+                let _ = std::fs::write(dir.join("analysis_output.md"), &text);
+
+                Ok(StageOutput {
+                    data: output_data,
+                    metadata: StageMetadata {
+                        duration_ms: 0,
+                        items_processed: tool_results.len() + 1,
+                        success: true,
+                        error: None,
+                    },
+                })
+            }
+            Err(e) => Err(StageError::Failed(format!("Analyst error: {e}"))),
+        }
+    }
+}
+
 // ── Multi-Agent: Critic Stage ──────────────────────────────────
 
 use miniagent_provider::traits::LlmProvider;
@@ -675,11 +1144,10 @@ impl StageHandler for OrchestratorStage {
         // 2. From the stage_sub_tasks map in initial input (set by WorkflowBuilder)
         if sub_tasks.is_empty() {
             let stage_name = self.name();
-            if let Some(map) = ctx.input["stage_sub_tasks"].as_object() {
-                if let Some(arr) = map.get(stage_name).and_then(|v| v.as_array()) {
+            if let Some(map) = ctx.input["stage_sub_tasks"].as_object()
+                && let Some(arr) = map.get(stage_name).and_then(|v| v.as_array()) {
                     sub_tasks = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
                 }
-            }
         }
 
         // 3. From previous stage outputs (when orchestrator is not root)
@@ -793,7 +1261,7 @@ impl StageHandler for OrchestratorStage {
         // Use the agent to synthesize — give it the worker results as context
         let mut history = vec![
             Message::system(system),
-            Message::user(&format!(
+            Message::user(format!(
                 r#"You are the orchestrator. Your workers have completed their sub-tasks for the overall goal:
 
 ## Overall Goal
@@ -879,7 +1347,21 @@ impl StageHandler for PlannerStage {
         let prompt = ctx.input["prompt"].as_str().unwrap_or("");
 
         if prompt.is_empty() {
-            let spec = crate::builder::WorkflowSpec::single_agent();
+            let spec = crate::builder::WorkflowSpec {
+                task_type: "single_agent".into(),
+                stages: vec![crate::builder::StageSpec {
+                    name: "agent".into(),
+                    handler_type: "agent".into(),
+                    system_prompt: String::new(),
+                    tools: vec![],
+                    model_tier: "flash".into(),
+                    max_iterations: 50,
+                    enable_skills: true,
+                    description: String::new(),
+                    sub_tasks: vec![],
+                }],
+                edges: vec![],
+            };
             return Ok(spec_to_output(&spec));
         }
 
@@ -893,21 +1375,15 @@ impl StageHandler for PlannerStage {
 
 ## Available Stage Types
 - "agent": Full AI agent with tool access (web_search, web_fetch, pubmed_search, patent_search, clinical_trials_search, bash, read, write, edit, grep, glob, git, conda). Can do multi-turn research. Suitable for information gathering, code writing, data collection.
+- "researcher": Specialized research agent. Uses web_search, web_fetch, pubmed_search, patent_search, clinical_trials_search, and read tools. Gathers information from web and local sources, always cites sources (URLs, PMIDs, patent numbers). Produces research_output.json with structured tool results. Best for literature reviews, patent searches, clinical trial surveys.
+- "analyst": Data analysis agent. Uses read, grep, glob, and bash tools. Reads data files, analyzes datasets, generates charts via Python (matplotlib, plotly), saves visualization files. Produces analysis_output.md with data tables, statistical summaries, and chart references. Best for data analysis, visualization, statistical reporting.
 - "critic": Reviews previous stage output for gaps, errors, weaknesses, overstatements. Produces structured critique.
 - "synthesizer": Integrates all previous outputs into polished final result with deep reasoning. Best for final report generation.
 - "llm": Generic LLM processing stage with custom system prompt. Use for domain-specific transformation (e.g., translation, formatting, domain analysis).
 - "orchestrator": Decomposes complex tasks into parallel sub-tasks, dispatches them to worker agents, then synthesizes results. Use when the task has multiple independent facets that can be researched/processed concurrently.
 
-## Reference Workflow Patterns (adopt if appropriate, or design your own)
-1. **Simple task** (code, math, quick Q&A): 1 agent stage only.
-2. **Research & synthesis** (literature review, survey, report): agent → critic → synthesizer, or orchestrator → synthesizer for broad multi-topic research.
-3. **Writing** (draft, essay, proposal): agent → synthesizer with writing-focused system_prompt.
-4. **Analysis & recommendation** (policy, strategy): agent → llm(analyst) → synthesizer.
-5. **Multi-perspective** (debate, comparison): multiple agent stages → critic → synthesizer.
-6. **Parallel research** (multi-topic investigation): orchestrator with sub_tasks for each topic → synthesizer for unified report.
-
 ## Design Rules
-- Use 1-5 stages. Simple tasks need only 1 agent stage.
+- Use 1-5 stages. Single-stage tasks should use a single "agent" stage.
 - Use "orchestrator" for tasks with clearly separable sub-tasks (e.g., "research topics A, B, and C").
 - Each "orchestrator" sub_task becomes an independent worker agent — list them explicitly.
 - First stage should almost always be "agent" or "orchestrator" (to gather information).
@@ -915,7 +1391,7 @@ impl StageHandler for PlannerStage {
 - Model tier: "flash" for search/tool-heavy stages, "pro" for complex reasoning/writing/synthesis.
 - enable_skills: true only for agent stages.
 - edges define execution order as [from_stage_name, to_stage_name].
-- You may design custom workflows not listed above if the task demands it.
+- You may design custom workflows for any task structure.
 
 ## Output Format (JSON only, no markdown)
 {{
@@ -923,7 +1399,7 @@ impl StageHandler for PlannerStage {
   "stages": [
     {{
       "name": "stage_name",
-      "handler_type": "agent|critic|synthesizer|llm|orchestrator",
+      "handler_type": "agent|researcher|analyst|critic|synthesizer|llm|orchestrator",
       "description": "One sentence describing this stage's role in the workflow",
       "sub_tasks": [
         "Specific sub-task 1 delegated to this stage",
@@ -955,7 +1431,21 @@ impl StageHandler for PlannerStage {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "Planner LLM failed, using single-agent fallback");
-                let spec = crate::builder::WorkflowSpec::single_agent();
+                let spec = crate::builder::WorkflowSpec {
+                task_type: "single_agent".into(),
+                stages: vec![crate::builder::StageSpec {
+                    name: "agent".into(),
+                    handler_type: "agent".into(),
+                    system_prompt: String::new(),
+                    tools: vec![],
+                    model_tier: "flash".into(),
+                    max_iterations: 50,
+                    enable_skills: true,
+                    description: String::new(),
+                    sub_tasks: vec![],
+                }],
+                edges: vec![],
+            };
                 return Ok(spec_to_output(&spec));
             }
         };
@@ -976,7 +1466,21 @@ impl StageHandler for PlannerStage {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "Planner output parse error, using single-agent fallback");
-                let spec = crate::builder::WorkflowSpec::single_agent();
+                let spec = crate::builder::WorkflowSpec {
+                task_type: "single_agent".into(),
+                stages: vec![crate::builder::StageSpec {
+                    name: "agent".into(),
+                    handler_type: "agent".into(),
+                    system_prompt: String::new(),
+                    tools: vec![],
+                    model_tier: "flash".into(),
+                    max_iterations: 50,
+                    enable_skills: true,
+                    description: String::new(),
+                    sub_tasks: vec![],
+                }],
+                edges: vec![],
+            };
                 return Ok(spec_to_output(&spec));
             }
         };

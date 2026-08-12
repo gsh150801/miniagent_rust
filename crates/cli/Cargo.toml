@@ -15,10 +15,10 @@ miniagent-agent = { path = "../agent" }
 miniagent-tool = { path = "../tool" }
 miniagent-memory = { path = "../memory" }
 miniagent-checkpoint = { path = "../checkpoint" }
-miniagent-evolution = { path = "../evolution" }
 miniagent-workflow = { path = "../workflow" }
 miniagent-kg = { path = "../kg" }
 miniagent-hypothesis = { path = "../hypothesis" }
+miniagent-analysis = { path = "../analysis" }
 miniagent-self-improve = { path = "../self-improve" }
 miniagent-telemetry = { path = "../telemetry" }
 miniagent-skill = { path = "../skill" }
@@ -32,3 +32,4 @@ dotenvy.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
+tracing.workspace = true

@@ -24,6 +24,17 @@ pub struct HealthState {
     probed: HashSet<String>,
     /// Full probe results (for diagnostics).
     results: Vec<BackendHealth>,
+    /// Runtime circuit-breaker: backends temporarily disabled due to repeated
+    /// failures, with the timestamp they were disabled at.
+    disabled: std::collections::HashMap<String, std::time::Instant>,
+    /// How long a disabled backend stays disabled before being retried.
+    cooldown_secs: u64,
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HealthState {
@@ -32,10 +43,21 @@ impl HealthState {
             healthy: HashSet::new(),
             probed: HashSet::new(),
             results: Vec::new(),
+            disabled: std::collections::HashMap::new(),
+            cooldown_secs: 120, // re-probe after 2 minutes
         }
     }
 
+    /// Check if a backend is currently usable. Backends that are disabled
+    /// due to runtime failures (circuit breaker) return false, but only
+    /// until the cooldown expires — after which they're retried automatically.
     pub fn is_healthy(&self, name: &str) -> bool {
+        // Circuit breaker: if disabled and within cooldown, skip.
+        if let Some(disabled_at) = self.disabled.get(name)
+            && disabled_at.elapsed().as_secs() < self.cooldown_secs {
+                return false;
+            }
+            // Cooldown expired — allow retry (will re-disable if it fails again).
         if !self.probed.contains(name) {
             return true; // not yet probed → assume healthy
         }
@@ -45,6 +67,8 @@ impl HealthState {
     pub fn mark_healthy(&mut self, name: &str) {
         self.probed.insert(name.to_string());
         self.healthy.insert(name.to_string());
+        // Clear any runtime circuit-breaker state.
+        self.disabled.remove(name);
     }
 
     pub fn mark_unhealthy(&mut self, name: &str, error: String, latency_ms: u64) {
@@ -58,8 +82,27 @@ impl HealthState {
         });
     }
 
+    /// Temporarily disable a backend at runtime (circuit breaker).
+    /// Called when a search fails repeatedly. The backend will be retried
+    /// after the cooldown period.
+    pub fn disable_runtime(&mut self, name: &str) {
+        self.disabled.insert(name.to_string(), std::time::Instant::now());
+    }
+
+    /// Check if a backend is disabled by the runtime circuit breaker.
+    pub fn is_disabled(&self, name: &str) -> bool {
+        if let Some(disabled_at) = self.disabled.get(name) {
+            disabled_at.elapsed().as_secs() < self.cooldown_secs
+        } else {
+            false
+        }
+    }
+
     pub fn healthy_backends(&self) -> Vec<String> {
-        self.probed.iter().filter(|n| self.healthy.contains(*n)).cloned().collect()
+        self.probed.iter()
+            .filter(|n| self.is_healthy(n))
+            .cloned()
+            .collect()
     }
 
     pub fn all_results(&self) -> &[BackendHealth] {
@@ -127,9 +170,31 @@ pub async fn probe_all_backends() -> Vec<BackendHealth> {
     }
 
     // PubMed probe
+    let client2 = client.clone();
     handles.push(tokio::spawn(async move {
-        probe_pubmed(&client, test_query).await
+        probe_pubmed(&client2, test_query).await
     }));
+
+    // LangSearch probe
+    let langsearch_key = env_opt("LANGSEARCH_API_KEY");
+    if let Some(key) = langsearch_key {
+        let client = client.clone();
+        let q = test_query.to_string();
+        handles.push(tokio::spawn(async move {
+            probe_langsearch(&client, &q, &key).await
+        }));
+    } else {
+        record_unhealthy("langsearch", "LANGSEARCH_API_KEY not set", 0).await;
+    }
+
+    // DDG probe (no key required — always try)
+    {
+        let client = client.clone();
+        let q = test_query.to_string();
+        handles.push(tokio::spawn(async move {
+            probe_ddgs(&client, &q).await
+        }));
+    }
 
     // Collect results
     let mut results = Vec::new();
@@ -236,9 +301,10 @@ async fn probe_tavily(client: &reqwest::Client, query: &str, api_key: &str) -> B
 async fn probe_bocha(client: &reqwest::Client, query: &str, api_key: &str) -> BackendHealth {
     let start = std::time::Instant::now();
     match client
-        .get("https://api.bochaai.com/v1/ai/search")
+        .post("https://api.bochaai.com/v1/web-search")
         .header("Authorization", format!("Bearer {api_key}"))
-        .query(&[("query", query), ("count", "1")])
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({"query": query, "count": 1}))
         .send()
         .await
     {
@@ -291,13 +357,140 @@ async fn probe_pubmed(client: &reqwest::Client, query: &str) -> BackendHealth {
     }
 }
 
+/// Probe LangSearch API health.
+async fn probe_langsearch(client: &reqwest::Client, query: &str, api_key: &str) -> BackendHealth {
+    let start = std::time::Instant::now();
+    match client
+        .post("https://api.langsearch.com/v1/web-search")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({"query": query, "num": 1}))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => BackendHealth {
+            name: "langsearch".into(),
+            healthy: true,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        },
+        Ok(resp) => BackendHealth {
+            name: "langsearch".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("HTTP {}", resp.status())),
+        },
+        Err(e) => BackendHealth {
+            name: "langsearch".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("{e}")),
+        },
+    }
+}
+
+/// Probe DuckDuckGo HTML endpoint health (no API key required).
+/// DDG may need a proxy in some regions — the probe tries via proxy if configured.
+async fn probe_ddgs(_client: &reqwest::Client, query: &str) -> BackendHealth {
+    let start = std::time::Instant::now();
+
+    // DDG is often blocked without a proxy. Build a proxy-aware client if
+    // ALL_PROXY / HTTPS_PROXY is set, matching the search_ddgs runtime behavior.
+    let client = if let Some(proxy_url) = env_opt("ALL_PROXY")
+        .or_else(|| env_opt("all_proxy"))
+        .or_else(|| env_opt("HTTPS_PROXY"))
+        .or_else(|| env_opt("https_proxy"))
+    {
+        match reqwest::Proxy::all(&proxy_url) {
+            Ok(proxy) => match reqwest::Client::builder()
+                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .timeout(std::time::Duration::from_secs(15))
+                .proxy(proxy)
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return BackendHealth {
+                    name: "ddgs".into(), healthy: false,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: Some(format!("proxy client build: {e}")),
+                },
+            },
+            Err(e) => return BackendHealth {
+                name: "ddgs".into(), healthy: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                error: Some(format!("proxy parse: {e}")),
+            },
+        }
+    } else {
+        // No proxy configured — use the passed-in client directly
+        return match _client
+            .post("https://html.duckduckgo.com/html/")
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .query(&[("q", query)])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.text().await.unwrap_or_default();
+                let has_results = body.contains("result__a");
+                BackendHealth {
+                    name: "ddgs".into(), healthy: has_results,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: if has_results { None } else { Some("No results".into()) },
+                }
+            }
+            Ok(resp) => BackendHealth {
+                name: "ddgs".into(), healthy: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                error: Some(format!("HTTP {}", resp.status())),
+            },
+            Err(e) => BackendHealth {
+                name: "ddgs".into(), healthy: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                error: Some(format!("{e}")),
+            },
+        };
+    };
+
+    // Use GET with query param — DDG HTML endpoint works more reliably with GET.
+    match client
+        .get("https://html.duckduckgo.com/html/")
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .query(&[("q", query)])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            let has_results = body.contains("result__a") || body.contains("result__snippet");
+            BackendHealth {
+                name: "ddgs".into(),
+                healthy: has_results,
+                latency_ms: start.elapsed().as_millis() as u64,
+                error: if has_results { None } else { Some("No results in response".into()) },
+            }
+        }
+        Ok(resp) => BackendHealth {
+            name: "ddgs".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("HTTP {}", resp.status())),
+        },
+        Err(e) => BackendHealth {
+            name: "ddgs".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("{e}")),
+        },
+    }
+}
+
 async fn record_health(result: &BackendHealth) {
     let mut state = HEALTH_STATE.write().await;
     if result.healthy {
         state.mark_healthy(&result.name);
     } else {
-        state.mark_unhealthy(&result.name, result.error.clone().unwrap_or_default(), result.latency_ms);
-    }
+        state.mark_unhealthy(&result.name, result.error.clone().unwrap_or_default(), result.latency_ms);    }
 }
 
 async fn record_unhealthy(name: &str, error: &str, latency_ms: u64) {

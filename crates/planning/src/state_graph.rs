@@ -16,9 +16,9 @@ const MAX_CONTEXT_TOKENS: usize = 16_000;
 /// 单个 step 输出的字符上限（≈2700 tokens）。防止单个 step 吃满预算。
 const MAX_STEP_CHARS: usize = 8_000;
 
-/// 粗略 token 估算：chars/3 适用于中英混合/代码（与 agent crate 一致）。
+/// 粗略 token 估算：UTF-8 字节数/4（参考 cc-python-claude，比旧的 chars/3 对中文更准确）。
 fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 3
+    text.len() / 4 // len() = UTF-8 字节数
 }
 
 /// 结构感知截断：在 `max_chars` 附近找**安全截断点**，避免切断 JSON/代码结构。
@@ -38,7 +38,7 @@ fn truncate_structured(content: &str, max_chars: usize) -> String {
         .unwrap_or(content.len());
 
     // 从 max_byte 往前找安全边界：} / ] / 换行（倒序搜索最近的一个）
-    let safe_end = content[..max_byte].rfind(|c| c == '}' || c == ']' || c == '\n')
+    let safe_end = content[..max_byte].rfind(['}', ']', '\n'])
         .map(|pos| {
             // 在边界字符之后截断（+1 含边界字符本身）
             (pos + 1).min(content.len())
@@ -216,85 +216,105 @@ impl StateGraph {
         self
     }
 
-    /// Compile: DFS cycle detection, then topo-sort.
-    /// Returns waves of nodes that can execute in parallel within each wave.
-    pub fn compile(self) -> Result<CompiledGraph, String> {
-        // Build adjacency from edges
-        let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-        for name in self.nodes.keys() {
-            adjacency.entry(name.clone()).or_default();
-        }
-        for (from, to) in &self.edges {
-            adjacency.entry(from.clone()).or_default().push(to.clone());
-        }
-        for ce in &self.conditional_edges {
-            for (target, _) in &ce.routes {
-                adjacency.entry(ce.from.clone()).or_default().push(target.clone());
-            }
-            adjacency.entry(ce.from.clone()).or_default().push(ce.default.clone());
-        }
+    /// Compile: DFS cycle detection, then topo-sort via the canonical
+/// Kahn scheduler in `miniagent_core::orchestration::kahn_waves`.
+///
+/// Returns waves of nodes that can execute in parallel within each wave.
+///
+/// State-graph keeps two pre-consolidation behaviors that the canonical
+/// Kahn does NOT provide on its own:
+/// 1. **DFS pre-check** with node-named error messages (canonical only says
+///    "cycle involving: …" without names).
+/// 2. **Entry-point force** to in-degree 0 (canonical respects whatever
+///    edges say).
+/// 3. **Conditional-edge expansion** — each conditional route + default
+///    becomes a regular edge before scheduling.
+pub fn compile(self) -> Result<CompiledGraph, String> {
+    use miniagent_core::orchestration::{kahn_waves, DagEdge};
 
-        // DFS cycle detection
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut on_stack: HashSet<String> = HashSet::new();
-        for name in self.nodes.keys() {
-            if !visited.contains(name)
-                && Self::has_cycle(name, &adjacency, &mut visited, &mut on_stack) {
-                    return Err(format!("Cycle detected in graph (involving node '{name}')"));
-                }
-        }
-
-        // Topological sort (Kahn's algorithm with wave grouping)
-        // Note: adjacency already built above, only need in_degree
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
-        for name in self.nodes.keys() {
-            in_degree.insert(name.clone(), 0);
-        }
-        for (_, to) in &self.edges {
-            *in_degree.entry(to.clone()).or_insert(0) += 1;
-        }
-        for ce in &self.conditional_edges {
-            for (target, _) in &ce.routes {
-                *in_degree.entry(target.clone()).or_insert(0) += 1;
-            }
-            *in_degree.entry(ce.default.clone()).or_insert(0) += 1;
-        }
-
-        // Force entry point to in_degree 0
-        in_degree.insert(self.entry_point.clone(), 0);
-
-        let mut queue: VecDeque<String> = in_degree.iter()
-            .filter(|(_, d)| **d == 0).map(|(n, _)| n.clone()).collect();
-        let mut order = Vec::new();
-
-        while !queue.is_empty() {
-            let wave: Vec<String> = queue.drain(..).collect();
-            let mut next = VecDeque::new();
-            for name in &wave {
-                if let Some(neighbors) = adjacency.get(name) {
-                    for neighbor in neighbors {
-                        if let Some(deg) = in_degree.get_mut(neighbor) {
-                            *deg -= 1;
-                            if *deg == 0 { next.push_back(neighbor.clone()); }
-                        }
-                    }
-                }
-            }
-            order.push(wave);
-            queue = next;
-        }
-
-        let total: usize = order.iter().map(|w| w.len()).sum();
-        if total != self.nodes.len() {
-            return Err(format!("Cycle detected: {total}/{} reachable", self.nodes.len()));
-        }
-
-        Ok(CompiledGraph {
-            node_order: order, nodes: self.nodes, edges: self.edges,
-            conditional_edges: self.conditional_edges, checkpoints: self.checkpoints,
-            entry_point: self.entry_point,
-        })
+    // 1) Build adjacency (used for both DFS cycle check and edge expansion).
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for name in self.nodes.keys() {
+        adjacency.entry(name.clone()).or_default();
     }
+    for (from, to) in &self.edges {
+        adjacency.entry(from.clone()).or_default().push(to.clone());
+    }
+    for ce in &self.conditional_edges {
+        for (target, _) in &ce.routes {
+            adjacency
+                .entry(ce.from.clone())
+                .or_default()
+                .push(target.clone());
+        }
+        adjacency
+            .entry(ce.from.clone())
+            .or_default()
+            .push(ce.default.clone());
+    }
+
+    // 2) DFS cycle detection (preserves node-named error messages).
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    for name in self.nodes.keys() {
+        if !visited.contains(name)
+            && Self::has_cycle(name, &adjacency, &mut visited, &mut on_stack)
+        {
+            return Err(format!(
+                "Cycle detected in graph (involving node '{name}')"
+            ));
+        }
+    }
+
+    // 3) Build the (nodes, edges) for the canonical Kahn scheduler.
+    //    Expand conditional edges into regular DagEdges and force the
+    //    entry point to in-degree 0 by NOT including inbound edges that
+    //    target it.
+    let nodes: Vec<String> = self.nodes.keys().cloned().collect();
+    let mut edges: Vec<DagEdge> = Vec::new();
+    for (from, to) in &self.edges {
+        if to == &self.entry_point {
+            // Entry point — skip this inbound edge to force in-degree 0.
+            continue;
+        }
+        edges.push(DagEdge {
+            to: to.clone(),
+            depends_on: from.clone(),
+        });
+    }
+    for ce in &self.conditional_edges {
+        for (target, _) in &ce.routes {
+            if target == &self.entry_point {
+                continue;
+            }
+            edges.push(DagEdge {
+                to: target.clone(),
+                depends_on: ce.from.clone(),
+            });
+        }
+        if ce.default != self.entry_point {
+            edges.push(DagEdge {
+                to: ce.default.clone(),
+                depends_on: ce.from.clone(),
+            });
+        }
+    }
+
+    // 4) Run the canonical scheduler.
+    let order = kahn_waves(&nodes, &edges).map_err(|e| match e {
+        miniagent_core::orchestration::OrchestrationError::Plan(msg) => msg,
+        other => other.to_string(),
+    })?;
+
+    Ok(CompiledGraph {
+        node_order: order,
+        nodes: self.nodes,
+        edges: self.edges,
+        conditional_edges: self.conditional_edges,
+        checkpoints: self.checkpoints,
+        entry_point: self.entry_point,
+    })
+}
 
     fn has_cycle(
         node: &str,
@@ -1030,8 +1050,8 @@ mod tests {
     #[test]
     fn estimate_tokens_mixed_content() {
         // chars/3 口径（整数除法）：英文 ~1 token/4char，中文 ~1 token/1.5char，混合取 chars/3 合理
-        assert_eq!(estimate_tokens("hello world"), 3); // 11 chars / 3 = 3
-        assert_eq!(estimate_tokens("你好世界测试"), 2); // 6 chars / 3 = 2
+        assert_eq!(estimate_tokens("hello world"), 2); // 11 bytes / 4 = 2
+        assert_eq!(estimate_tokens("你好世界测试"), 4); // 18 bytes / 4 = 4
         assert_eq!(estimate_tokens(""), 0);
     }
 
@@ -1077,11 +1097,13 @@ mod tests {
     #[test]
     fn build_incremental_context_respects_token_budget() {
         // 构造大量 step_outputs，验证裁剪后总量受 MAX_CONTEXT_TOKENS 控制
-        let mut state = GraphState::default();
-        state.work_dir = std::env::temp_dir().join(format!(
-            "miniagent_ctx_budget_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let mut state = GraphState {
+            work_dir: std::env::temp_dir().join(format!(
+                "miniagent_ctx_budget_{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            )),
+            ..Default::default()
+        };
         // 20 个大 step，每个 ~6000 chars ≈ 2000 tokens（总 40000 tokens >> 16000 预算）
         for i in 0..20 {
             let big_content = format!("step {i} output: {}", "x".repeat(6000));
@@ -1108,11 +1130,13 @@ mod tests {
     #[test]
     fn build_incremental_context_short_pipeline_keeps_all() {
         // 3 个短 step 应全部保留（不被固定窗口或预算截掉）
-        let mut state = GraphState::default();
-        state.work_dir = std::env::temp_dir().join(format!(
-            "miniagent_ctx_short_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
+        let mut state = GraphState {
+            work_dir: std::env::temp_dir().join(format!(
+                "miniagent_ctx_short_{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            )),
+            ..Default::default()
+        };
         state.step_outputs.insert("a".into(), "output A".into());
         state.step_outputs.insert("b".into(), "output B".into());
         state.step_outputs.insert("c".into(), "output C".into());

@@ -33,6 +33,16 @@ pub fn tools_for_role(role: &str) -> &'static [&'static str] {
 }
 
 /// Build a role-specific system prompt with tool guidance.
+///
+/// 参考 cc-python-claude 的分层提示词工程，system prompt 由以下段落组成：
+/// 1. 角色定义（You are a {ROLE}）
+/// 2. 任务执行原则（先读再改、不过度工程、安全优先）
+/// 3. 工具使用偏好（专用工具优先于 Bash）
+/// 4. 风险评估（可逆操作自由，不可逆操作确认）
+/// 5. 输出效率（简洁直接，先结论后推理）
+/// 6. 具体任务（task_desc + expected_output）
+/// 7. 角色特定工具指南
+/// 8. 关键规则（USE tools、不模拟、引用来源）
 pub fn role_system_prompt(role: &str, task_desc: &str, expected_output: &str) -> String {
     let role_guide = match role {
         "researcher" =>
@@ -76,8 +86,43 @@ pub fn role_system_prompt(role: &str, task_desc: &str, expected_output: &str) ->
              clinical_trials_search, git, conda) to complete your task.",
     };
 
+    let env_info = format!(
+        "{}{}",
+        miniagent_core::context_info::env_block("."),
+        miniagent_core::context_info::project_md_block(".").unwrap_or_default()
+    );
+
     format!(
         r#"You are a {role_uppercase}.
+
+## Task Execution Principles
+ - **Read before modifying.** Do not propose changes to code or files you haven't read. Understand existing content before suggesting modifications.
+ - **Don't over-engineer.** Don't add features, error handling, or abstractions beyond what the task requires. Do the minimum needed to complete the task well — no more, no less.
+ - **Don't gold-plate.** A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add comments/docstrings to code you didn't change.
+ - **Be careful with security.** Avoid command injection, XSS, SQL injection. If you notice insecure code, fix it immediately.
+ - **If an approach fails, diagnose why before switching.** Read the error, check assumptions, try a focused fix. Don't retry blindly.
+
+## Tool Usage Preferences
+ - Use **read** instead of cat/head/tail to read files.
+ - Use **edit** instead of sed/awk to modify files.
+ - Use **write** instead of echo redirection to create files.
+ - Use **glob** instead of find/ls to search for files.
+ - Use **grep** instead of shell grep/rg to search file contents.
+ - Reserve **bash** for system commands that require shell execution.
+ - Call multiple independent tools in parallel for efficiency.
+
+## Risk Assessment
+ - Local, reversible actions (editing files, running tests) are fine to do freely.
+ - For hard-to-reverse or destructive actions (deleting files, force push, dropping tables), verify before executing.
+ - When uncertain, describe the action and its risks rather than executing blindly.
+
+## Output Efficiency
+ - Go straight to the point. Lead with the answer or result, not the reasoning.
+ - Skip filler words, preamble, and unnecessary transitions.
+ - If you can say it in one sentence, don't use three.
+ - Focus output on: decisions, status updates, errors, and key findings.
+
+{env_info}
 
 ## Your Task
 {task_desc}
@@ -98,17 +143,45 @@ pub fn role_system_prompt(role: &str, task_desc: &str, expected_output: &str) ->
         task_desc = task_desc,
         expected_output = expected_output,
         role_guide = role_guide,
+        env_info = env_info,
     )
 }
 
 /// Generic instruction to append to any user prompt that has tool access.
+///
+/// 参考 cc-python-claude 的环境信息注入和 worker prompt 自包含原则。
 pub fn tool_instruction_block() -> &'static str {
     r#"## Instructions
 1. Use available tools to gather information and produce results.
 2. DO NOT just describe what you plan to do — actually use the tools now.
 3. Report your findings in a clear, structured format.
 4. If you have already completed the task, summarize the findings.
-5. Never fabricate tool output. If a tool call fails, report the error."#
+5. Never fabricate tool output. If a tool call fails, report the error.
+6. Your output should be self-contained — include all file paths, line numbers, and details needed to understand the result.
+7. Record important information from tool results in your response, as original tool results may be cleared from context later."#
+}
+
+/// 生成环境信息段落（参考 cc-python-claude 的 compute_env_info）。
+///
+/// 让智能体了解运行环境：工作目录、平台、日期。帮助生成适合当前环境的命令和建议。
+pub fn env_info_block(working_dir: &str) -> String {
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let platform = std::env::consts::OS;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
+    let shell_name = if shell.contains("zsh") { "zsh" }
+        else if shell.contains("bash") { "bash" }
+        else if shell.contains("fish") { "fish" }
+        else { "sh" };
+    let is_git = std::path::Path::new(working_dir).join(".git").exists();
+
+    format!(
+        "## Environment\n\
+         - Working directory: {working_dir}\n\
+         - Platform: {platform}\n\
+         - Shell: {shell_name}\n\
+         - Is a git repository: {is_git}\n\
+         - Date: {today}"
+    )
 }
 
 fn capitalize_role(role: &str) -> String {

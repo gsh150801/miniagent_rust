@@ -5,6 +5,10 @@ let tasks = {};
 let currentTaskId = null;
 let uploadedFiles = [];
 let isStreaming = false;
+// Skills state
+let skills = [];                    // [{name, description, triggers, tools_needed, ...}]
+let selectedSkills = new Set();     // user-selected skill names
+let skillPanelOpen = true;
 // Right panel state
 let activeRightTab = 'progress';      // 'progress' | 'files'
 let rightPanelOpen = true;
@@ -24,7 +28,7 @@ function connect() {
   setConnState('connecting');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
-  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); };
+  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); };
   ws.onmessage = (e) => {
     try { handleMsg(JSON.parse(e.data)); }
     catch(err) { handleMsg({ type: 'stream', text: e.data }); }
@@ -42,6 +46,10 @@ function setConnState(s) {
 function handleMsg(msg) {
   switch(msg.type) {
     case 'status': addSystemMsg(msg.message); break;
+    case 'task_started':
+      currentTaskId = msg.task_id;
+      renderTaskList();
+      break;
     case 'plan':
       currentPlan = { workflow: msg.workflow, stages: msg.stages };
       showPlan(msg.workflow, msg.stages);
@@ -51,6 +59,10 @@ function handleMsg(msg) {
       updateStagePill(msg.stage, msg.status);
       stageStatus[msg.stage] = msg.status;
       renderProgressView();
+      break;
+    case 'ask':
+      // 双向 ws：后端反问用户，渲染输入框/选项卡
+      renderAsk(msg.task_id, msg.question, msg.options || []);
       break;
     case 'stage_output': showStageOutput(msg.stage, msg.summary); break;
     case 'stream': appendStream(msg.text); break;
@@ -162,6 +174,85 @@ function loadTasks() {
 
 function filterTasks() { renderTaskList(); }
 
+// ── Skills ──
+async function loadSkills() {
+  try {
+    const resp = await fetch('/api/skills');
+    if (resp.ok) {
+      skills = await resp.json();
+      renderSkillList();
+    }
+  } catch(err) { /* ignore — will retry on next connect */ }
+}
+
+function toggleSkillPanel() {
+  skillPanelOpen = !skillPanelOpen;
+  document.getElementById('skillPanel').style.display = skillPanelOpen ? '' : 'none';
+  document.getElementById('skillChevron').innerHTML = skillPanelOpen ? '&#9660;' : '&#9654;';
+}
+
+function filterSkills() { renderSkillList(); }
+
+function renderSkillList() {
+  const el = document.getElementById('skillList');
+  const count = document.getElementById('skillCount');
+  if (!el) return;
+  const query = (document.getElementById('skillSearch')?.value || '').trim().toLowerCase();
+
+  const filtered = skills.filter(s => {
+    if (!query) return true;
+    const haystack = [s.name, s.description, (s.triggers||[]).join(' '), (s.tags||[]).join(' ')].join(' ').toLowerCase();
+    return haystack.includes(query);
+  });
+
+  count.textContent = filtered.length;
+
+  if (filtered.length === 0) {
+    el.innerHTML = `<div style="padding:12px;font-size:12px;color:var(--text3);text-align:center">No skills found</div>`;
+    return;
+  }
+
+  el.innerHTML = filtered.map(s => {
+    const selected = selectedSkills.has(s.name);
+    const desc = (s.description || '').slice(0, 80);
+    const icon = selected ? '&#9989;' : '&#11036;';
+    return `<div class="skill-item ${selected ? 'selected' : ''}" data-name="${escHtml(s.name)}" onclick="toggleSkill('${escHtml(s.name)}')">
+      <span class="skill-check">${icon}</span>
+      <div class="skill-body">
+        <div class="skill-name">${escHtml(s.name)}</div>
+        ${desc ? `<div class="skill-desc">${escHtml(desc)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function toggleSkill(name) {
+  if (selectedSkills.has(name)) {
+    selectedSkills.delete(name);
+  } else {
+    selectedSkills.add(name);
+  }
+  renderSkillList();
+  renderSkillChips();
+}
+
+function renderSkillChips() {
+  const el = document.getElementById('skillChips');
+  if (!el) return;
+  el.innerHTML = '';
+  for (const name of selectedSkills) {
+    const chip = document.createElement('span');
+    chip.className = 'file-chip skill-chip';
+    chip.innerHTML = `&#128295; ${escHtml(name)} <span class="remove">&times;</span>`;
+    chip.querySelector('.remove').addEventListener('click', () => {
+      selectedSkills.delete(name);
+      renderSkillList();
+      renderSkillChips();
+    });
+    el.appendChild(chip);
+  }
+}
+
 // Incremental render: reuse existing nodes by data-id, only update changed bits.
 function renderTaskList() {
   const el = document.getElementById('taskList');
@@ -209,17 +300,84 @@ function renderTaskList() {
   }
 }
 
+/// 渲染 ask 消息：输入框 + 选项卡（需求1：ask 反问用户）
+function renderAsk(taskId, question, options) {
+  const card = document.createElement('div');
+  card.className = 'msg-ask';
+
+  const q = document.createElement('div');
+  q.className = 'ask-question';
+  q.textContent = '❓ ' + question;
+  card.appendChild(q);
+
+  // 选项按钮
+  if (options.length > 0) {
+    const optBox = document.createElement('div');
+    optBox.className = 'ask-options';
+    for (const opt of options) {
+      const btn = document.createElement('button');
+      btn.className = 'ask-option-btn';
+      btn.textContent = opt;
+      btn.addEventListener('click', () => {
+        ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: opt }));
+        card.remove();
+      });
+      optBox.appendChild(btn);
+    }
+    card.appendChild(optBox);
+  }
+
+  // 文本输入框
+  const inputBox = document.createElement('div');
+  inputBox.className = 'ask-input-box';
+  const input = document.createElement('input');
+  input.className = 'ask-input';
+  input.placeholder = 'Type your answer...';
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const answer = input.value.trim();
+      if (answer) {
+        ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: answer }));
+        card.remove();
+      }
+    }
+  });
+  inputBox.appendChild(input);
+
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'ask-send-btn';
+  sendBtn.textContent = 'Reply';
+  sendBtn.addEventListener('click', () => {
+    const answer = input.value.trim();
+    if (answer) {
+      ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: answer }));
+      card.remove();
+    }
+  });
+  inputBox.appendChild(sendBtn);
+  card.appendChild(inputBox);
+
+  insertCardBeforeResult(card);
+  input.focus();
+}
+
 function makeTaskNode(id, t, title, isActive) {
   const div = document.createElement('div');
   div.className = 'task-item' + (isActive ? ' active' : '');
   div.dataset.id = id;
-  div.addEventListener('click', (e) => { if (!e.target.classList.contains('btn-del')) selectTask(id); });
-  const btn = document.createElement('button');
-  btn.className = 'btn-del';
-  btn.title = 'Delete';
-  btn.innerHTML = '&times;';
-  btn.addEventListener('click', (e) => { e.stopPropagation(); deleteTask(id, title); });
-  div.appendChild(btn);
+  div.addEventListener('click', (e) => { if (!e.target.classList.contains('btn-del') && !e.target.classList.contains('btn-trace')) selectTask(id); });
+  const delBtn = document.createElement('button');
+  delBtn.className = 'btn-del';
+  delBtn.title = 'Delete';
+  delBtn.innerHTML = '&times;';
+  delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteTask(id, title); });
+  const traceBtn = document.createElement('button');
+  traceBtn.className = 'btn-trace';
+  traceBtn.title = 'View trace';
+  traceBtn.textContent = '📋';
+  traceBtn.addEventListener('click', (e) => { e.stopPropagation(); viewTrace(id, title); });
+  div.appendChild(traceBtn);
+  div.appendChild(delBtn);
   const body = document.createElement('div');
   body.className = 'task-body';
   div.appendChild(body);
@@ -236,8 +394,62 @@ function fillTaskBody(body, t, title) {
   const time = t.created_at
     ? new Date(t.created_at).toLocaleString('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
     : '';
+  const hasTrace = t.event_log && t.event_log.length > 0;
   body.innerHTML = `<div class="task-title">${escHtml(title)}</div>
-    <div class="task-meta"><span class="status-dot ${t.status}"></span>${escHtml(t.status)}${time ? ' &middot; '+time : ''}</div>`;
+    <div class="task-meta"><span class="status-dot ${t.status}"></span>${escHtml(t.status)}${time ? ' &middot; '+time : ''}${hasTrace ? ` &middot; <span class="trace-badge">${t.event_log.length} events</span>` : ''}</div>`;
+}
+
+/// 查看任务完整轨迹（需求2: 全链路可追溯）
+async function viewTrace(taskId, title) {
+  let trace;
+  try {
+    const resp = await fetch(`/api/trace/${taskId}`);
+    trace = await resp.json();
+  } catch (e) {
+    showToast('Failed to load trace: ' + e.message, true, 'error');
+    return;
+  }
+  if (trace.error) { showToast(trace.error, true, 'error'); return; }
+
+  const events = trace.event_log || [];
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.style.alignItems = 'flex-start';
+
+  const eventHtml = events.length === 0
+    ? '<p style="color:var(--text-muted);padding:12px">No events recorded for this task.</p>'
+    : events.map((entry, i) => {
+        const ev = entry.event || {};
+        const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString('zh-CN') : '';
+        const kind = ev.kind || 'unknown';
+        let detail = '';
+        if (ev.tool_name) detail += `<div><b>Tool:</b> ${escHtml(ev.tool_name)}</div>`;
+        if (ev.input) detail += `<div class="trace-input"><b>Input:</b> <pre>${escHtml(typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input, null, 2).slice(0, 500))}</pre></div>`;
+        if (ev.output) detail += `<div class="trace-output"><b>Output:</b> <pre>${escHtml(typeof ev.output === 'string' ? ev.output.slice(0,500) : JSON.stringify(ev.output).slice(0,500))}</pre></div>`;
+        if (ev.is_error) detail += `<div style="color:var(--danger)">⚠ Error</div>`;
+        if (ev.duration_ms) detail += `<div><b>Duration:</b> ${ev.duration_ms}ms</div>`;
+        return `<div class="trace-event ${ev.is_error ? 'trace-error' : ''}">
+          <div class="trace-header"><span class="trace-kind">${escHtml(kind)}</span><span class="trace-ts">${ts}</span></div>
+          ${detail}
+        </div>`;
+      }).join('');
+
+  overlay.innerHTML = `<div class="trace-modal">
+    <div class="trace-title-bar">
+      <h3>📋 Trace: ${escHtml(title)}</h3>
+      <button class="btn-confirm no">Close</button>
+    </div>
+    <div class="trace-summary">
+      <span>Status: ${escHtml(trace.status||'')}</span>
+      <span>Events: ${events.length}</span>
+      <span>Stages: ${(trace.stage_outputs||[]).length}</span>
+      <span>Messages: ${trace.message_count||0}</span>
+    </div>
+    <div class="trace-events">${eventHtml}</div>
+  </div>`;
+  overlay.querySelector('.no').addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
 }
 
 function deleteTask(id, title) {
@@ -424,9 +636,31 @@ function addSystemMsg(text) { getInner().appendChild(makeSysBubble(text)); scrol
 
 // Streaming: throttled plain-text append during stream, markdown only at completion.
 let streamEl = null, streamRaw = '', streamPending = '', streamFlushTimer = null;
+// Anchor element that always stays at the end of the message list.
+// Plan cards and stage-output cards are inserted BEFORE this anchor, so the
+// final result (stream text) + file downloads always appear last.
+let resultAnchor = null;
+
+function ensureResultAnchor() {
+  const inner = getInner();
+  if (resultAnchor && resultAnchor.parentNode === inner) return;
+  resultAnchor = document.createElement('div');
+  resultAnchor.className = 'result-anchor';
+  resultAnchor.style.cssText = 'display:contents';
+  inner.appendChild(resultAnchor);
+}
+
+// Insert a card element BEFORE the result anchor so execution details stay
+// above the final answer.
+function insertCardBeforeResult(card) {
+  ensureResultAnchor();
+  resultAnchor.parentNode.insertBefore(card, resultAnchor);
+}
 function startStream() {
   streamRaw = '';
   streamPending = '';
+  streamEl = null;
+  resultAnchor = null;   // fresh anchor for this task run
   isStreaming = true;
   startElapsed();
   const cancelBtn = document.getElementById('btnCancel');
@@ -436,11 +670,16 @@ function startStream() {
 function ensureStreamEl() {
   if (streamEl) return;
   hideWelcome();
-  const inner = getInner();
+  ensureResultAnchor();
   const div = document.createElement('div');
   div.className = 'msg msg-ai';
   div.innerHTML = `<div class="msg-bubble"><span class="cursor"></span></div>`;
-  inner.appendChild(div);
+  // Insert AFTER the anchor so the final answer is always last.
+  if (resultAnchor.nextSibling) {
+    resultAnchor.parentNode.insertBefore(div, resultAnchor.nextSibling);
+  } else {
+    resultAnchor.parentNode.appendChild(div);
+  }
   streamEl = div.querySelector('.msg-bubble');
   scrollBottom();
 }
@@ -474,6 +713,8 @@ function finishStream(taskId, files) {
     streamEl.innerHTML = md(streamRaw);
   }
   streamEl = null; streamRaw = ''; streamPending = '';
+  // Reset the result anchor so the next task starts fresh.
+  resultAnchor = null;
   if (taskId) {
     currentTaskId = taskId;
     if (files && files.length) getInner().appendChild(makeDownloads(taskId, files));
@@ -492,10 +733,25 @@ function finishStreamError(message) {
 }
 
 function cancelTask() {
-  if (ws && ws.readyState === 1 && currentTaskId) {
-    ws.send(JSON.stringify({ type: 'cancel', task_id: currentTaskId }));
-    showToast('Cancel requested', false);
+  let taskId = currentTaskId;
+  // Fallback: if currentTaskId is null but streaming is active, try to find
+  // the running task from the DOM (active task-item) or from tasks map.
+  if (!taskId && isStreaming) {
+    const activeEl = document.querySelector('.task-item.active');
+    if (activeEl) taskId = activeEl.dataset.id;
   }
+  if (!taskId) {
+    showToast('No active task to cancel', true);
+    return;
+  }
+  fetch('/api/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: taskId }),
+  }).then(r => r.json()).then(d => {
+    if (d.status === 'cancelled') showToast('Cancel requested', false);
+    else showToast('Cancel failed: task not found', true);
+  }).catch(e => showToast('Cancel error: ' + e.message, true));
 }
 
 function makeDownloads(taskId, files) {
@@ -538,7 +794,6 @@ function showPlan(workflow, stages) {
   }
 
   hideWelcome();
-  const inner = getInner();
   const card = document.createElement('div');
   card.className = 'exec-panel';
 
@@ -586,7 +841,7 @@ function showPlan(workflow, stages) {
     </div>
     <div style="margin-top:6px">${stagesHtml}</div>
   </div>`;
-  inner.appendChild(card);
+  insertCardBeforeResult(card);
   scrollBottom();
 }
 function updateStagePill(name, status) {
@@ -602,7 +857,7 @@ function toggleToolDetail(uid) {
   detail.style.display = shown ? 'none' : 'block';
   if (toggle) toggle.innerHTML = shown ? '&#9660;' : '&#9650;';
   if (preview) preview.style.display = shown ? '' : 'none';
-  scrollBottom();
+  // Do NOT scroll — preserve user's reading position when expanding/collapsing.
 }
 
 // Aggregate tool entries into activity stat badges.
@@ -623,7 +878,6 @@ function renderActivityStats(toolEntries) {
 
 function showStageOutput(stage, summary) {
   if (!summary) return;
-  const inner = getInner();
 
   const icon = stage.includes('research') || stage.includes('agent') ? '&#128269;'
     : stage.includes('critic') || stage.includes('critique') ? '&#128270;'
@@ -653,7 +907,7 @@ function showStageOutput(stage, summary) {
   if (statsHtml) headerHtml += statsHtml;
   headerHtml += `</div>`;
   headerCard.innerHTML = headerHtml;
-  inner.appendChild(headerCard);
+  insertCardBeforeResult(headerCard);
 
   for (const entry of toolEntries) {
     const toolCard = document.createElement('div');
@@ -711,12 +965,14 @@ function showStageOutput(stage, summary) {
     }
     toolHtml += `</div>`;
     toolCard.innerHTML = toolHtml;
-    inner.appendChild(toolCard);
+    insertCardBeforeResult(toolCard);
   }
   scrollBottom();
 }
 
 // ── Input ──
+// 模式切换已移除（统一新流程：explore→ask→plan→dispatch→feedback）
+
 function sendMessage() {
   const input = document.getElementById('input');
   const text = input.value.trim();
@@ -726,8 +982,10 @@ function sendMessage() {
   uploadedFiles = [];
   document.getElementById('fileChips').innerHTML = '';
   startStream();
+  // 统一流程：不再传 mode 字段，后端统一走 handle_run 新流程
   const payload = { type: 'run', prompt: text, files: fileIds };
   if (currentTaskId) payload.task_id = currentTaskId;
+  if (selectedSkills.size > 0) payload.skills = [...selectedSkills];
   ws.send(JSON.stringify(payload));
   input.value = '';
   autoResize(input);
@@ -827,25 +1085,66 @@ function renderProgressView() {
     </div>
   </div>`;
 
-  // Subtask tree
+  // Subtask tree — show each stage with its role, sub-tasks, tools, and live status
   if (stages.length) {
     html += `<div class="stree-section-title">Workflow Stages</div>`;
-    for (const s of stages) {
+    for (let si = 0; si < stages.length; si++) {
+      const s = stages[si];
       const status = stageStatus[s.name] || 'pending';
-      const cls = status;
-      const subItems = (s.sub_tasks || []).map(t =>
-        `<div class="stree-subtask done"><span class="check">&#10003;</span><span>${escHtml(t)}</span></div>`
-      ).join('');
+      // Determine stage completion icon
+      const stageIcon = status === 'completed' ? '&#10003;'
+        : status === 'running' ? '<span class="check-spin"></span>'
+        : status === 'failed' ? '&#10007;'
+        : '&#9675;';  // empty circle for pending
+      const stageCls = status; // 'pending' | 'running' | 'completed' | 'failed'
+
+      // Sub-task status: derive from stage status.
+      // If stage completed → all sub-tasks done.
+      // If stage running → show first sub-task as active, rest pending.
+      // If stage pending → all pending.
+      const subTasks = s.sub_tasks || [];
+      let subItemsHtml = '';
+      for (let ti = 0; ti < subTasks.length; ti++) {
+        let subStatus = 'pending';
+        let subIcon = '&#9675;'; // empty circle
+        if (status === 'completed') {
+          subStatus = 'done'; subIcon = '&#10003;';
+        } else if (status === 'failed') {
+          subStatus = 'failed'; subIcon = '&#10007;';
+        } else if (status === 'running') {
+          // First sub-task is "in progress"
+          if (ti === 0) { subStatus = 'active'; subIcon = '<span class="check-spin"></span>'; }
+        }
+        subItemsHtml += `<div class="stree-subtask ${subStatus}">
+          <span class="check">${subIcon}</span>
+          <span>${escHtml(subTasks[ti])}</span>
+        </div>`;
+      }
+
+      // Tools badges
       const toolBadges = (s.tools || []).map(t => `<span class="stree-tool">${escHtml(t)}</span>`).join('');
-      const role = s.handler ? `<span class="role">${escHtml(s.handler)}</span>` : '';
-      html += `<div class="stree-stage ${cls} expanded" data-stage="${escHtml(s.name)}">
+
+      // Role / handler badge
+      const roleLabel = s.handler ? `<span class="role">${escHtml(s.handler)}</span>` : '';
+
+      // Description
+      const descHtml = s.description ? `<div class="stree-stage-desc">${escHtml(s.description)}</div>` : '';
+
+      // Tier badge (model tier)
+      const tierBadge = s.tier ? `<span class="stree-tier">${escHtml(s.tier)}</span>` : '';
+
+      html += `<div class="stree-stage ${stageCls} expanded" data-stage="${escHtml(s.name)}">
         <div class="stree-stage-head" onclick="this.parentElement.classList.toggle('expanded')">
-          <span class="check">&#10003;</span>
-          <span class="name">${escHtml(s.name)}</span>${role}
+          <span class="check ${stageCls}">${stageIcon}</span>
+          <span class="stage-idx">${si + 1}</span>
+          <span class="name">${escHtml(s.name)}</span>
+          ${roleLabel}${tierBadge}
+          <span class="stage-badge ${stageCls}">${status}</span>
           <span class="chevron">&#9654;</span>
         </div>
         <div class="stree-stage-body">
-          ${subItems}
+          ${descHtml}
+          ${subItemsHtml}
           ${toolBadges ? `<div class="stree-tool-list">${toolBadges}</div>` : ''}
         </div>
       </div>`;
@@ -1068,67 +1367,14 @@ function showToast(msg, isError, cls) {
   setTimeout(() => el.className = 'toast', 3000);
 }
 
-// ── Markdown (inline, no CDN) ──
-// Fixed version: code blocks are extracted as placeholders first so inline
-// transforms (bold/headings/lists) don't corrupt code contents. Tables get a
-// proper thead via the separator row. Ordered vs unordered lists no longer clash.
+// ── Markdown (use marked.js parser) ──
 function md(text) {
   if (!text) return '';
-  // 1. Escape HTML globally.
-  let h = escHtml(text);
-  // 2. Extract fenced code blocks into placeholders to protect them.
-  const codeBlocks = [];
-  h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
-    const i = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${code.replace(/\n$/, '')}</code></pre>`);
-    return `\u0000CB${i}\u0000`;
-  });
-  // 3. Inline code.
-  h = h.replace(/`([^`]+)`/g, (m, c) => {
-    const i = codeBlocks.length;
-    codeBlocks.push(`<code>${c}</code>`);
-    return `\u0000CB${i}\u0000`;
-  });
-  // 4. Headings.
-  h = h.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-  h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-  h = h.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  // 5. Horizontal rule.
-  h = h.replace(/^---+$/gm, '<hr>');
-  // 6. Blockquote (line leading '&gt; ').
-  h = h.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-  // 7. Tables: header row + separator row + body rows.
-  h = h.replace(/((?:^\|.*\|\n)+)/gm, (block) => {
-    const rows = block.trim().split('\n');
-    if (rows.length < 2) return block;
-    const isSep = (r) => /^\|[\s:-]*\|([\s:-|]+\|)*$/.test(r);
-    if (!isSep(rows[1])) return block; // not a real table
-    const parseRow = (r) => r.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-    const head = parseRow(rows[0]).map(c => `<th>${c}</th>`).join('');
-    const body = rows.slice(2).map(r => `<tr>${parseRow(r).map(c => `<td>${c}</td>`).join('')}</tr>`).join('');
-    return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-  });
-  // 8. Bold / italic.
-  h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  h = h.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
-  // 9. Links.
-  h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  // 10. Unordered lists.
-  h = h.replace(/^(?:- |\* )(.+)$/gm, '<ul><li>$1</li></ul>');
-  h = h.replace(/(<\/ul>\n?<ul>)+/g, '');
-  // 11. Ordered lists.
-  h = h.replace(/^\d+\. (.+)$/gm, '<ol><li>$1</li></ol>');
-  h = h.replace(/(<\/ol>\n?<ol>)+/g, '');
-  // 12. Paragraphs.
-  h = h.replace(/\n\n+/g, '</p><p>');
-  h = '<p>' + h + '</p>';
-  h = h.replace(/<p>\s*(<h[1-6]|<pre|<ul|<ol|<blockquote|<hr|<table)/g, '$1');
-  h = h.replace(/(<\/h[1-6]>|<\/pre>|<\/ul>|<\/ol>|<\/blockquote>|<hr>|<\/table>)\s*<\/p>/g, '$1');
-  h = h.replace(/\n/g, '<br>');
-  // 13. Restore code placeholders.
-  h = h.replace(/\u0000CB(\d+)\u0000/g, (m, i) => codeBlocks[+i] || m);
-  return h;
+  if (typeof marked !== 'undefined' && marked.parse) {
+    return marked.parse(text, { breaks: true, gfm: true });
+  }
+  // Fallback if marked is not loaded
+  return escHtml(text).replace(/\n/g, '<br>');
 }
 
 // ── Init ──

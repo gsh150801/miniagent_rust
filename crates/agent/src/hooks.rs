@@ -186,14 +186,13 @@ pub fn default_hooks() -> HookRegistry {
         }
 
         // For modify operations: only allow if env has mn_ prefix
-        if matches!(action, "install" | "remove" | "uninstall" | "clean") {
-            if !env_name.starts_with("mn_") {
+        if matches!(action, "install" | "remove" | "uninstall" | "clean")
+            && !env_name.starts_with("mn_") {
                 return HookAction::Block(format!(
                     "CondaSafety: only environments with 'mn_' prefix can be modified. \
                      '{env_name}' is a system-owned environment and is protected."
                 ));
             }
-        }
 
         HookAction::Continue
     });
@@ -206,17 +205,14 @@ pub fn default_hooks() -> HookRegistry {
         let repo_path = input.and_then(|v| v.get("repo_path")).and_then(|v| v.as_str()).unwrap_or("");
         if repo_path.is_empty() { return HookAction::Continue; }
         let path = std::path::Path::new(repo_path);
-        if let Ok(cwd) = std::env::current_dir() {
-            if path.is_absolute() {
-                if let Ok(canon) = path.canonicalize() {
-                    if !canon.starts_with(&cwd) {
+        if let Ok(cwd) = std::env::current_dir()
+            && path.is_absolute()
+                && let Ok(canon) = path.canonicalize()
+                    && !canon.starts_with(&cwd) {
                         return HookAction::Block(format!(
                             "GitSafety: repo '{repo_path}' is outside working directory"
                         ));
                     }
-                }
-            }
-        }
         HookAction::Continue
     });
 
@@ -418,4 +414,158 @@ fn is_path_safe(raw_path: &str, allowed_dirs: &[String]) -> bool {
         }
     }
     false
+}
+
+// ── 外部 shell 命令钩子（参考 cc-python-claude hook_runner.py）─────────
+//
+// 允许用户从配置文件加载外部 shell 命令作为钩子，无需改 Rust 代码。
+// 配置格式（JSON）：
+// {
+//   "hooks": {
+//     "BeforeToolCall": [
+//       {"command": "echo 'tool: '$tool_name >> /tmp/audit.log", "tool_name": "bash"},
+//       "make lint"
+//     ],
+//     "AfterToolCall": [
+//       {"command": "echo 'done: '$tool_name >> /tmp/audit.log"}
+//     ]
+//   }
+// }
+//
+// 执行协议：
+// - 工具上下文以 JSON 经 stdin 传入子进程
+// - 退出码 0 = 放行，2 = 阻止（stdout 作为原因），超时 10s 强杀
+// - 钩子故障不影响工具执行（异常/超时 → Continue）
+
+/// 外部 shell 钩子配置。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExternalHookConfig {
+    pub command: String,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+}
+
+/// 从 JSON 配置加载外部钩子并注册到 HookRegistry。
+///
+/// 配置格式：`{"hooks": {"BeforeToolCall": [...], "AfterToolCall": [...]}}`
+/// 每项可以是字符串（简写，对所有工具生效）或对象 `{command, tool_name}`。
+pub fn load_external_hooks(registry: &mut HookRegistry, config_json: &str) {
+    let config: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to parse external hooks config");
+            return;
+        }
+    };
+
+    let hooks = match config.get("hooks").and_then(|v| v.as_object()) {
+        Some(h) => h,
+        None => return,
+    };
+
+    for (event_name, hook_list) in hooks {
+        let event = match event_name.as_str() {
+            "BeforeToolCall" => HookEvent::BeforeToolCall,
+            "AfterToolCall" => HookEvent::AfterToolCall,
+            "BeforeLlmCall" => HookEvent::BeforeLlmCall,
+            "AfterLlmCall" => HookEvent::AfterLlmCall,
+            "BeforeAgentLoop" => HookEvent::BeforeAgentLoop,
+            "AfterAgentLoop" => HookEvent::AfterAgentLoop,
+            _ => continue,
+        };
+
+        let entries = match hook_list.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for entry in entries {
+            let (command, tool_filter) = if let Some(s) = entry.as_str() {
+                (s.to_string(), None)
+            } else if let Some(obj) = entry.as_object() {
+                let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tn = obj.get("tool_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                (cmd, tn)
+            } else {
+                continue;
+            };
+
+            if command.is_empty() { continue; }
+
+            let hook_name = format!("external_{}_{}", event_name, command.len());
+            let events = vec![event];
+            let cmd = command.clone();
+            let filter = tool_filter.clone();
+
+            registry.register(&hook_name, events, move |_evt, data| {
+                let cmd = cmd.clone();
+                let filter = filter.clone();
+                let data = data.clone();
+                async move {
+                    // 工具名过滤
+                    if let Some(ref f) = filter {
+                        let tn = data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                        if tn != f { return HookAction::Continue; }
+                    }
+
+                    // 执行 shell 命令，stdin 传上下文 JSON
+                    let ctx_json = serde_json::to_string(&data).unwrap_or_default();
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio::process::Command::new("bash")
+                            .arg("-c").arg(&cmd)
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .kill_on_drop(true)
+                            .output_async_with_input(ctx_json.as_bytes()),
+                    ).await;
+
+                    match result {
+                        Ok(Ok(output)) => {
+                            if output.status.code() == Some(2) {
+                                // 退出码 2 = 阻止
+                                let reason = String::from_utf8_lossy(&output.stdout)
+                                    .trim().to_string();
+                                HookAction::Block(if reason.is_empty() {
+                                    "Blocked by external hook".into()
+                                } else {
+                                    reason
+                                })
+                            } else {
+                                HookAction::Continue
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, cmd = %cmd, "external hook failed — continuing");
+                            HookAction::Continue
+                        }
+                        Err(_) => {
+                            tracing::warn!(cmd = %cmd, "external hook timed out (10s) — continuing");
+                            HookAction::Continue
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Trait extension for async output with stdin input.
+#[async_trait::async_trait]
+trait CommandExt {
+    async fn output_async_with_input(&mut self, input: &[u8]) -> std::io::Result<std::process::Output>;
+}
+
+#[async_trait::async_trait]
+impl CommandExt for tokio::process::Command {
+    async fn output_async_with_input(&mut self, input: &[u8]) -> std::io::Result<std::process::Output> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = self.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input).await;
+            let _ = stdin.shutdown().await;
+        }
+        child.wait_with_output().await
+    }
 }

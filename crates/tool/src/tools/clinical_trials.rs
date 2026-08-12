@@ -35,7 +35,10 @@ impl Tool for ClinicalTrialsTool {
         "Search clinical trials from ClinicalTrials.gov (free, no API key). \
          Returns study title, NCT number, status, conditions, interventions, phase, \
          sponsor, enrollment, locations, and brief summary. \
-         Supports filtering by recruitment status, phase, study type, and date range."
+         Supports filtering by recruitment status, phase, study type, and date range.\n\n\
+         IMPORTANT: ALWAYS search using English medical condition and intervention names. \
+         Translate non-English disease/drug names to English before searching. \
+         If results are sparse, try broader condition terms or alternative drug names."
     }
     fn class(&self) -> ToolClass { ToolClass::ReadOnly }
     fn input_schema(&self) -> serde_json::Value {
@@ -44,7 +47,7 @@ impl Tool for ClinicalTrialsTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query: condition, drug, intervention, or NCT number"
+                    "description": "Search query in ENGLISH: condition name (e.g. 'pancreatic cancer'), drug/intervention name, or NCT number. Translate non-English terms to English medical terminology first."
                 },
                 "max_results": {
                     "type": "integer",
@@ -304,7 +307,7 @@ mod tests {
     fn test_clinical_trials_no_query_error() {
         let tool = ClinicalTrialsTool::new();
         let input = json!({}); // missing query
-        let ctx = ToolContext { working_dir: ".".into(), session_id: "test".into() };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string() );
         let cancel = CancellationToken::new();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(tool.execute(input, &ctx, cancel));

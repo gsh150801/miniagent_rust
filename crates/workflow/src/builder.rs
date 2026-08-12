@@ -9,7 +9,7 @@ use miniagent_provider::deepseek::{DeepSeekFlash, DeepSeekPro};
 
 use crate::engine::Workflow;
 use crate::stage::{ProviderSelector, Stage};
-use crate::stages::{AgentStage, CriticStage, GenericLlmStage, OrchestratorStage, SynthesizerStage};
+use crate::stages::{AgentStage, AnalystStage, CriticStage, GenericLlmStage, OrchestratorStage, ResearcherStage, SynthesizerStage};
 
 fn default_flash() -> String { "flash".into() }
 fn default_max_iter() -> usize { 35 }
@@ -108,6 +108,16 @@ impl WorkflowBuilder {
                         .with_limits(max_iterations, max_tokens);
                     Stage::new(&stage_spec.name, handler).with_provider(provider)
                 }
+                "researcher" => {
+                    let handler = ResearcherStage::new(self.agent.clone())
+                        .with_limits(max_iterations, max_tokens);
+                    Stage::new(&stage_spec.name, handler).with_provider(provider)
+                }
+                "analyst" => {
+                    let handler = AnalystStage::new(self.agent.clone())
+                        .with_limits(max_iterations, max_tokens);
+                    Stage::new(&stage_spec.name, handler).with_provider(provider)
+                }
                 "critic" => {
                     let p: Box<dyn miniagent_provider::traits::LlmProvider> =
                         Box::new(DeepSeekFlash::new(key));
@@ -170,33 +180,9 @@ impl WorkflowBuilder {
             "task_dir": task_dir,
             "stage_sub_tasks": stage_sub_tasks,
         }));
+        wf = wf.with_task_dir(task_dir);
+        wf = wf.with_config(self.config.clone());
 
         Ok(wf)
     }
-}
-
-/// Built-in workflow presets matching common task patterns.
-impl WorkflowSpec {
-    pub fn single_agent() -> Self {
-        Self {
-            task_type: "single_agent".into(),
-            stages: vec![StageSpec {
-                name: "agent".into(),
-                handler_type: "agent".into(),
-                system_prompt: String::new(),
-                tools: vec![],
-                model_tier: "flash".into(),
-                max_iterations: 50,
-                enable_skills: true,
-                description: String::new(),
-                sub_tasks: vec![],
-            }],
-            edges: vec![],
-        }
-    }
-
-    // Commented out: use PlannerStage for dynamic workflow generation instead.
-    // pub fn deep_research() -> Self { ... }
-    // pub fn writing() -> Self { ... }
-
 }

@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -6,7 +7,7 @@ use miniagent_core::event::{ContentBlock, StopReason, Usage};
 use miniagent_core::message::MessageRole;
 use miniagent_core::secrets::ApiKey;
 use miniagent_core::types::ToolCallId;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +62,7 @@ struct FunctionDef {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct ToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -75,6 +77,7 @@ struct FunctionCall {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChatResponse {
     id: String,
     choices: Vec<Choice>,
@@ -82,6 +85,7 @@ struct ChatResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Choice {
     index: usize,
     message: ChoiceMessage,
@@ -90,6 +94,7 @@ struct Choice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChoiceMessage {
     role: Option<String>,
     content: Option<String>,
@@ -98,6 +103,7 @@ struct ChoiceMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ToolCallResponse {
     id: String,
     #[serde(rename = "type", default)]
@@ -112,6 +118,7 @@ struct FunctionCallResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct UsageResponse {
     prompt_tokens: usize,
     completion_tokens: usize,
@@ -127,6 +134,7 @@ struct StreamChunkRaw {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StreamChoice {
     index: usize,
     delta: StreamDelta,
@@ -135,6 +143,7 @@ struct StreamChoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct StreamDelta {
     #[serde(default)]
     role: Option<String>,
@@ -173,9 +182,13 @@ impl StepFunClient {
     }
 
     pub fn with_model(api_key: &ApiKey, model: &str) -> Self {
+        let mut builder = Client::builder().timeout(Duration::from_secs(300));
+        if let Some(proxy_url) = Self::proxy_from_env()
+            && let Ok(proxy) = Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(300))
+            client: builder
                 .build()
                 .expect("failed to create HTTP client"),
             base_url: std::env::var("STEPFUN_BASE_URL")
@@ -193,6 +206,19 @@ impl StepFunClient {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Build a proxy from standard environment variables.
+    /// Checks `ALL_PROXY` / `all_proxy` → `HTTPS_PROXY` / `https_proxy` → `HTTP_PROXY` / `http_proxy`.
+    fn proxy_from_env() -> Option<String> {
+        std::env::var("ALL_PROXY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("all_proxy").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("HTTPS_PROXY").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("https_proxy").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("http_proxy").ok().filter(|v| !v.is_empty()))
     }
 
     fn build_request(&self, request: &CompletionRequest, stream: bool) -> ChatRequest {
@@ -373,7 +399,17 @@ impl LlmProvider for StepFunClient {
                 .json(&chat_request)
                 .send() => r,
         }
-        .map_err(|e| AgentError::provider(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| {
+            let cause = e
+                .source()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(c) = cause {
+                AgentError::provider(format!("HTTP request failed: {e} (cause: {c})"))
+            } else {
+                AgentError::provider(format!("HTTP request failed: {e}"))
+            }
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -426,9 +462,16 @@ impl LlmProvider for StepFunClient {
             let response = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(AgentError::provider(format!("HTTP error: {e}"))))
-                        .await;
+                    let cause = e
+                        .source()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    let detail = if let Some(c) = cause {
+                        format!("HTTP error: {e} (cause: {c})")
+                    } else {
+                        format!("HTTP error: {e}")
+                    };
+                    let _ = tx.send(Err(AgentError::provider(detail))).await;
                     return;
                 }
             };

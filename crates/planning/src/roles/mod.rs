@@ -261,11 +261,10 @@ impl Blackboard {
             tracing::warn!("blackboard::get rejected unsafe key: {key}");
             return None;
         }
-        if let Some(v) = self.artifacts.get(key) {
-            if !v.is_empty() {
+        if let Some(v) = self.artifacts.get(key)
+            && !v.is_empty() {
                 return Some(v.clone());
             }
-        }
         // 内存未命中或为空：回退文件
         let (role, filename) = split_key(key);
         let path = self.work_dir.join(&role).join(&filename);

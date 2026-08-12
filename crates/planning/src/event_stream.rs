@@ -150,12 +150,13 @@ impl EventStream {
         filtered.into_iter().rev().collect()
     }
 
-    /// Get events relevant to a specific role.
-    /// A role sees: its own events + events from agents it depends on.
+    /// Get events relevant to a specific role (own events only).
+    /// The role dependency concept was tied to the deleted `agent_profile`
+    /// module; callers that need cross-role visibility should pass the agent
+    /// names directly to [`Self::recent`].
     pub fn relevant_to(&self, role: &str, count: usize) -> Vec<&AgentEvent> {
-        let dependents = crate::agent_profile::role_context_deps(role);
         self.events.iter()
-            .filter(|e| e.agent == role || dependents.contains(&e.agent.as_str()))
+            .filter(|e| e.agent == role)
             .rev()
             .take(count)
             .collect::<Vec<_>>()

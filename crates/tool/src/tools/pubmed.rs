@@ -32,14 +32,25 @@ impl Tool for PubMedTool {
     fn description(&self) -> &str {
         "Search PubMed for biomedical/ life sciences literature. \
          Returns article titles, PMIDs, publication years, and abstracts when available. \
-         Use for biology, medicine, genetics, drug discovery, and related fields."
+         Use for biology, medicine, genetics, drug discovery, and related fields.\n\n\
+         IMPORTANT query guidelines:\n\
+         - ALWAYS translate non-English queries to English before searching. \
+         PubMed indexes English-language literature; Chinese/Japanese/Korean keywords \
+         will return few or zero results.\n\
+         - Use precise medical terminology: prefer 'pancreatic adenocarcinoma' over \
+         'pancreatic cancer', 'immune checkpoint inhibitors' over 'immunotherapy'.\n\
+         - If the first search returns too few results, retry with broader or \
+         alternative terms: try synonyms (tumor/neoplasm/carcinoma), MeSH terms \
+         (e.g. 'Pancreatic Neoplasms[MeSH]'), or remove restrictive qualifiers.\n\
+         - If results are too many but unfocused, add qualifiers like \
+         'AND (treatment OR therapy)' or restrict to recent years with min_year."
     }
     fn class(&self) -> ToolClass { ToolClass::ReadOnly }
     fn input_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "PubMed search query (supports MeSH terms, boolean operators AND/OR/NOT)"},
+                "query": {"type": "string", "description": "PubMed search query in ENGLISH. Supports MeSH terms (e.g. 'Pancreatic Neoplasms[MeSH]'), boolean operators (AND/OR/NOT), and field tags (e.g. 'title:immunotherapy'). Translate any non-English keywords to English medical terminology first."},
                 "max_results": {"type": "integer", "description": "Results per page (default: 50, max: 500)"},
                 "offset": {"type": "integer", "description": "Starting offset for pagination (default: 0)"},
                 "min_year": {"type": "string", "description": "Filter: minimum publication year (e.g. 2024)"}

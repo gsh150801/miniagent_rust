@@ -63,6 +63,13 @@ impl SkillRegistry {
         self.skills.values().find(|s| s.metadata.name == name)
     }
 
+    /// 返回所有已注册技能的名字列表（用于"技能未找到"时帮助 LLM 自纠错）。
+    pub fn all_skill_names(&self) -> Vec<String> {
+        self.skills.values()
+            .map(|s| s.metadata.name.clone())
+            .collect()
+    }
+
     /// Find skills matching a user query based on trigger similarity.
     /// Returns skills sorted by relevance: trigger match + priority.
     pub fn find_matching(&self, user_query: &str, max_results: usize) -> Vec<&SkillBundle> {

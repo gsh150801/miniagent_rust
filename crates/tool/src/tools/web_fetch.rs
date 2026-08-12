@@ -30,7 +30,10 @@ impl WebFetchTool {
 impl Tool for WebFetchTool {
     fn name(&self) -> &str { "web_fetch" }
     fn description(&self) -> &str {
-        "Fetch a URL and return its content as markdown text. Handles HTML to text conversion."
+        "Fetch a URL and return its content as markdown text. Handles HTML to text conversion.\n\n\
+         Tips: Use this to read full articles, documentation, or papers found via web_search \
+         or pubmed_search. For non-English pages, the content will be returned in the original \
+         language — you can summarize/translate it for the user in your response."
     }
     fn class(&self) -> ToolClass { ToolClass::ReadOnly }
     fn input_schema(&self) -> serde_json::Value {
@@ -97,24 +100,21 @@ fn strip_html(html: &str) -> String {
     let mut i = 0;
 
     while i < html.len() {
-        if lower[i..].starts_with("<style") {
-            if let Some(end) = lower[i..].find("</style>") {
+        if lower[i..].starts_with("<style")
+            && let Some(end) = lower[i..].find("</style>") {
                 i += end + "</style>".len();
                 continue;
             }
-        }
-        if lower[i..].starts_with("<script") {
-            if let Some(end) = lower[i..].find("</script>") {
+        if lower[i..].starts_with("<script")
+            && let Some(end) = lower[i..].find("</script>") {
                 i += end + "</script>".len();
                 continue;
             }
-        }
-        if lower[i..].starts_with("<!--") {
-            if let Some(end) = lower[i..].find("-->") {
+        if lower[i..].starts_with("<!--")
+            && let Some(end) = lower[i..].find("-->") {
                 i += end + "-->".len();
                 continue;
             }
-        }
 
         // Safe char-boundary advancement
         let ch = html[i..].chars().next().unwrap_or('\0');

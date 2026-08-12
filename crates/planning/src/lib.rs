@@ -1,15 +1,9 @@
 pub mod plan;
 pub mod roles;
+pub mod runners;
 pub mod state_graph;
-pub mod tool_binding;
-pub mod agent_profile;
-pub mod control_shell;
-pub mod hooks;
 pub mod event_stream;
 pub mod todo_attention;
-pub mod context_manager;
-pub mod tournament;
-pub mod research;
 
 pub use plan::{Plan, PlanStep, Planner, PlanExecutor, StepStatus};
 pub use roles::{
@@ -20,28 +14,15 @@ pub use roles::{
     persist_output, load_checkpoint, load_todo, save_todo, append_event, read_role_artifacts,
 };
 pub use state_graph::{StateGraph, GraphState, GraphNode, NodeOutput, Checkpoint, GraphMessage};
-// `ModelTier` 统一从 `miniagent_core` 重导出，替代历史上 state_graph/agent_profile 两处独立定义。
+pub use event_stream::{EventStream, AgentEvent as PlanningAgentEvent, EventKind};
+pub use todo_attention::{TodoAttention, TodoItem, TodoStatus as PlanningTodoStatus};
+// `ModelTier` 统一从 `miniagent_core` 重导出。
 pub use miniagent_core::ModelTier;
-pub use tool_binding::{ToolRegistry, ToolDescriptor, ToolCategory, IoType, SafetyLevel, default_registry};
-pub use agent_profile::{AgentProfile, AgentRoleType, ActivationPolicy, default_profiles, context_dependencies_of, role_context_deps, ROLE_CONTEXT_DEPS};
-pub use control_shell::{ControlShell, ActivationRule};
-pub use hooks::{
-    Hook, HookAction, HookContext, HookEvent, HookRegistry,
-    AuditLogHook, TokenBudgetHook, ToolApprovalHook, ContextSizeHook, ErrorRecoveryHook,
-    PathSandboxHook, DangerousCommandHook, PermissionGuardHook, TaskVerificationHook,
-    default_hooks,
-};
-pub use event_stream::{EventStream, AgentEvent, EventKind};
-pub use todo_attention::{TodoAttention, TodoItem, TodoStatus};
-pub use context_manager::ContextManager;
-pub use tournament::{
-    EloEngine, PlayerRating, MatchOutcome,
-    DebateRubricScores, DebateSession, Verdict,
-    TournamentArena, TournamentPhase, DebateResult,
-    NashEquilibriumDetector,
-};
-pub use research::{
-    AgentSpec, AgentTemplate, DynamicAgent, AgentRegistry, AgentStatus, SchedulerRole,
-    PrincipalInvestigatorRole, TournamentMasterRole, EvidenceAccumulatorRole, SynthesisJudgeRole,
-    build_alzheimers_pipeline, AlzheimersConfig, AlzheimersHypothesisProfile,
-};
+
+// Removed in round 30 (planning crate consolidation):
+//   tournament/ (1063 LoC, zero production references),
+//   research/   (1145 LoC, zero external references),
+//   hooks/      (662 LoC, demo-only),
+//   control_shell, tool_binding, agent_profile, context_manager
+//   (all CLI-demo-only or zero-ref).
+// Net reduction: ~3.2k lines, ~50% of the crate.

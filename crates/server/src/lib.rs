@@ -15,7 +15,7 @@ pub use state::AppState;
 
 pub struct ServerConfig {
     pub config: Arc<AppConfig>,
-    pub agent: Agent,
+    pub agent: Arc<Agent>,
     pub memory: Option<MemoryManager>,
     pub checkpoint_store: Option<CheckpointStore>,
 }
@@ -82,9 +82,20 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
 
 /// Scan result/{id}_{brief}/ directories and restore TaskInfo entries.
 fn restore_tasks_from_disk(state: &AppState) {
-    let Ok(entries) = std::fs::read_dir(&state.task_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&state.task_dir) else {
+        tracing::warn!(dir = %state.task_dir.display(), "Failed to read task directory during restore");
+        return;
+    };
 
-    for entry in entries.flatten() {
+    let mut restored = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "restore: skipping directory entry");
+                continue;
+            }
+        };
         let name = match entry.file_name().to_str() {
             Some(n) => n.to_string(),
             None => continue,
@@ -118,12 +129,18 @@ fn restore_tasks_from_disk(state: &AppState) {
         // Collect result files
         let mut files = vec![];
         if let Ok(dir_entries) = std::fs::read_dir(&dir) {
-            for de in dir_entries.flatten() {
-                if let Some(fname) = de.file_name().to_str() {
-                    if fname.ends_with(".md") || fname.ends_with(".json") {
+            for de in dir_entries {
+                let de = match de {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(error = %e, dir = %dir.display(), "restore: skipping file entry");
+                        continue;
+                    }
+                };
+                if let Some(fname) = de.file_name().to_str()
+                    && (fname.ends_with(".md") || fname.ends_with(".json")) {
                         files.push(fname.to_string());
                     }
-                }
             }
         }
 
@@ -142,8 +159,35 @@ fn restore_tasks_from_disk(state: &AppState) {
             ],
             plan: None,
             stage_outputs: Vec::new(),
+            event_log: Vec::new(),
+        };
+
+        // Restore plan, stage_outputs, and messages from metadata.json if present
+        let info = if let Ok(metadata_str) = std::fs::read_to_string(info.result_dir.join("metadata.json")) {
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_str) {
+                let mut info_mut = info;
+                if let Some(plan) = metadata.get("plan") {
+                    info_mut.plan = Some(plan.clone());
+                }
+                if let Some(outputs) = metadata.get("stage_outputs").and_then(|v| v.as_array()) {
+                    info_mut.stage_outputs = outputs.clone();
+                }
+                if let Some(messages) = metadata.get("messages").and_then(|v| v.as_array()) {
+                    info_mut.messages = messages.clone();
+                }
+                info_mut
+            } else {
+                info
+            }
+        } else {
+            info
         };
 
         state.tasks.insert(task_id.to_string(), info);
+        restored += 1;
+    }
+
+    if restored > 0 {
+        tracing::info!(count = restored, "Restored tasks from disk");
     }
 }

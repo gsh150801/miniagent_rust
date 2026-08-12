@@ -100,15 +100,14 @@ impl Tool for CondaTool {
         };
 
         // ---- Security guard: only 'mn_' prefixed environments can be modified ----
-        if !env_name.is_empty() && matches!(action, "install" | "remove" | "uninstall" | "clean") {
-            if !env_name.starts_with("mn_") {
+        if !env_name.is_empty() && matches!(action, "install" | "remove" | "uninstall" | "clean")
+            && !env_name.starts_with("mn_") {
                 return Err(AgentError::tool("conda", format!(
                     "Environment '{}' does not have the 'mn_' prefix. \
                      Only miniagent-managed environments (with 'mn_' prefix) can be modified. \
                      To create a new environment, use: create with env_name='mn_yourname'", env_name
                 )));
             }
-        }
 
         // Force 'mn_' prefix when creating new environments
         if action == "create" {

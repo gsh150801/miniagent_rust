@@ -335,7 +335,7 @@ async fn test_planner_real_api_call() {
         .trim_end_matches("```").trim();
 
     let plan: TaskPlan = serde_json::from_str(cleaned)
-        .expect(&format!("Failed to parse plan. Preview: {}...", &cleaned[..cleaned.len().min(200)]));
+        .unwrap_or_else(|_| panic!("Failed to parse plan. Preview: {}...", &cleaned[..cleaned.len().min(200)]));
 
     eprintln!("\n=== Planner Real API Result ===");
     eprintln!("Overall goal: {}", plan.overall_goal);
@@ -470,7 +470,7 @@ fn mock_state(loop_count: usize, max_loops: usize, completed: bool) -> PipelineS
         final_output: None,
         no_progress_streak: 0,
         total_tokens_used: 0,
-        retrieval_context: RetrievalContext::default(),
+        stage_outputs: Vec::new(),
     }
 }
 
@@ -481,6 +481,8 @@ fn make_result(task_id: &str, success: bool) -> TaskResult {
         output: format!("Output for {task_id}"),
         error: if success { None } else { Some(format!("Error for {task_id}")) },
         tokens_used: 100,
+    validation_report: None,
+    arbiter_decision: None,
     }
 }
 
@@ -610,11 +612,9 @@ fn test_multi_loop_safety_stop_at_max_loops() {
 #[test]
 fn test_multi_loop_no_progress_safety_stop() {
     // Simulate a PROGRESS scenario: streak resets when progress improves.
-    let progress_evals = vec![
-        make_eval(1, 2, 0, 33.0, true),
+    let progress_evals = [make_eval(1, 2, 0, 33.0, true),
         make_eval(2, 1, 0, 66.0, true),
-        make_eval(2, 1, 0, 100.0, false),
-    ];
+        make_eval(2, 1, 0, 100.0, false)];
 
     let mut prog_streak: usize = 0;
     for i in 1..progress_evals.len() {
@@ -723,7 +723,7 @@ fn test_multi_loop_evaluate_continue_with_failed() {
     let mut state = mock_state(0, 5, false);
 
     // Simulate 4 loops with gradual improvement: 3 failures → 2 → 1 → 0
-    let scenarios = vec![
+    let scenarios = [
         // (before_eval_loop, completed, failed, pending, progress, should_continue)
         (0, 1, 3, 0, 25.0, true),   // Loop 0: 3 failed → continue
         (1, 2, 2, 0, 50.0, true),   // Loop 1: 2 failed → continue
@@ -731,22 +731,14 @@ fn test_multi_loop_evaluate_continue_with_failed() {
         (3, 4, 0, 0, 100.0, false), // Loop 3: all passed → stop!
     ];
 
-    for (i, &(before_loop, completed, failed, _pending, progress, expected_continue)) in scenarios.iter().enumerate() {
+    for (i, &(before_loop, completed, failed, _pending, _progress, expected_continue)) in scenarios.iter().enumerate() {
         state.loop_count = before_loop;
         let total = completed + failed;
 
-        // Apply Evaluate's hard rules (from evaluate.rs lines 163-171)
-        let should_continue = if before_loop >= state.max_loops {
-            false
-        } else if failed == 0 && completed == total && progress >= 90.0 {
-            false  // all done with good progress
-        } else if failed == 0 && completed == total {
-            false  // all done
-        } else if before_loop == 0 && completed == 0 {
-            true   // first loop, nothing done yet
-        } else {
-            true   // still has failures
-        };
+        // Apply Evaluate's hard rules (mirrors evaluate.rs: stop iff loop-limit
+        // reached or all tasks done without failures; otherwise keep looping to
+        // retry failures / run remaining work).
+        let should_continue = !(before_loop >= state.max_loops || (failed == 0 && completed == total));
 
         assert_eq!(should_continue, expected_continue,
             "Scenario {i}: loop {before_loop}, {completed}/{total} done, {failed} failed. Expected continue={expected_continue}, got {should_continue}");
@@ -992,6 +984,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
             output: "ITER achieved first plasma in 2024. Commonwealth Fusion Systems demonstrated their SPARC magnet technology and raised $2B. Key timeline: commercial fusion by 2035.".into(),
             error: None,
             tokens_used: 850,
+        validation_report: None,
+        arbiter_decision: None,
         },
         TaskResult {
             task_id: "quantum_research".into(),
@@ -999,6 +993,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
             output: "Google's Willow chip (105 qubits) achieved quantum error correction below threshold for the first time. IBM Quantum System Two now operational with 1000+ qubits. Key milestone: logical qubits demonstrated with error rates decreasing as qubit count increases.".into(),
             error: None,
             tokens_used: 720,
+        validation_report: None,
+        arbiter_decision: None,
         },
         TaskResult {
             task_id: "crispr_research".into(),
@@ -1006,6 +1002,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
             output: "Partial data only — API timeout during clinical trial database query.".into(),
             error: Some("PubMed API timeout: failed to fetch latest CRISPR clinical trial data. Retrieved cached results only.".into()),
             tokens_used: 150,
+        validation_report: None,
+        arbiter_decision: None,
         },
     ];
 
@@ -1134,6 +1132,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
             output: "Casgevy (exagamglogene autotemcel) is the first FDA-approved CRISPR therapy, approved Dec 2023 for sickle cell disease. Over 50 active clinical trials listed on ClinicalTrials.gov. Key areas: cancer immunotherapy (CAR-T cells), inherited blood disorders, and infectious diseases like HIV. Next-generation CRISPR tools including base editors and prime editors show promise.".into(),
             error: None,
             tokens_used: 920,
+        validation_report: None,
+        arbiter_decision: None,
         },
         TaskResult {
             task_id: "final_synthesis".into(),
@@ -1141,6 +1141,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
             output: "# Technology Synthesis Report\n\n## 1. Fusion Energy\nITER achieved first plasma...\n\n## 2. Quantum Computing\nGoogle's Willow chip...\n\n## 3. CRISPR Gene Editing\nCasgevy FDA-approved...\n\n## Synthesis\nAll three fields are at critical inflection points...".into(),
             error: None,
             tokens_used: 1500,
+        validation_report: None,
+        arbiter_decision: None,
         },
     ];
 
@@ -1267,9 +1269,9 @@ fn test_e2e_no_progress_safety_stops_infinite_loop() {
 
     // Helper: simulate one loop's evaluation + task results
     let make_stuck_results = || vec![
-        TaskResult { task_id: "collect_data".into(), success: true, output: "Data collected".into(), error: None, tokens_used: 100 },
-        TaskResult { task_id: "clean_data".into(), success: true, output: "Data cleaned".into(), error: None, tokens_used: 100 },
-        TaskResult { task_id: "analyze_data".into(), success: false, output: "".into(), error: Some("Analysis failed".into()), tokens_used: 50 },
+        TaskResult { task_id: "collect_data".into(), success: true, output: "Data collected".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None },
+        TaskResult { task_id: "clean_data".into(), success: true, output: "Data cleaned".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None },
+        TaskResult { task_id: "analyze_data".into(), success: false, output: "".into(), error: Some("Analysis failed".into()), tokens_used: 50, validation_report: None, arbiter_decision: None },
     ];
 
     let make_stuck_eval = |loop_num: usize| EvaluationResult {
@@ -1333,11 +1335,9 @@ fn test_e2e_no_progress_safety_stops_infinite_loop() {
     eprintln!("  ✅ repair_analyses: {} repairs over 4 loops", state.repair_analyses.len());
 
     // ── Contrast: progress scenario should NOT trigger ──
-    let progress_evals = vec![
-        make_eval(1, 2, 0, 33.0, true),
+    let progress_evals = [make_eval(1, 2, 0, 33.0, true),
         make_eval(2, 1, 0, 66.0, true),
-        make_eval(3, 0, 0, 100.0, false),
-    ];
+        make_eval(3, 0, 0, 100.0, false)];
     let mut prog_streak: usize = 0;
     for i in 0..progress_evals.len() {
         let prev = if i > 0 { progress_evals[i - 1].overall_progress_pct } else { 0.0 };
@@ -1371,6 +1371,8 @@ fn test_e2e_max_loops_boundary_forced_stop() {
                 output: format!("Output for task {}", loop_i + 1),
                 error: if loop_i < 2 { None } else { Some("Persistent failure".into()) },
                 tokens_used: 100,
+                validation_report: None,
+                arbiter_decision: None,
             },
         ];
 
@@ -1554,7 +1556,7 @@ fn test_e2e_cross_stage_message_routing() {
 
     let loop2_fix_messages: Vec<&StageMessage> = messages.iter()
         .filter(|m| m.content.contains("successfully") || m.to_stage == "__complete__").collect();
-    assert!(loop2_fix_messages.len() >= 1, "Should have success/completion messages");
+    assert!(!loop2_fix_messages.is_empty(), "Should have success/completion messages");
     eprintln!("  ✅ Success routing: messages correctly report completion after repair");
 
     eprintln!("\n  ✅ Cross-stage message routing test PASSED: all 15 messages verified");
@@ -1563,7 +1565,7 @@ fn test_e2e_cross_stage_message_routing() {
 /// Test (Online): Multi-loop with 3 loops — requires API key.
 #[tokio::test]
 async fn test_full_pipeline_multi_loop() {
-    let api_key = match try_load_api_key() {
+    let _api_key = match try_load_api_key() {
         Some(k) => k,
         None => {
             eprintln!("⚠ SKIP: No DEEPSEEK_API_KEY available");
@@ -1585,11 +1587,11 @@ async fn test_full_pipeline_multi_loop() {
         config,
         3,  // 3 loops
         cancel,
-        None,
     ).await;
 
     match result {
-        Ok(output) => {
+        Ok(state) => {
+            let output = state.final_output.unwrap_or_default();
             let preview: String = output.chars().take(1500).collect();
             eprintln!("\n═══ Multi-Loop Pipeline Output (first 1500 chars) ═══");
             eprintln!("{}", preview);
@@ -1605,7 +1607,7 @@ async fn test_full_pipeline_multi_loop() {
 /// Test (Online): Full LoopPipeline run with 5 loops.
 #[tokio::test]
 async fn test_full_loop_pipeline_real_api() {
-    let api_key = match try_load_api_key() {
+    let _api_key = match try_load_api_key() {
         Some(k) => k,
         None => {
             eprintln!("⚠ SKIP: No DEEPSEEK_API_KEY available");
@@ -1623,11 +1625,11 @@ async fn test_full_loop_pipeline_real_api() {
         config,
         1,
         cancel,
-        None,
     ).await;
 
     match result {
-        Ok(output) => {
+        Ok(state) => {
+            let output = state.final_output.unwrap_or_default();
             eprintln!("Pipeline output (first 500 chars):\n{}", &output[..output.len().min(500)]);
             assert!(!output.is_empty(), "Pipeline should produce output");
             eprintln!("\n✅ Full pipeline test passed");
@@ -1649,16 +1651,6 @@ async fn test_full_loop_pipeline_real_api() {
 //   - Multiple failure modes in the same task
 //   - Final output quality verification
 
-/// Helper: build a TaskResult
-fn tr(task_id: &str, success: bool) -> TaskResult {
-    TaskResult {
-        task_id: task_id.into(),
-        success,
-        output: format!("Output for {task_id}"),
-        error: if success { None } else { Some(format!("Error: {task_id} failed")) },
-        tokens_used: 100,
-    }
-}
 
 fn tr_with_output(task_id: &str, success: bool, output: &str, error: Option<&str>) -> TaskResult {
     TaskResult {
@@ -1667,6 +1659,8 @@ fn tr_with_output(task_id: &str, success: bool, output: &str, error: Option<&str
         output: output.into(),
         error: error.map(|s| s.into()),
         tokens_used: 200,
+    validation_report: None,
+    arbiter_decision: None,
     }
 }
 
@@ -2898,8 +2892,8 @@ fn test_ultra_long_running_cumulative_repairs() {
     assert_eq!(ctx.state.repair_analyses.len(), 3,
         "3 repairs across 4 loops (loops 1, 2, 3 each had failures)");
     let causes: Vec<&str> = ctx.state.repair_analyses.iter().map(|r| {
-        let cat = r.root_cause.split(':').next().unwrap_or("?");
-        cat
+        
+        r.root_cause.split(':').next().unwrap_or("?")
     }).collect();
     eprintln!("  ✅ repair_analyses: {} repairs accumulated, categories: {:?}",
         ctx.state.repair_analyses.len(), causes);
@@ -3377,7 +3371,7 @@ fn test_12_loop_software_refactoring_pipeline() {
 /// neurodegenerative diseases, and oncology over the past 5 years.
 #[tokio::test]
 async fn test_real_long_running_research_pipeline() {
-    let api_key = match try_load_api_key() {
+    let _api_key = match try_load_api_key() {
         Some(k) => k,
         None => {
             eprintln!("⚠ SKIP: No DEEPSEEK_API_KEY available");
@@ -3423,12 +3417,12 @@ async fn test_real_long_running_research_pipeline() {
             config,
             20,  // max 20 loops
             cancel,
-        None,
         )
     ).await;
 
     match result {
-        Ok(Ok(output)) => {
+        Ok(Ok(state)) => {
+            let output = state.final_output.unwrap_or_default();
             let preview: String = output.chars().take(2000).collect();
             eprintln!("\n═══ Research Pipeline Output (first 2000 chars) ═══");
             eprintln!("{}", preview);
@@ -3469,4 +3463,246 @@ async fn test_real_long_running_research_pipeline() {
         std::env::remove_var("TOKEN_BUDGET");
         std::env::remove_var("LOOP_MAX_LOOPS");
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Regression Tests for #1 (skip successful tasks) + #2 (dedup results)
+// ════════════════════════════════════════════════════════════════
+
+/// Test: outputs_still_exist correctly identifies file existence scenarios.
+#[test]
+fn test_outputs_still_exist_file_detection() {
+    use miniagent_loop_pipeline::dispatch::outputs_still_exist;
+
+    let tmp = std::env::temp_dir();
+
+    // Scenario 1: pure text output (no file paths) → should allow skip
+    assert!(outputs_still_exist("A summary of findings", tmp.to_str().unwrap()));
+
+    // Scenario 2: file path exists → should allow skip
+    let existing = tmp.join("test_exists.md");
+    std::fs::write(&existing, "test").unwrap();
+    // Only pass the existing file path (no missing files in the string)
+    assert!(outputs_still_exist(&existing.display().to_string(), tmp.to_str().unwrap()));
+
+    // Scenario 3: file path missing → should NOT allow skip
+    let missing = tmp.join("definitely_missing_xyz.csv");
+    assert!(!outputs_still_exist(&format!("data.csv {}", missing.display()), tmp.to_str().unwrap()));
+
+    // Cleanup
+    let _ = std::fs::remove_file(existing);
+
+    eprintln!("✅ outputs_still_exist correctly handles text, existing, and missing file scenarios");
+}
+
+/// Test: merge_plan preserves successful task ids and fields across loops.
+#[test]
+fn test_merge_plan_preserves_successful_tasks() {
+    use miniagent_loop_pipeline::plan::merge_plan;
+    use miniagent_loop_pipeline::types::{TaskPlan, TaskUnit, TaskResult};
+
+    let old_plan = TaskPlan {
+        overall_goal: "Research A and B".into(),
+        tasks: vec![
+            TaskUnit {
+                id: "task_a".into(),
+                description: "Research topic A".into(),
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary A".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: Some("Output A content".into()),
+            },
+            TaskUnit {
+                id: "task_b".into(),
+                description: "Research topic B".into(),
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary B".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: Some("Output B content".into()),
+            },
+        ],
+        max_loops: 5,
+    };
+
+    // LLM generates a new plan with same ids but slightly different descriptions
+    let new_plan = TaskPlan {
+        overall_goal: "Research A and B".into(),
+        tasks: vec![
+            TaskUnit {
+                id: "task_a".into(),
+                description: "Research topic A (updated)".into(),  // description changed
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary A".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: None,
+            },
+            TaskUnit {
+                id: "task_b".into(),
+                description: "Research topic B".into(),  // unchanged
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary B".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: None,
+            },
+        ],
+        max_loops: 5,
+    };
+
+    let task_results = vec![
+        TaskResult { task_id: "task_a".into(), success: true, output: "Output A".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None, },
+        TaskResult { task_id: "task_b".into(), success: true, output: "Output B".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None, },
+    ];
+
+    let merged = merge_plan(new_plan, &old_plan, &task_results);
+
+    // task_a: description changed → only output preserved, not full clone
+    let merged_a = merged.tasks.iter().find(|t| t.id == "task_a").unwrap();
+    assert_eq!(merged_a.output, Some("Output A content".into()), "task_a output should be preserved");
+    assert_eq!(merged_a.description, "Research topic A (updated)", "task_a description should keep LLM's version");
+
+    // task_b: description unchanged → full clone (output + description + role + deps)
+    let merged_b = merged.tasks.iter().find(|t| t.id == "task_b").unwrap();
+    assert_eq!(merged_b.output, Some("Output B content".into()), "task_b output should be preserved");
+    assert_eq!(merged_b.description, "Research topic B", "task_b description should be preserved from old plan");
+    assert_eq!(merged_b.assigned_role, "researcher", "task_b role should be preserved");
+
+    eprintln!("✅ merge_plan correctly preserves successful task ids and fields");
+}
+
+/// Test: dispatch deduplication via HashMap ensures each task_id appears only once.
+#[test]
+fn test_dispatch_result_deduplication() {
+    use miniagent_loop_pipeline::types::TaskResult;
+
+    let mut result_map: std::collections::HashMap<String, TaskResult> = std::collections::HashMap::new();
+
+    // Simulate: task_1 succeeds in loop 1, then appears again in loop 2 results
+    result_map.insert("task_1".into(), TaskResult {
+        task_id: "task_1".into(),
+        success: true,
+        output: "Loop 1 output".into(),
+        error: None,
+        tokens_used: 100,
+    validation_report: None,
+    arbiter_decision: None,
+    });
+
+    // Loop 2: task_1 succeeds again with better output → should overwrite
+    result_map.insert("task_1".into(), TaskResult {
+        task_id: "task_1".into(),
+        success: true,
+        output: "Loop 2 improved output".into(),
+        error: None,
+        tokens_used: 150,
+    validation_report: None,
+    arbiter_decision: None,
+    });
+
+    // task_2 fails once
+    result_map.insert("task_2".into(), TaskResult {
+        task_id: "task_2".into(),
+        success: false,
+        output: String::new(),
+        error: Some("Network error".into()),
+        tokens_used: 50,
+    validation_report: None,
+    arbiter_decision: None,
+    });
+
+    let all_results: Vec<TaskResult> = result_map.into_values().collect();
+
+    assert_eq!(all_results.len(), 2, "Should have exactly 2 unique tasks");
+    let task_1 = all_results.iter().find(|r| r.task_id == "task_1").unwrap();
+    assert_eq!(task_1.output, "Loop 2 improved output", "Should have latest output");
+    let task_2 = all_results.iter().find(|r| r.task_id == "task_2").unwrap();
+    assert!(!task_2.success, "task_2 should still be failed");
+
+    eprintln!("✅ dispatch result deduplication works correctly");
+}
+
+/// Test: evaluate progress is based on current plan, not inflated task_results.
+#[test]
+fn test_evaluate_progress_based_on_plan() {
+    use miniagent_loop_pipeline::types::{TaskPlan, TaskUnit, TaskResult};
+
+    let plan = TaskPlan {
+        overall_goal: "Research 2 topics".into(),
+        tasks: vec![
+            TaskUnit {
+                id: "topic_a".into(),
+                description: "Research A".into(),
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary A".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: None,
+            },
+            TaskUnit {
+                id: "topic_b".into(),
+                description: "Research B".into(),
+                assigned_role: "researcher".into(),
+                depends_on: vec![],
+                expected_output: "Summary B".into(),
+                difficulty: "medium".into(),
+                failed: false,
+                error: None,
+                output: None,
+            },
+        ],
+        max_loops: 5,
+    };
+
+    // Simulate inflated task_results: topic_a succeeded 3 times across loops
+    let task_results = [TaskResult { task_id: "topic_a".into(), success: true, output: "v1".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None, },
+        TaskResult { task_id: "topic_a".into(), success: true, output: "v2".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None, },
+        TaskResult { task_id: "topic_a".into(), success: true, output: "v3".into(), error: None, tokens_used: 100, validation_report: None, arbiter_decision: None, },
+        TaskResult { task_id: "topic_b".into(), success: false, output: String::new(), error: Some("failed".into()), tokens_used: 50, validation_report: None, arbiter_decision: None, }];
+
+    // Evaluate logic: only count tasks present in current plan
+    let plan_task_ids: std::collections::HashSet<&str> =
+        plan.tasks.iter().map(|t| t.id.as_str()).collect();
+
+    let relevant_results: Vec<&TaskResult> = task_results.iter()
+        .filter(|r| plan_task_ids.contains(r.task_id.as_str()))
+        .collect();
+
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut pending = 0usize;
+
+    for task in &plan.tasks {
+        if let Some(result) = relevant_results.iter().find(|r| r.task_id == task.id) {
+            if result.success {
+                completed += 1;
+            } else {
+                failed += 1;
+            }
+        } else {
+            pending += 1;
+        }
+    }
+
+    assert_eq!(completed, 1, "Only topic_a should be completed");
+    assert_eq!(failed, 1, "Only topic_b should be failed");
+    assert_eq!(pending, 0, "No pending tasks");
+    assert_eq!(completed + failed + pending, 2, "Must equal plan task count");
+
+    let progress_pct = (completed as f64 / plan.tasks.len() as f64) * 100.0;
+    assert_eq!(progress_pct, 50.0, "Progress should be 50%, not inflated by duplicate results");
+
+    eprintln!("✅ evaluate progress correctly based on current plan (not inflated task_results)");
 }

@@ -9,6 +9,11 @@ use crate::secrets::ApiKey;
 /// the `tool` crate's search-backend keys).
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    // ── Provider selection ───────────────────────────────────────
+    /// Which LLM provider to use: "deepseek" (default) or "stepfun".
+    /// Set via PROVIDER env var. Allows switching providers without code changes.
+    pub provider: String,
+
     // ── DeepSeek ──────────────────────────────────────────────────
     pub deepseek_api_key: Option<ApiKey>,
     pub deepseek_base_url: String,
@@ -63,20 +68,6 @@ pub struct AppConfig {
     // ── Budget ────────────────────────────────────────────────────
     pub token_budget: usize,
 
-    // ── Evolution (MLEvolve integration) ─────────────────────────
-    /// Enable tournament-based plan selection (Phase 2).
-    pub loop_evolution_enabled: bool,
-
-    // ── Decoupled Execution (Phase 3) ───────────────────────────
-    /// Enable tactic escalation to strategy layer on repeated failures.
-    pub loop_dispatch_decoupled: bool,
-    /// Max consecutive tactic failures before escalation.
-    pub loop_dispatch_max_retries: usize,
-
-    // ── Search Scheduler (Phase 4) ──────────────────────────────
-    /// Enable entropy-driven search scheduling with stagnation detection.
-    pub loop_search_scheduler_enabled: bool,
-
     // ── Server ────────────────────────────────────────────────────
     pub server_host: String,
     pub server_port: u16,
@@ -92,6 +83,11 @@ impl AppConfig {
         let _ = dotenvy::dotenv();
 
         Self {
+            // ── Provider selection ──
+            provider: Self::var("PROVIDER")
+                .unwrap_or_else(|| "deepseek".into())
+                .to_lowercase(),
+
             deepseek_api_key: ApiKey::from_env("DEEPSEEK_API_KEY"),
             deepseek_base_url: Self::var("DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com".into()),
@@ -134,34 +130,6 @@ impl AppConfig {
             // ── Budget ──
             token_budget: Self::parsed("TOKEN_BUDGET", 3_000_000),
 
-            // ── Evolution (MLEvolve integration) ──
-            loop_evolution_enabled: match std::env::var("LOOP_EVOLUTION_ENABLED") {
-                Ok(val) => {
-                    let lower = val.to_lowercase();
-                    lower == "1" || lower == "true"
-                }
-                Err(_) => false,
-            },
-
-            // ── Decoupled Execution (Phase 3) ──
-            loop_dispatch_decoupled: match std::env::var("LOOP_DISPATCH_DECOUPLED") {
-                Ok(val) => {
-                    let lower = val.to_lowercase();
-                    lower == "1" || lower == "true"
-                }
-                Err(_) => false,
-            },
-            loop_dispatch_max_retries: Self::parsed("LOOP_DISPATCH_MAX_RETRIES", 3),
-
-            // ── Search Scheduler (Phase 4) ──
-            loop_search_scheduler_enabled: match std::env::var("LOOP_SEARCH_SCHEDULER_ENABLED") {
-                Ok(val) => {
-                    let lower = val.to_lowercase();
-                    lower == "1" || lower == "true"
-                }
-                Err(_) => false,
-            },
-
             // ── Server ──
             server_host: Self::var("SERVER_HOST").unwrap_or_else(|| "0.0.0.0".into()),
             server_port: Self::parsed("SERVER_PORT", 3002),
@@ -183,6 +151,25 @@ impl AppConfig {
         self.stepfun_api_key
             .as_ref()
             .ok_or_else(|| "STEPFUN_API_KEY not set. Add it to .env or export it.".to_string())
+    }
+
+    /// Returns true if the active provider is StepFun.
+    pub fn is_stepfun(&self) -> bool {
+        self.provider == "stepfun"
+    }
+
+    /// Returns true if the active provider is DeepSeek (default).
+    pub fn is_deepseek(&self) -> bool {
+        self.provider == "deepseek"
+    }
+
+    /// Require the API key for whichever provider is currently active.
+    pub fn require_active_key(&self) -> Result<&ApiKey, String> {
+        if self.is_stepfun() {
+            self.require_stepfun_key()
+        } else {
+            self.require_deepseek_key()
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────

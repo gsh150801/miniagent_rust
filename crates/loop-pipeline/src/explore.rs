@@ -55,11 +55,6 @@ impl PipelineStage for ExploreStage {
             )
         };
 
-        // ── MLEvolve Phase 1: Memory Retrieval Context ───────────
-        let retrieval_context = &ctx.state.retrieval_context;
-        let memory_section = format_memory_section(retrieval_context);
-        // ────────────────────────────────────────────────────────
-
         let prompt = format!(
             r#"You are the **Explorer** in a multi-agent pipeline. Your job is to use tools to research the task and gather real information.
 
@@ -70,7 +65,6 @@ impl PipelineStage for ExploreStage {
 {prior_exploration}
 {repair_context}
 
-{memory_section}
 ## Instructions
 1. **Use web_search, web_fetch, and pubmed_search** to research the task.
 2. Gather real information — do not rely on your internal knowledge alone.
@@ -170,47 +164,5 @@ impl PipelineStage for ExploreStage {
             ),
         })
     }
-}
-
-// ── MLEvolve Phase 1: Memory Injection Helpers ─────────────────
-
-/// Format the memory retrieval context into a prompt section.
-///
-/// Injects:
-///   - Relevant successes (what worked for similar tasks)
-///   - Pitfalls (what to avoid based on historical failures)
-///   - Domain template suggestions (tools, roles, focus)
-fn format_memory_section(ctx: &crate::types::RetrievalContext) -> String {
-    let mut parts = Vec::new();
-
-    // Relevant successes
-    if !ctx.relevant_successes.is_empty() {
-        let successes: Vec<String> = ctx.relevant_successes.iter()
-            .map(|s| format!("- [SUCCESS] {}: {}", s.description, s.lessons.first().unwrap_or(&"".to_string())))
-            .collect();
-        parts.push(format!("## Relevant Past Successes\n{}", successes.join("\n")));
-    }
-
-    // Pitfalls to avoid
-    if !ctx.pitfalls.is_empty() {
-        let pitfalls: Vec<String> = ctx.pitfalls.iter()
-            .map(|p| format!("- [PITFALL] {}: {}", p.description, p.lessons.first().unwrap_or(&"".to_string())))
-            .collect();
-        parts.push(format!("## Historical Pitfalls to Avoid\n{}", pitfalls.join("\n")));
-    }
-
-    // Confidence indicator
-    if ctx.confidence > 0.0 {
-        parts.push(format!("## Memory Confidence\n{:.0}% — based on {} relevant experiences",
-            ctx.confidence * 100.0,
-            ctx.relevant_successes.len() + ctx.pitfalls.len(),
-        ));
-    }
-
-    if parts.is_empty() {
-        return String::new();
-    }
-
-    format!("## MLEvolve Memory Retrieval\n{}", parts.join("\n\n"))
 }
 

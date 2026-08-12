@@ -6,6 +6,9 @@ pub mod dispatch;
 pub mod evaluate;
 pub mod repair;
 pub mod prompts;
+pub mod roles;
 pub mod pipeline;
+pub mod runner;
 
 pub use pipeline::LoopPipeline;
+pub use runner::LoopRunner;

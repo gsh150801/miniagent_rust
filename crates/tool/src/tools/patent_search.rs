@@ -34,7 +34,11 @@ impl Tool for PatentSearchTool {
     fn description(&self) -> &str {
         "Search patents from global databases. Uses Google Patents (default) and USPTO. \
          Returns patent title, number, assignee, inventors, filing date, status, and abstract. \
-         Supports search by keywords, patent number, assignee, inventor, or CPC/IPC classification."
+         Supports search by keywords, patent number, assignee, inventor, or CPC/IPC classification.\n\n\
+         IMPORTANT: ALWAYS use English keywords for searching — patent databases index \
+         primarily in English. Translate non-English queries to English technical terms \
+         before searching. If results are sparse, retry with broader terms, synonyms, \
+         or CPC classification codes."
     }
     fn class(&self) -> ToolClass { ToolClass::ReadOnly }
     fn input_schema(&self) -> serde_json::Value {
@@ -43,7 +47,7 @@ impl Tool for PatentSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (e.g. 'quantum computing', 'CRISPR patent', patent number like 'US20240000000A1')"
+                    "description": "Search query in ENGLISH (e.g. 'quantum computing', 'CRISPR gene editing'), patent number (e.g. 'US20240000000A1'), or CPC class (e.g. 'A61K31/00'). Translate non-English terms to English first."
                 },
                 "max_results": {
                     "type": "integer",
@@ -342,7 +346,7 @@ mod tests {
 
         let tool = PatentSearchTool::new();
         let input = json!({"query": "test", "backend": "uspto"});
-        let ctx = ToolContext { working_dir: ".".into(), session_id: "test".into() };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string() );
         let cancel = CancellationToken::new();
 
         // Use tokio runtime to run async

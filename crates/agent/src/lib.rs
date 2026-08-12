@@ -1,5 +1,6 @@
 pub mod context;
 pub mod hooks;
+pub mod agent_tool;
 
 use std::sync::Arc;
 
@@ -32,27 +33,31 @@ const KEEP_RECENT_MSGS: usize = 5;
 /// Max consecutive all-error tool rounds before breaking the agent loop
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
 
-/// Rough token count: chars/3 works for mixed Chinese/English/code
+/// Rough token estimate using UTF-8 byte count.
+///
+/// 参考 cc-python-claude 的 token_estimation.py：用 UTF-8 字节数而非字符数。
+/// 英文 ~4 bytes/token，中文 UTF-8 编码后 ~3 bytes/字（每字约 1.5 token），
+/// 用 bytes/4 对中英混合更准确。旧的 chars/3 对纯中文严重低估（中文 1 char ≈ 1.5 token，
+/// chars/3 算成 0.33 token/char，偏差 4.5x）。
 fn estimate_history_tokens(history: &[Message]) -> usize {
     history
         .iter()
-        .map(|m| m.text_content().chars().count() / 3)
+        .map(|m| m.text_content().len() / 4) // len() = UTF-8 字节数
         .sum()
 }
 
 pub struct Agent {
     provider_router: ProviderRouter,
-    tool_executor: Option<Arc<ToolExecutor>>,
+    /// 运行时可替换的 ToolExecutor（用 Arc<Mutex<Option<...>>> 支持
+    /// 在 Arc<Agent> 上调用 replace_tools 而不需要 &mut self）。
+    tool_executor: Arc<std::sync::Mutex<Option<Arc<ToolExecutor>>>>,
     memory: Option<Arc<MemoryManager>>,
     checkpoint_store: Option<Arc<CheckpointStore>>,
     self_improver: Option<Arc<tokio::sync::Mutex<SelfImprover>>>,
     hooks: Option<Arc<HookRegistry>>,
     config: Option<Arc<miniagent_core::settings::AppConfig>>,
-    /// Optional broadcast channel so external consumers (e.g. the web server)
-    /// can observe fine-grained events: tool call start/end, lifecycle, etc.
-    /// Wrapped in Arc<Mutex<>> so it can be set on an Arc-shared agent without
-    /// requiring &mut self.
     event_sender: Option<Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Sender<AgentEvent>>>>>,
+    sub_agent_rx: Option<std::sync::Mutex<tokio::sync::broadcast::Receiver<AgentEvent>>>,
 }
 
 // Agent 含 `Box<dyn LlmProvider>` 等不可 Debug 的字段，无法 derive(Debug)。
@@ -61,7 +66,7 @@ pub struct Agent {
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
-            .field("has_tools", &self.tool_executor.is_some())
+            .field("has_tools", &self.tool_executor.lock().map(|e| e.is_some()).unwrap_or(false))
             .field("has_memory", &self.memory.is_some())
             .finish()
     }
@@ -78,19 +83,26 @@ impl Agent {
     pub fn new(flash: Box<dyn LlmProvider>, pro: Box<dyn LlmProvider>) -> Self {
         Self {
             provider_router: ProviderRouter::new(flash, pro),
-            tool_executor: None,
+            tool_executor: Arc::new(std::sync::Mutex::new(None)),
             memory: None,
             checkpoint_store: None,
             self_improver: None,
             hooks: None,
             config: None,
             event_sender: None,
+            sub_agent_rx: None,
         }
     }
 
-    pub fn with_tools(mut self, executor: ToolExecutor) -> Self {
-        self.tool_executor = Some(Arc::new(executor));
+    pub fn with_tools(self, executor: ToolExecutor) -> Self {
+        *self.tool_executor.lock().unwrap() = Some(Arc::new(executor));
         self
+    }
+
+    /// 运行时替换 ToolExecutor（用于 AgentTool server 接入：
+    /// 先构建 Agent→包 Arc→构造 AgentTool→replace_tools 注入含 AgentTool 的 registry）。
+    pub fn replace_tools(&self, executor: ToolExecutor) {
+        *self.tool_executor.lock().unwrap() = Some(Arc::new(executor));
     }
 
     pub fn with_memory(mut self, memory: MemoryManager) -> Self {
@@ -153,8 +165,8 @@ impl Agent {
         self.memory.as_deref()
     }
 
-    pub fn tool_executor(&self) -> Option<&ToolExecutor> {
-        self.tool_executor.as_deref()
+    pub fn tool_executor(&self) -> Option<std::sync::MutexGuard<'_, Option<Arc<ToolExecutor>>>> {
+        self.tool_executor.lock().ok()
     }
 
     /// Single turn: user prompt → agent response (no tool loop)
@@ -171,10 +183,9 @@ impl Agent {
         }
 
         // Gather tool definitions if available, optionally filtered by allowed_tools.
-        let tools: Vec<ToolDef> = self
-            .tool_executor
-            .as_ref()
-            .map(|e| {
+        let tools: Vec<ToolDef> = {
+            let guard = self.tool_executor.lock().unwrap();
+            guard.as_ref().map(|e| {
                 let mut defs: Vec<ToolDef> = e
                     .registry()
                     .get_definitions()
@@ -191,8 +202,8 @@ impl Agent {
                 }
 
                 defs
-            })
-            .unwrap_or_default();
+            }).unwrap_or_default()
+        };
 
         // Assemble memory context
         let memory_context = if let Some(ref mem) = self.memory {
@@ -253,6 +264,37 @@ impl Agent {
         }
     }
 
+    /// Set the sub-agent completion receiver (for AgentTool).
+    /// When set, run_with_loop will collect completed sub-agent results between iterations.
+    pub fn set_sub_agent_rx(&self, rx: tokio::sync::broadcast::Receiver<AgentEvent>) {
+        if let Some(ref inner) = self.sub_agent_rx {
+            let mut guard = inner.lock().unwrap();
+            *guard = rx;
+        }
+    }
+
+    /// Collect any completed sub-agent results into history (non-blocking).
+    fn collect_sub_agent_results(&self, history: &mut Vec<Message>) {
+        let Some(ref inner) = self.sub_agent_rx else { return };
+        let mut guard = match inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        loop {
+            match guard.try_recv() {
+                Ok(AgentEvent::SubAgentCompleted { task_id, result, success }) => {
+                    let label = if success { "completed" } else { "failed" };
+                    history.push(Message::tool(
+                        &task_id,
+                        format!("[Sub-agent {label}]\n{result}"),
+                    ));
+                }
+                Ok(_) => {} // other events, ignore
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Multi-turn with tool-call loop
     pub async fn run_with_loop(
         &self,
@@ -266,6 +308,12 @@ impl Agent {
         let mut last_delta = None;
         let mut consecutive_errors: usize = 0;
 
+        // transcript 修复：在循环开始前修补孤立 tool_use（防 API 校验错误）
+        let fixed = miniagent_core::message::validate_transcript(history);
+        if fixed > 0 {
+            tracing::info!(fixed, "transcript repaired at run_with_loop start");
+        }
+
         self.emit_event(AgentEvent::RunStarted { run_id, timestamp: chrono::Utc::now() }).await;
 
         for iteration in 0..max_iterations {
@@ -276,7 +324,47 @@ impl Agent {
                 run_id, iteration,
             ).await;
 
-            let delta = self.run(history, context, cancel.child_token()).await?;
+            // LLM 调用 + 重试（参考 cc-python-claude query_loop 的错误恢复策略）
+            // 429/529 瞬时错误 → 指数退避重试（最多 3 次）
+            // 其他错误 → 直接失败
+            let delta = {
+                let mut retry_count = 0u32;
+                let max_retries = 3u32;
+                loop {
+                    match self.run(history, context, cancel.child_token()).await {
+                        Ok(d) => break d,
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            // 429 (rate limit) / 529 (overloaded) / 瞬时网络错误 → 重试
+                            let is_transient = err_str.contains("429")
+                                || err_str.contains("529")
+                                || err_str.contains("rate limit")
+                                || err_str.contains("overloaded")
+                                || err_str.contains("connection")
+                                || err_str.contains("timeout")
+                                || err_str.contains("timed out");
+
+                            if is_transient && retry_count < max_retries {
+                                retry_count += 1;
+                                let delay = std::time::Duration::from_secs(
+                                    2u64.pow(retry_count) // 2s, 4s, 8s 指数退避
+                                );
+                                tracing::error!(
+                                    retry = retry_count,
+                                    max_retries = max_retries,
+                                    delay_secs = delay.as_secs(),
+                                    error = %err_str,
+                                    "transient LLM error, retrying with backoff"
+                                );
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            // 非瞬时错误或重试耗尽 → 返回错误
+                            return Err(e);
+                        }
+                    }
+                }
+            };
             let stop_reason = delta.stop_reason.clone();
 
             total_usage.input_tokens += delta.usage.input_tokens;
@@ -317,7 +405,13 @@ impl Agent {
 
             match stop_reason {
                 StopReason::ToolUse => {
-                    if let Some(ref executor) = self.tool_executor {
+                    // Clone Arc<ToolExecutor> and immediately drop the guard
+                    // to avoid holding MutexGuard across .await points (not Send).
+                    let executor_opt = {
+                        let guard = self.tool_executor.lock().unwrap();
+                        guard.clone()
+                    };
+                    if let Some(ref executor) = executor_opt {
                         let last_msg = history.last().unwrap();
                         let raw_tool_calls: Vec<(ToolCallRequest, serde_json::Value)> = last_msg
                             .content
@@ -359,7 +453,7 @@ impl Agent {
                                     tracing::warn!(reason = %reason, "Hook blocked tool call");
                                     history.push(Message::tool(
                                         "hook_blocked",
-                                        &format!("Operation blocked: {reason}"),
+                                        format!("Operation blocked: {reason}"),
                                     ));
                                     blocked = true;
                                     break;
@@ -380,6 +474,14 @@ impl Agent {
 
                         // Emit tool-call-start events (fire-and-forget).
                         for tc in &tool_calls {
+                            // 日志：记录工具调用请求（target=tool_call，放行到 info 级别）
+                            tracing::info!(
+                                target: "tool_call",
+                                call_id = ?tc.id,
+                                tool = %tc.name,
+                                input = %tc.input,
+                                "tool_call_requested",
+                            );
                             self.emit_event(AgentEvent::ToolCallRequested {
                                 call_id: tc.id,
                                 tool_name: tc.name.clone(),
@@ -387,10 +489,10 @@ impl Agent {
                             }).await;
                         }
 
-                        let ctx = ToolContext {
-                            working_dir: context.working_dir.clone(),
-                            session_id: format!("{}", run_id.0),
-                        };
+                        let ctx = ToolContext::new(
+                            context.working_dir.clone(),
+                            format!("{}", run_id.0),
+                        );
 
                         let results = executor
                             .execute_batch(&tool_calls, &ctx, cancel.child_token())
@@ -408,10 +510,60 @@ impl Agent {
                                     .map(|m| m.is_error).unwrap_or(false);
                                 let latency = output.metadata.as_ref()
                                     .map(|m| m.duration_ms).unwrap_or(0);
+
+                                // 日志：记录工具调用结果（成功/失败/结果/耗时）
+                                // target=tool_call 放行到 info；失败时用 error 级别
+                                if is_error {
+                                    tracing::error!(
+                                        target: "tool_call",
+                                        call_id = ?call_id,
+                                        tool = %tool_name,
+                                        duration_ms = latency,
+                                        result = %output.content.chars().take(500).collect::<String>(),
+                                        "tool_call_failed",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target: "tool_call",
+                                        call_id = ?call_id,
+                                        tool = %tool_name,
+                                        duration_ms = latency,
+                                        result = %output.content.chars().take(500).collect::<String>(),
+                                        "tool_call_completed",
+                                    );
+                                }
+
                                 if is_error {
                                     imp.on_tool_failure(tool_name, &output.content);
                                 } else {
                                     imp.on_tool_success(tool_name, latency);
+                                }
+                            }
+                        } else {
+                            // 无 self_improver 时也要记录工具调用日志
+                            for (call_id, output) in &results {
+                                let tool_name = tool_calls.iter()
+                                    .find(|tc| tc.id == *call_id)
+                                    .map(|tc| tc.name.as_str())
+                                    .unwrap_or("unknown");
+                                let is_error = output.metadata.as_ref()
+                                    .map(|m| m.is_error).unwrap_or(false);
+                                let latency = output.metadata.as_ref()
+                                    .map(|m| m.duration_ms).unwrap_or(0);
+                                if is_error {
+                                    tracing::error!(
+                                        target: "tool_call",
+                                        call_id = ?call_id, tool = %tool_name, duration_ms = latency,
+                                        result = %output.content.chars().take(500).collect::<String>(),
+                                        "tool_call_failed",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target: "tool_call",
+                                        call_id = ?call_id, tool = %tool_name, duration_ms = latency,
+                                        result = %output.content.chars().take(500).collect::<String>(),
+                                        "tool_call_completed",
+                                    );
                                 }
                             }
                         }
@@ -487,6 +639,17 @@ impl Agent {
                         break;
                     }
                 }
+                StopReason::MaxTokens
+                    // 参考 cc-python-claude query_loop：输出被截断时追加"请继续"续写，
+                    // 而非直接终止（丢失后续内容）。最多续写 3 次防无限循环。
+                    if iteration < max_iterations.saturating_sub(1) => {
+                        tracing::info!(
+                            iteration,
+                            "output truncated (MaxTokens), appending 'continue' to resume"
+                        );
+                        history.push(Message::user("Please continue from where you left off."));
+                        // 不 break，继续下一轮循环让 LLM 续写
+                    }
                 _ => {
                     last_delta = Some(AgentDelta {
                         new_messages: vec![],
@@ -496,6 +659,9 @@ impl Agent {
                     break;
                 }
             }
+
+            // 收集已完成的子 agent 结果（AgentTool 后台异步模式）
+            self.collect_sub_agent_results(history);
         }
 
         // Episode-end consolidation

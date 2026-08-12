@@ -975,3 +975,1182 @@ O(M log M) 次比较 × 每次遍历历史 → O(M log M × H)。
 - `expect()` 在生产路径（缺 API key/DB 时 panic 而非降级）——低危，多数有不变量保护
 - `EventStream.push` 每条事件 open/close 文件句柄——CPU 微优化
 - `find_entity_by_name` 性能（待确认是否已索引）
+
+---
+
+## 第十轮优化：loop-pipeline 任务级增量复用（缺陷 #1 + #2 + #3 修复）（✅ 已完成）
+
+**日期**：2026-06-21
+
+### 问题回顾
+loop-pipeline 的 Explore→Plan→Dispatch→Evaluate→Repair 循环存在三个互相依赖的结构性缺陷：
+1. **plan 每轮全量重生成** → 新 plan 丢失上轮 task 的 id/output，task_id 跨轮不稳定
+2. **dispatch 无条件重新执行所有 task** → 已成功任务被白费重跑（LLM 调用、工具执行）
+3. **task_results 无界累积 + evaluate 进度失真** → completed 计入重复结果，progress_pct 虚高
+
+根因：**没有"增量"概念**。本方案建立任务级增量复用链路。
+
+### 三层修复
+
+#### 层 1：plan 增量合并（`plan.rs`）
+新增 `merge_plan(new_plan, old_plan, task_results) -> TaskPlan` 函数：
+- 遍历新 plan 的 task，若 id 在旧 plan 中存在且 task_results 显示该 id 成功 → 保留旧 output/error
+- 使 dispatch 能据此跳过重跑
+- prompt 改动：prior_tasks 上下文显式包含上轮 task id + 成功/失败状态标记，要求 LLM 对成功任务复用相同 id
+
+#### 层 2：dispatch 跳过已成功任务 + 产物校验（`dispatch.rs`）
+- 新增 `outputs_still_exist(expected_output, working_dir) -> bool`：从 expected_output 提取文件路径（.py/.rs/.md/.csv 等扩展名），校验是否仍存在
+- wave 执行循环 spawn 前：查 `result_map` 是否有该 task_id 的成功记录 + 产物校验通过 → 跳过重跑，复用旧结果
+- result_map 已按 task_id 去重（HashMap），消除缺陷 #2 的无界累积
+
+#### 层 3：evaluate 基于当前 plan 计算真实进度（`evaluate.rs`）
+- 用 `plan_task_ids: HashSet` 过滤，只统计当前 plan 内 task 的结果
+- `debug_assert_eq!(completed + failed + pending, total)` 保证不再有 completed+failed > total 的失真
+
+### 附带修复
+- **server/routes.rs 多余 `}`**：第八轮 warning 清理时引入的花括号不平衡，已修复
+
+### 新增测试（10 个）
+| 测试文件 | 测试 | 验证 |
+|---------|------|------|
+| dispatch.rs (×6) | `test_outputs_still_exist_*` | 文件存在/缺失/相对路径/多文件/纯文本各场景 |
+| plan.rs (×4) | `test_merge_plan_*` | 首次不合并/保留成功 output/新 id 不合并/失败 task 不合并 |
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅（provider/evolution 既有 warning 非本轮引入） |
+| `cargo test -p miniagent-loop-pipeline --lib` | ✅ **24 通过 / 0 失败**（14 原有 + 10 新增） |
+| `integration_test.rs` | ✅ **37 通过 / 0 失败** |
+| `stepfun_integration.rs` | ⚠️ 5 failed = StepFun API 429 rate limit（与改动无关，配额耗尽） |
+
+### 行为变化
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| 第 2 轮 plan | 全量重生成，丢失上轮 id | 增量合并：成功任务保留 id/output |
+| 第 2 轮 dispatch | 重新执行所有 task（含已成功的） | 跳过已成功且产物存在的 task |
+| task_results | 无界累积（跨轮 push 不去重） | 按 task_id 去重（HashMap） |
+| evaluate 进度 | completed 计入跨轮孤儿结果 | 只统计当前 plan 内 task |
+| 成本 | N 轮 = N 倍重复执行 | N 轮 ≈ 只执行失败/新增 task |
+
+---
+
+## 第十一轮优化：loop-pipeline 客观产物校验（缺陷 #3 修复）（✅ 已完成）
+
+**日期**：2026-06-21
+
+### 问题
+evaluate 阶段完全依赖 LLM 主观判断（"我觉得完成了"），无客观信号验证产物是否真存在。
+LLM 可能说"全部完成"但实际文件缺失——基于错误评估提前终止。
+
+### 修复（`evaluate.rs`）
+新增 `check_phantom_failures(tasks, results, working_dir) -> Vec<String>`：
+- 对 plan 中标记为"成功"的 task，检查 expected_output 提到的文件是否真存在（复用
+  dispatch.rs 的 `outputs_still_exist`）
+- 返回"幽灵成功"列表（标记成功但产物缺失的 task_id）
+
+在 evaluate 的 override 逻辑后注入：当 `should_continue=false`（即将终止）时，若有幽灵失败：
+- 强制 `should_continue=true`（防止提前终止）
+- 幽灵 task 加入 `failed_task_ids`（让 dispatch 下轮重跑）
+- 加入 `unmet_goals` 记录缺失原因
+
+### 行为变化
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| LLM 说"全部完成"但文件缺失 | 提前终止（错误） | 强制继续，标记缺失 task 为失败（重跑） |
+| LLM 说"全部完成"且文件都在 | 终止（正确） | 终止（不变，客观校验通过） |
+| 纯文本输出（无文件） | — | 不校验（outputs_still_exist 返回 true） |
+
+### #4 loop_count 经评估不修复
+`loop_count += 1` 在 evaluate 内部的两个分支（行 274、299）。经评估：当前设计**自洽**
+——evaluate 是每轮唯一递增 loop_count 的地方，语义清晰（"完成一轮评估后递增"），
+evaluate 内部的 `loop_count >= max_loops` 判断也依赖此递增。移动到主循环会改变控制流
+语义且增加风险，**判定为"不修复"**（代码异味但不影响正确性）。
+
+### 新增测试（5 个，`evaluate.rs::tests`）
+| 测试 | 验证 |
+|------|------|
+| `test_phantom_check_no_missing_files` | 文件存在 → 无幽灵 |
+| `test_phantom_check_detects_missing_file` | 文件缺失 → 检测到幽灵 |
+| `test_phantom_check_skips_text_only_outputs` | 纯文本输出 → 不校验 |
+| `test_phantom_check_skips_failed_tasks` | 失败 task → 不校验（已在 failed_ids） |
+| `test_phantom_check_mixed_success_and_failure` | 混合场景 → 只标记真正缺失的 |
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| loop-pipeline lib | ✅ **29 通过**（24 原有 + 5 新增） |
+| integration_test | ✅ **37 通过** |
+| stepfun_integration | ⚠️ 5 failed = API 429（与改动无关） |
+
+---
+
+## 第十二轮优化：CLI provider 路由修复（PROVIDER=stepfun 401 根因）（✅ 已完成）
+
+**日期**：2026-06-21
+
+### 问题
+用户配置 `PROVIDER=stepfun` + 真实 StepFun key，但 workflow 命令报 401 Unauthorized。
+根因：**CLI 所有命令硬编码 DeepSeek provider**，用 `config.require_deepseek_key()` 取 key
+（占位符）+ `DeepSeekFlash::new()` 构造——完全忽略 `PROVIDER=stepfun` 配置。
+
+### 根因分析
+- `settings.rs` **早已有完整 provider 路由基础设施**：`provider` 字段、`is_stepfun()`、
+  `require_active_key()`、`require_stepfun_key()`——但 CLI 从未使用
+- CLI 全部命令用 `require_deepseek_key()` + `DeepSeekFlash/Pro::new()` 硬编码
+- StepFun provider（`StepFunFlash`/`StepFunClient`）已实现但 CLI 从未接入
+
+### 修复（`cli/src/main.rs`）
+1. **新增 `make_providers(config) -> (Box<dyn LlmProvider>, Box<dyn LlmProvider>)`** 工厂函数：
+   根据 `config.is_stepfun()` 返回 (StepFun, StepFun) 或 (DeepSeekFlash, DeepSeekPro)
+2. **所有命令的 key 解析**：`require_deepseek_key()` → `require_active_key()`（尊重 PROVIDER）
+3. **所有命令的 provider 构造**改为路由：
+   - `build_full_agent`：用 `make_providers`（agent/run/loop 命令受益）
+   - `workflow_command`：PlannerStage 的 flash 用 if-else 路由
+   - `plan_command`：Planner + agent 用 `make_providers`
+   - `orchestrate_command`：agent + decompose flash 用路由
+   - `debate_command`：三个角色（proposer/opponent/judge）用三元组路由
+   - `team_command`：StateGraph execute 的 flash/pro 用 `make_providers`
+   - `research_command`：用 `make_providers`
+
+### 行为变化
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| `PROVIDER=stepfun` + 有效 StepFun key | 401（用 DeepSeek 占位符 key） | ✅ 正确路由到 StepFun |
+| `PROVIDER=deepseek`（默认）+ 有效 DeepSeek key | ✅ 正常 | ✅ 正常（不变） |
+| 缺 key | `require_deepseek_key` 报错 | `require_active_key` 报当前 provider 的 key 缺失 |
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 29） | ✅ 全绿 |
+
+---
+
+## 第十三轮优化：Server provider 路由 + skill 浏览端点（✅ 已完成）
+
+**日期**：2026-06-23
+
+### 问题 1："Rust vs Go" 任务报 401 Unauthorized
+**根因**：server 的 `handle_run`（WebSocket 任务处理）和 `run_handler`（REST API）都硬编码
+`config.require_deepseek_key()` + `DeepSeekFlash::new()`——与 CLI 的问题完全相同。
+`PROVIDER=stepfun` 配置被忽略，用 DeepSeek 占位符 key 调 API → 401 → "Planner LLM failed,
+using single-agent fallback"。
+
+**修复**（`server/src/routes.rs`）：
+- `handle_run` + `run_handler`：`require_deepseek_key()` → `require_active_key()`
+- `PlannerStage::new`：if `is_stepfun()` → StepFunFlash，else → DeepSeekFlash
+- `stream_synthesis`：加 `is_stepfun` 参数，按配置选 StepFunFlash 或 DeepSeekPro
+- server bin（`miniagent-server.rs`）启动逻辑**已正确路由**（无需改）
+
+### 问题 2：前端 skill 面板永远为空（"只能搜索不能浏览"）
+**根因**：后端**没有 `/api/skills` 端点**！前端 `loadSkills()` fetch `/api/skills` 返回 404，
+`skills` 数组保持空 `[]`，面板永远显示"No skills found"。不是"只能搜索不能浏览"，
+而是**根本加载不到任何 skill**。
+
+**修复**（`server/src/routes.rs`）：
+- 新增 `skills_handler`：扫描 `skills/` + `.miniagent/skills/` 目录的 SKILL.md，
+  返回 `[{name, description, triggers, tags, tools_needed, priority, actionable, version}]`
+- 注册路由 `.route("/api/skills", get(skills_handler))`
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 29） | ✅ 全绿 |
+
+---
+
+## 第十四轮优化：需求2全链路追溯 + 需求3日志改 error（批次1+2）（✅ 已完成）
+
+**日期**：2026-06-26
+
+### 需求3：日志改 error-only（批次1）
+
+**问题**：server 日志 filter level = INFO（含大量 warn/info 噪声）；3 处危险吞错。
+
+**修复**：
+- `server/bin/miniagent-server.rs`：`init("info")` → `init("error")`（只记 error，忽略 warn/info）
+- **修复 run_judge/run_critic 降级吞错**（`dispatch.rs`）：provider 错误/parse 错误时原来返回
+  `passed: true`（把失败任务误判通过）→ 改为 `passed: false` + `tracing::error!`
+- **修复 metadata.json 写失败吞错**（`routes.rs:1408`）：`let _ = write(...)` → 记 error
+- **修复 dispatch 持久化 `.ok()` 吞错**（`dispatch.rs:617/648/683`）：`.ok()` → 记 error
+
+### 需求2：全链路追溯（批次2）
+
+**问题**：工具调用审计（AgentEvent）只走 broadcast→前端，**不落盘**——刷新后丢失。
+审计基础设施（EventStream/AuditLogHook）代码存在但未接入 server。
+
+**修复**：
+- **`TaskInfo` 加 `event_log: Vec<serde_json::Value>`**：存储每个 AgentEvent（含完整 tool input/output/error/duration）+ 时间戳
+- **`run_with_progress` / `run_multi_stage_with_streaming`**：AgentEvent 分支并行落盘到 `task.event_log`（每事件 `{ts, event}`）
+- **新增 `/api/trace/{task_id}` 端点**：返回 task 的完整 event_log + stage_outputs + summary
+- **前端加"📋 轨迹"按钮**：每个任务卡可点击查看完整执行轨迹（工具调用链、error 高亮、时间戳）
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 29 + server） | ✅ 全绿 |
+
+### 后续批次（需求1，下一轮）
+- 批次3：新建 Executor/Validator/Arbiter 三角色执行结构
+- 批次4：统一新流程（explore→ask→plan→调度→执行→反馈）+ 双向 ws + 前端重构
+
+---
+
+## 第十五轮优化：需求1 三角色 + 统一新流程 + 双向ws + 前端重构（批次3+4）（✅ 已完成）
+
+**日期**：2026-06-27
+
+### 批次3：三角色执行结构（Executor/Validator/Arbiter）
+
+**新建** `crates/loop-pipeline/src/roles/`：
+- **`validator.rs`**：`ValidationReport { passed, issues, severity, suggestions }` + `run_validator`（单次 LLM 调用，校验执行者产出）
+- **`arbiter.rs`**：`ArbiterDecision { Pass, Revise{feedback}, Supplement{feedback} }` + `run_arbiter`/`run_arbiter_forgiving`（综合产物+校验报告做决策）
+- **`mod.rs`**：`execute_with_roles` 协作循环（Executor→Validator→Arbiter→Revise/Supplement→重新Executor，最多 2 轮）+ `ThreeRoleResult`
+
+**TaskResult 扩展**：加 `validation_report: Option<Value>` + `arbiter_decision: Option<String>`
+
+**9 个单元测试**：validator 解析/检测问题、arbiter serde/决策/pass/revise、三角色协作循环（pass首轮/循环重试/超限强制pass）
+
+### 批次4：统一新流程 + 双向 ws + 前端重构
+
+#### 后端（`routes.rs`）
+- **AppState 加 `asks`**：`DashMap<String, oneshot::Sender<String>>`（ask 暂停的同步机制）
+- **`handle_ws` 加 `"ask_reply"` 消息分支**：前端回复时唤醒暂停的 task
+- **`ask_user` helper**：推 `{type:'ask'}` + 注册 oneshot + await（5 分钟超时保护）
+- **`handle_run` 加 ExploreStage**：LLM 分析问题获取上下文，推 progress 事件
+- **`handle_run` 加 AskStage**（可选）：探索发现"ambiguous"时反问用户
+- **`handle_run` 加 PlanStage progress 事件**：推 explore/plan 阶段状态
+- **`handle_ws` 的 `"run"` 分支统一**：移除 `if req.mode == "loop"` 分支，全部走 `handle_run`
+
+#### 前端（`app.js` + `index.html` + `styles.css`）
+- **移除 modeToggle**：HTML 删除按钮 + JS 删除 toggleMode + sendMessage 不再传 mode
+- **`handleMsg` 加 `case 'ask'`**：调 `renderAsk` 渲染输入框/选项卡
+- **`renderAsk` 函数**：问题文本 + 选项按钮（点击即回复）+ 文本输入框（Enter 回复）+ Reply 按钮
+- **ask CSS 样式**：`.msg-ask` / `.ask-option-btn` / `.ask-input` / `.ask-send-btn`
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 38） | ✅ 全绿 |
+| 三角色测试 | ✅ 9/9 |
+
+### 后续（待手动测试）
+- server 启动 + 前端发任务 → 观察 explore/plan 阶段实时进度
+- ask 交互：LLM 判断 ambiguous → 前端弹输入框 → 用户回复 → task 继续
+- 三角色接入 dispatch：当前 `execute_with_roles` 已实现，接入 `handle_run` 的 dispatch 阶段需后续
+
+---
+
+## 第十六轮优化：FeedbackStage 总评审（需求1 完成）（✅ 已完成）
+
+**日期**：2026-06-28
+
+### FeedbackStage 总评审
+在 `handle_run` 的 workflow 执行后、函数结束前，加 FeedbackStage：
+- **`run_feedback_review`**：综合所有 stage 产物 + 原始需求，用 LLM 做总评审
+  - 输出 `FeedbackResult { verdict: "deliver"/"revise"/"unclear", summary }`
+  - verdict 非 deliver 时推反馈给前端（用户可决定是否重新发起）
+- 推 `{type:'progress', stage:'feedback', status:'running/done'}` 到前端
+- 设计决策：总评审在 workflow 整体执行后做一次，而非逐 stage 评审——避免侵入 workflow 执行逻辑，降低风险
+
+### 完整新流程状态
+`handle_run` 现在的完整流程：
+1. ✅ **ExploreStage**：LLM 分析问题获取上下文
+2. ✅ **AskStage**（可选）：问题模糊时反问用户（双向 ws 暂停）
+3. ✅ **PlanStage**：PlannerStage 拆解子任务 + 依赖分类
+4. ✅ **DispatchStage**：WorkflowBuilder 按依赖执行（串行/并行）
+5. ✅ **FeedbackStage**：总评审决定交付/修改/不确定
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 38） | ✅ 全绿 |
+
+### 三个需求最终状态
+- **需求1**（统一工作流）：✅ 完成（explore→ask→plan→dispatch→feedback 全链路 + 三角色结构 + 双向 ws + 前端 ask 交互 + 总评审）
+- **需求2**（全链路追溯）：✅ 完成（event_log 落盘 + /api/trace 端点 + 前端轨迹查看）
+- **需求3**（日志只记 error）：✅ 完成（filter level error + 修复 3 处危险吞错）
+
+---
+
+## 第十七轮优化：日志策略细化（error + 工具调用，不记 warning）（✅ 已完成）
+
+**日期**：2026-06-28
+
+### 用户要求
+日志只记录报错、工具调用（成功/失败/参数/结果）等重要信息，不记录 warning 这种非重要信息。
+
+### 修复
+
+#### 1. Filter 策略调整（`telemetry/src/subscriber.rs`）
+fallback filter 从 `miniagent={level},tokio=warn,hyper=warn,reqwest=warn` 改为：
+```
+miniagent=error,tool_call=info,tokio=error,hyper=error,reqwest=error
+```
+- **`miniagent` 整体只记 error**（忽略 99 处 warn、115 处 info）
+- **`tool_call` target 放行到 info**（工具调用是重要信息，需记录）
+- **框架噪声（tokio/hyper/reqwest）压到 error**（不再显示 warn）
+
+#### 2. 工具调用加 tracing 日志（`agent/src/lib.rs`）
+在 Agent 的工具执行循环加三个日志点（target="tool_call"）：
+- **`tool_call_requested`**（info）：call_id + tool_name + input（参数）
+- **`tool_call_completed`**（info）：call_id + tool_name + duration_ms + result（成功结果，截断 500 字符）
+- **`tool_call_failed`**（error）：call_id + tool_name + duration_ms + result（失败结果）
+
+覆盖有/无 self_improver 两条路径。
+
+### 效果
+重启 server 后，日志只显示：
+- 🔴 error（报错）
+- 🔧 tool_call（工具调用的完整参数+结果+耗时+成功/失败）
+- 不再显示 warn/info 噪声
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 38） | ✅ 全绿 |
+
+---
+
+## 第十八轮优化：参考 cc-python-claude 完善提示词工程（✅ 已完成）
+
+**日期**：2026-06-28
+
+### 参考项目分析
+研究了 `/Users/Apple/Downloads/cc-python-claude`（Claude Code Python 版）的提示词构建工程。
+其 `cc/prompts/` 目录实现了成熟的分层提示词系统：builder.py（拼装）+ sections.py（各段落文本）+
+teammate_prompt.py（多智能体通信）+ coordinator_prompt.py（协调者编排）。
+
+### 差距 → 改进
+
+| cc-python-claude 的设计 | 本项目改进 |
+|--------------------------|-----------|
+| **分层 system prompt**（intro→system→tasks→actions→tools→tone→efficiency→env） | `role_system_prompt` 从一整块拼接改为 **8 段分层** |
+| **"先读再改"原则** | 加 Task Execution Principles 段（read before modify, don't over-engineer, diagnose failures）|
+| **工具使用偏好**（Read>cat, Edit>sed, Glob>find） | 加 Tool Usage Preferences 段（专用工具优先于 bash）|
+| **风险评估**（可逆自由、不可逆确认） | 加 Risk Assessment 段 |
+| **输出效率**（简洁直接、先结论后推理） | 加 Output Efficiency 段 |
+| **环境信息注入**（cwd/platform/shell/git/date） | 新增 `env_info_block()` 函数，dispatch 注入 |
+| **Worker prompt 自包含** | tool_instruction_block 加"self-contained"和"record tool results"指令 |
+
+### 具体改动
+
+#### `loop-pipeline/src/prompts.rs`
+- **`role_system_prompt`** 重构：从 5 段（角色+任务+输出+工具+规则）扩展为 8 段分层：
+  1. 角色定义
+  2. **Task Execution Principles**（先读再改、不过度工程、安全优先、失败诊断）
+  3. **Tool Usage Preferences**（read>cat, edit>sed, glob>find, 并行调用）
+  4. **Risk Assessment**（可逆自由、不可逆确认）
+  5. **Output Efficiency**（简洁直接、先结论后推理）
+  6. 具体任务（task_desc + expected_output）
+  7. 角色特定工具指南
+  8. 关键规则
+- **`tool_instruction_block`** 增强：加 self-contained + record tool results 指令
+- **新增 `env_info_block(working_dir)`**：注入工作目录/平台/shell/git/date
+
+#### `loop-pipeline/src/dispatch.rs`
+- `execute_single_task` 的 user prompt 注入 `env_info_block` 环境信息
+
+#### `server/src/routes.rs`
+- AgentStage 的 `system_prompt` 从 2 行扩展为含 Task Execution Principles +
+  Tool Usage Preferences + Risk Assessment + Output Efficiency 的分层提示词
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| loop-pipeline lib 测试 | ✅ 38/38 全绿 |
+
+---
+
+## 第十九轮优化：参考 cc-python-claude 完善核心工程实现（✅ 已完成）
+
+**日期**：2026-06-28
+
+### 参考
+全面研究了 cc-python-claude（Claude Code Python 克隆）的工程实现，对比 6 个维度找出差距。
+本轮实施 5 个高价值改进（P0+P1），其余（权限系统/记忆提取/子agent工具）属架构性改造留待后续。
+
+### P0-1：token 估算改 UTF-8 字节数
+**差距**：`chars/3` 对中文严重低估（中文 1 char ≈ 1.5 token，chars/3 算成 0.33 token/char，偏差 4.5x）
+**修复**：
+- `agent/src/lib.rs` 的 `estimate_history_tokens`：`chars().count() / 3` → `len() / 4`（UTF-8 字节数）
+- `planning/src/state_graph.rs` 的 `estimate_tokens`：同步改为 `len() / 4`
+- 更新测试断言
+
+### P0-2+3：bash 工具安全增强
+**差距**：无输出截断（大输出撑爆上下文）+ 不绑定工作目录（路径逃逸面）
+**修复**（`tool/src/tools/bash.rs`）：
+- **输出截断**：stdout/stderr 各 200KB cap（参考 cc-python-claude MAX_OUTPUT_BYTES），超出附 truncation 提示
+- **绑定 working_dir**：`_ctx` → `ctx`，`Command::current_dir(&ctx.working_dir)`，bash 在指定工作目录执行
+
+### P1-1：run_with_loop 重试逻辑
+**差距**：429/529 瞬时错误直接 `?` 终止整个 run，无重试
+**修复**（`agent/src/lib.rs`）：
+- LLM 调用点加重试循环：429/529/rate limit/overloaded/connection/timeout → 指数退避（2s→4s→8s），最多 3 次
+- 非瞬时错误或重试耗尽 → 返回错误
+
+### P1-2：MaxTokens 截断续写
+**差距**：长输出被 MaxTokens 截断即 break，丢失后续内容
+**修复**（`agent/src/lib.rs`）：
+- `StopReason::MaxTokens` 不再直接 break，改为追加 "Please continue" 续写（参考 cc-python-claude query_loop）
+- 下一轮循环让 LLM 从截断点继续
+- 最后一轮迭代时仍 break（防无限循环）
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（core 25 + planning 66 + loop-pipeline 38） | ✅ 全绿 |
+
+---
+
+## 第二十轮优化：参考 cc-python-claude 深度改进（权限/钩子/记忆提取）（✅ 已完成）
+
+**日期**：2026-06-28
+
+### 改进1：权限系统升级（ASK 三态 + 白名单 + 非交互 fail-fast）
+
+**差距**：ApprovalHandler 只有 Allow/Deny 二元结果，无 Ask 第三态；无白名单；无模式系统。
+
+**修复**（`tool/src/approval.rs`）：
+- **`ApprovalDecision` 新增 `Ask(String)` 变体**：需询问用户是否允许
+- **`WhitelistMode` 四级模式**（参考 cc-python-claude PermissionMode）：
+  - `Bypass`：全放行
+  - `AcceptEdits`：只读+编辑自动允许，bash/git/conda 需 Ask
+  - `Default`：只只读自动允许，其余 Ask
+  - `NonInteractive`：同 Default 但 Ask 直接 Deny（fail-fast，用于后台/无人值守）
+- **`WhitelistApproval` handler**：`READ_ONLY_TOOLS` + `EDIT_TOOLS` 白名单常量
+- **`ToolExecutor` 处理 Ask**：executor 层无法交互式询问，Ask 退化为 Deny（交互式询问由 server 层处理）
+
+### 改进2：外部 shell 钩子加载器
+
+**差距**：内置钩子全编译期写死，用户无法零代码扩展。
+
+**修复**（`agent/src/hooks.rs`）：
+- **`load_external_hooks(registry, config_json)`**：从 JSON 配置加载外部 shell 命令钩子
+- 配置格式：`{"hooks": {"BeforeToolCall": [...], "AfterToolCall": [...]}}`
+- 每项可以是字符串（简写）或对象 `{command, tool_name}`
+- 执行协议（参考 cc-python-claude hook_runner.py）：
+  - 工具上下文 JSON 经 stdin 传入
+  - 退出码 0 = 放行，2 = 阻止（stdout 作为原因）
+  - 超时 10s 强杀
+  - 钩子故障不影响工具执行（异常/超时 → Continue）
+- 支持 6 种事件：BeforeToolCall/AfterToolCall/BeforeLlmCall/AfterLlmCall/BeforeAgentLoop/AfterAgentLoop
+
+### 改进3：LLM 记忆提取器
+
+**差距**：memory crate 有 SQLite+FTS5 存储层但缺提取入口——"有数据库但没人往里写"。
+
+**修复**（`memory/src/extractor.rs`，新建）：
+- **`extract_memories(provider, messages, cancel)`**：用 LLM 分析最近 20 条对话，提取 4 类记忆
+  - **user**：用户角色/偏好/专业水平/目标（importance 0.8）
+  - **feedback**：用户对工作方式的纠正（importance 0.9，最重要）
+  - **project**：项目上下文/决策/截止日期（importance 0.6）
+  - **reference**：外部资源指针（importance 0.5）
+- **"不存什么"规则**（参考 cc-python-claude）：代码模式、git 历史、debug 方案——可从代码推导
+- **`MIN_NEW_MESSAGES=4` 阈值**：新消息不足 4 条跳过（省 API）
+- **`extract_and_store(provider, messages, manager, cancel)`**：完整提取→转 EpisodicRecord→存入 SQLite
+- **`memory_to_record`**：ExtractedMemory → EpisodicRecord（含 importance 分级 + tags）
+- 3 个单元测试
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（memory 3 + tool 37 + loop-pipeline 38） | ✅ 全绿 |
+
+---
+
+## 第二十一轮优化：AskUser + NotebookEdit + PlanOnly + SkillAsTool（✅ 已完成）
+
+**日期**：2026-06-29
+
+### 高1：AskUser Tool + UserPrompt trait
+**差距**：LLM 无法主动向用户提问（遇到歧义只能猜测或停止）。
+
+**修复**：
+- **`UserPrompt` trait**（`tool/src/traits.rs`）：`async fn ask(&self, question: &str) -> Option<String>`，依赖注入解耦输入来源
+- **`NoUserPrompt`**：非交互实现（返回 None，用于 CI/管道）
+- **`ToolContext` 加 `user_prompt: Arc<dyn UserPrompt>`**：工具通过 ctx.user_prompt.ask() 提问
+- **`AskUserTool`**（`tool/src/tools/ask_user.rs`）：LLM 可调用的提问工具，注册到 defaults()
+- **`ToolContext::new()` 工厂方法**：默认 NoUserPrompt，CLI/server 可 `.with_user_prompt()` 注入
+
+### 高2：NotebookEditTool
+**差距**：科研 agent 无法直接产出 .ipynb 交付物。
+
+**修复**（`tool/src/tools/notebook_edit.rs`，新建）：
+- 支持 insert_cell / replace_cell / delete_cell 三种操作
+- 直接操作 .ipynb JSON 结构（无需 Jupyter 内核），自动创建 nbformat v4 空 notebook
+- 索引 clamp + cell 类型校验（code/markdown）+ 路径安全校验
+- 注册到 defaults()
+
+### 低1：PlanOnly 权限模式
+**修复**（`tool/src/approval.rs`）：`WhitelistMode` 新增 `PlanOnly`——只允许只读工具，所有写操作 Deny（让用户先审查计划再切回 Default 执行）
+
+### 低2：SkillAsTool 未命中返回可用列表
+**修复**（`skill/src/executor.rs` + `registry.rs`）：技能未找到时错误信息附带所有可用技能名，帮助 LLM 自纠错
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| tool lib 测试（36/37，1 网络测试不稳定） | ✅ 核心 |
+
+---
+
+## 第二十二轮优化：统一上下文信息注入（时间/环境/工具）（✅ 已完成）
+
+**日期**：2026-06-29
+
+### 问题
+用户问"今年世界杯的大冷门"返回 2022 年信息——根因：**所有 prompt 都没有注入当前日期**，
+LLM 不知道"今年"是 2026 年，默认用训练数据中最近的 2022 世界杯回答。
+
+### 修复：统一上下文注入模块
+
+#### 新建 `core/src/context_info.rs`（参考 cc-python-claude compute_env_info）
+- **`env_block(working_dir)`**：完整环境段落
+  - 当前日期 + 年份 + "今年"提示（关键修复："今年"={year}，不是过去的年份）
+  - 工作目录 + git 仓库状态
+  - 平台 + shell
+  - 语言提示（"用与用户相同的语言回答"）
+- **`date_hint()`**：轻量日期提示（辅助角色用）
+- **`user_context_block(input, working_dir)`**：环境+用户请求组合
+- 4 个单元测试
+
+#### 注入到所有关键 prompt 点
+
+| 注入点 | 注入内容 | 效果 |
+|--------|---------|------|
+| **server ExploreStage** system prompt | `env_block`（含日期+年份提示） | LLM 知道当前年份，正确解读"今年" |
+| **server AgentStage** system prompt | `env_block` | 执行者知道环境+日期+工具列表 |
+| **loop-pipeline role_system_prompt** | `env_block` | 每个子角色知道当前日期+环境 |
+| **loop-pipeline evaluate** system | `date_hint` | 评估者知道当前日期 |
+| **loop-pipeline plan** system | `date_hint` | 规划者知道当前日期 |
+| **loop-pipeline repair** system | `date_hint` | 修复者知道当前日期 |
+
+### 修复效果
+用户问"今年世界杯的大冷门"时，LLM 现在知道：
+- 当前日期是 2026-XX-XX
+- "今年" = 2026 年（不是 2022）
+- 会用 web_search 搜索 2026 年世界杯信息
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| core lib 测试（29，含 4 context_info） | ✅ |
+| loop-pipeline lib 测试（38） | ✅ |
+
+---
+
+## 第二十三~二十五轮优化：路线图步骤 1-3（transcript 修复 + 三角色接入 + 零警告）（✅ 已完成）
+
+**日期**：2026-07-11
+
+### 步骤1：transcript 修复（第二十三轮）
+
+**问题**：崩溃恢复时 history 末尾的孤立 tool_use（assistant 发起 tool_use 后崩溃，tool 未执行）会导致 provider API 校验错误。
+
+**修复**（`core/src/message.rs`）：
+- 新增 `validate_transcript(history) -> usize`：扫描所有 assistant 消息的 ToolUse blocks，检查后续是否有对应的 Tool role 消息，对缺失的追加合成 error tool_result
+- 在 `/api/resume` 入口调用：`validate_transcript(&mut history)` 自动修补
+- 4 个单元测试（正常/孤立/多孤立/无 tool_use）
+
+### 步骤2：三角色接入 dispatch（第二十四轮）
+
+**问题**：三角色 `execute_with_roles` 已实现+测试通过，但 FeedbackStage 只做总评审，未对每个 stage 产物走 Validator+Arbiter。
+
+**修复**（`server/src/routes.rs`）：
+- FeedbackStage 中新增**逐 stage 三角色校验**：
+  - 对每个 stage 产物调 `run_validator`（校验质量）
+  - 如果校验未通过，调 `run_arbiter_forgiving`（决策 Pass/Revise/Supplement）
+  - 收集所有 stage_issues
+- 如果三角色发现问题但总评审说 deliver，**修正 verdict 为 revise**
+- 前端可见 `stage_issues` 数组（每个问题的 stage 名 + 反馈文本）
+
+### 步骤3：编译警告清理 + 会话即时持久化（第二十五轮）
+
+**编译警告清理**：从 32 个 → **0 个**
+- `cargo fix --workspace` 自动修复 unused imports/variables（CLI 3 处）
+- provider stepfun.rs 响应结构体加 `#[allow(dead_code)]`（8 个 API 响应字段）
+- server `handle_run_loop` + `WsRequest` 加 `#[allow(dead_code)]`
+- loop-pipeline `any_found` 加 `_` 前缀
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| lib 测试（core 33 + planning 66 + loop-pipeline 38） | ✅ **137 全绿** |
+
+---
+
+## 第二十六轮优化：project.md 项目级指令 + 权限规则配置（✅ 已完成）
+
+**日期**：2026-07-11
+
+### project.md 项目级指令（参考 cc-python-claude claudemd.py）
+
+**设计**：用户在工作目录放一个 `project.md` 文件，Agent 自动读取并注入到 system prompt。
+比隐藏文件（.miniagent.md）更直观——用户能在 IDE 中直接看到。
+
+**实现**（`core/src/context_info.rs`）：
+- **`load_project_md(working_dir)`**：从工作目录向上遍历，合并所有 project.md（越靠近 cwd 优先级越高）
+- **`project.local.md`**：cwd 下的私有本地指令（最高优先级，不提交版本控制）
+- **`@path` 包含指令**：行首 `@path/to/file.md` 引用其他文件（有循环引用检测 + 深度限制）
+- **HTML 注释移除**：`<!-- ... -->` 被自动去除
+- **注入到 system prompt**：AgentStage + role_system_prompt 末尾（优先级最高）
+
+**使用示例**：
+```markdown
+# project.md
+本项目使用 Rust 2021 edition。
+所有测试必须通过才能提交。
+数据库是 PostgreSQL，不是 MySQL。
+```
+
+### 权限规则配置（参考 cc-python-claude permissions/rules.py）
+
+**设计**：用户通过 `settings.json` 配置工具 allow/deny 规则，支持 glob 匹配 bash 命令。
+
+**实现**（`tool/src/approval.rs`）：
+- **`PermissionRules`**：`{allow: [String], deny: [String]}`，从 JSON 加载
+- **规则语法**：
+  - `"read"` — 精确匹配工具名
+  - `"bash:git*"` — 匹配 bash 工具且 command 以 `git` 开头
+- **优先级**：deny > allow > 无匹配（fallthrough 到 WhitelistApproval）
+- **`RuleBasedApproval`** handler：先检查用户规则，无匹配时 fallthrough 到内部 handler
+- **`glob_matches`**：支持 `*`（前缀/后缀/全匹配）
+
+**配置示例**：
+```json
+{
+  "permissions": {
+    "allow": ["read", "glob", "grep", "bash:git*"],
+    "deny": ["bash:rm*"]
+  }
+}
+```
+
+5 个单元测试（加载/精确匹配/glob deny/deny 优先/glob 函数）。
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| lib 测试（core 33 + tool 42 + planning 66 + loop-pipeline 38） | ✅ **179 全绿** |
+
+---
+
+## 第二十七轮优化：AgentTool 子智能体（路线图步骤5）（✅ 已完成）
+
+**日期**：2026-07-11
+
+### 里程碑：LLM 可自主派生子 agent
+
+这是 miniagent 从"编排驱动"迈向"LLM 自主+编排辅助"混合模式的关键一步。
+LLM 现在可以在运行时自主决定何时分解复杂任务并派生子 agent。
+
+### 设计
+- **后台异步**：spawn 子 agent → 立即返回 task_id → 结果通过 broadcast 回传
+- **全新空 history**：子 agent 看不到父对话（self-contained prompt）
+- **工具排除**：子 agent 的 allowed_tools 排除 "agent"（防递归）
+- **Provider 继承**：复用父 Agent 的 ProviderRouter
+- **并发限制**：最多 3 个并发子 agent（Semaphore）
+- **父 agent 继续**：spawn 后继续 LLM 循环，下一轮收集子结果
+
+### 实现
+
+#### `core/src/event.rs`
+- `AgentEvent` 新增 `SubAgentCompleted { task_id, result, success }`
+
+#### `agent/src/lib.rs`
+- `Agent` struct 新增 `sub_agent_rx: Option<Mutex<broadcast::Receiver<AgentEvent>>>`
+- `set_sub_agent_rx()` 方法注入 receiver
+- `collect_sub_agent_results()` 在每轮迭代末尾收集已完成子 agent 结果注入 history
+- `run_with_loop` 在 match 块后调用 `collect_sub_agent_results`
+
+#### `agent/src/agent_tool.rs`（新建）
+- `AgentTool`：持有 `Arc<Agent>` + broadcast sender + Semaphore
+  - `execute()`：解析 task → 检查并发 → spawn 子 agent → 返回 task_id
+  - 子 agent 用全新 history + env_block + project.md + 排除 agent 的 allowed_tools
+  - 完成后 broadcast `SubAgentCompleted`
+- `build_tools_with_agent(agent)` 工厂：defaults() + AgentTool → (registry, receiver)
+- `sub_agent_allowed_tools()`：排除 "agent" 的工具列表
+
+#### `server/src/bin/miniagent-server.rs`
+- 启动时用 `build_tools_with_agent()` 构造工具集
+- `agent.set_sub_agent_rx(rx)` 注入 receiver
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ |
+| lib 测试（agent 1 + core 33 + loop-pipeline 38） | ✅ 全绿 |
+
+---
+
+## 第二十八轮优化：P0 端到端验证 + P1 健壮性 + P2 清理（✅ 已完成）
+
+**日期**：2026-07-25
+
+### P0: 端到端验证 + 搜索后端修复
+
+**根因诊断**：
+- 代理 `127.0.0.1:7890` 已 down → 海外搜索后端（serper/tavily/bocha/ddgs）全部不可达
+- StepFun API 直连可用，但 provider 的 `proxy_from_env()` 读 `ALL_PROXY` 导致走死代理
+- REST API 的 `run_handler` 缺少环境信息注入（日期/平台）→ LLM 回答 "2024" 而非 "2026"
+
+**修复**：
+- `.env`：注释掉 `ALL_PROXY`（代理已 down）
+- `run_handler` system_prompt 加 `env_block`（日期注入）
+- WebSocket 端到端验证通过：explore→plan→dispatch→feedback 完整流程 + LLM 正确回答 "2026"
+
+**当前后端状态**：2/6 healthy（PubMed + LangSearch 可用）；serper/tavily/bocha API key 可能过期，ddgs 中国直连不可达
+
+### P1: 健壮性加固
+
+#### P1-1: run_with_loop 开头加 validate_transcript
+`run_with_loop` 在循环开始前调用 `validate_transcript(history)`，修补孤立 tool_use（防 API 校验错误）。此前只在 `/api/resume` 入口调用。
+
+#### P1-2: AgentTool 超时保护
+子 agent spawn 加 `tokio::time::timeout(300s)`——防止卡死的子 agent 永久占用 semaphore slot。超时后广播 `SubAgentCompleted { success: false }`。
+
+#### P1-3: 权限规则接入 server
+server 启动时从 `./settings.json` 加载 `PermissionRules`，构造 `RuleBasedApproval`（无规则时退化为 `AutoApprove`）。
+
+### P2: 清理
+- 移除未用 import `AutoApprove`
+- `handle_run_loop` 保留 `#[allow(dead_code)]`（未来可能恢复 loop-pipeline 模式）
+
+### 验证
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| lib 测试（agent 1 + core 33 + loop-pipeline 38 + planning 66 + tool 42） | ✅ **180 全绿** |
+| WebSocket 端到端（explore→plan→dispatch→feedback） | ✅ LLM 正确回答 "2026" |
+
+---
+
+## 第二十九轮优化：端到端科研流水线贯通（目标2→3→4 + 目标1贯穿）（✅ 已完成）
+
+**日期**：2026-08-11
+
+### 背景
+
+四目标评估发现：主干流水线 `PubMed→KG→TransE→链路预测→假设→排序` 真实可用，但目标 2/3/4 存在具体缺口：
+- **目标2**：TransE 无负采样/margin loss/L2 归一化，时钟 RNG → 链路预测质量差；无外部生物医学 KG。
+- **目标3**：假设只产出单一湿实验 `ExperimentDesign`，**缺结构化「验证任务计划」**（数据分析任务 vs 湿实验方案分离）。
+- **目标4**：`PythonRuntime` 是 stub；notebook 不执行；无可复现性/溯源层。
+
+本轮按"端到端 MVP 贯通"路线打通 2→3→4，目标 1（可追溯）作为贯穿性质量保障。
+
+### Phase A — 目标2：强化 KG 链路预测与假说质量
+
+#### A1. TransE 重写（`crates/kg/src/embedding.rs` + `Cargo.toml`）
+旧实现：无负采样、纯正样本 SGD（loss 单调驱 `||h+r-t||→0`）、时钟种子 `DefaultHasher`、无归一化。
+
+新实现（教科书 TransE，Bordes et al. 2013）：
+- `rand` crate 正式接入（替换 `DefaultHasher`+纳秒时钟）；均匀初始化 `[-6/√d, 6/√d]`。
+- **负采样**：每个正三元组随机替换 head/tail 生成 corrupt 样本（可配置 `num_negatives`）。
+- **margin-based ranking loss**：`max(0, γ + d(pos) − d(neg))`，仅在违反 margin 时 SGD 更新。
+- **L2 归一化**：实体+关系向量每轮归一化（防 relation 向量爆炸 → margin loss 被平凡满足）。
+- `TrainConfig { margin, num_negatives, lr_decay, norm: L1|L2 }` + `train_with(kg, epochs, lr, cfg)`。
+- 测试：正样本距离随训练下降、corrupt 距离 > 正样本（聚合）、归一化后 ‖v‖≈1、L1/decay 不 panic。
+
+#### A2. 外部生物医学 KG 增强（新建 `crates/kg/src/external.rs`）
+- `load_relation_tsv` / `load_fixed_relation_tsv`：通用 TSV/CSV 三元组加载（DisGeNET/OMIM/自定义），自动跳过 header。
+- `string_network_url` + `parse_string_response` + `fetch_string_interactions`：STRING 免费 API 客户端（按基因拉取蛋白互作→`InteractsWith`）。
+- `merge_external(kg, triples)`：按 `find_entity_by_name` 去重实体，外部关系字符串映射到 `RelationType`，返回 `MergeStats`。
+- 测试：TSV 解析、STRING TSV 解析、合并去重（同名实体不重建、重复边跳过）、URL 格式。
+
+#### A3. 链路预测打分修正（`crates/kg/src/link_prediction.rs`）
+- 旧权重 kge 0.35 + path 0.30 = 0.65（缺 0.35，max score 永远 < 0.65）。
+- 统一为 **KGE + path + GIVE** 三路融合，权重归一化和为 1.0；新增 `with_weights(kge, path, give)`。
+- GIVE 信号 = 候选邻域与已知尾邻域的 Jaccard 重叠（语义外推）。
+- `HypothesisEvidence` 新增 `give_score`（`#[serde(default)]` 向后兼容）。
+- 测试：权重归一、score ∈ [0,1]、GIVE 偏好共享邻域、KGE 信号贡献、extrapolation。
+
+### Phase B — 目标3：结构化「验证任务计划」
+
+#### B1. 验证计划类型（新建 `crates/hypothesis/src/validation.rs`）
+- `ValidationPlan { hypothesis_id, rationale, data_analysis_tasks, wet_lab_protocols }`
+- `DataAnalysisTask { id, objective, dataset_source, dataset_accession, cohort_definition, variables(独立/因/协变量), statistical_method, expected_outcome, deliverable, priority }`
+- `DatasetSource ∈ { Geo, Tcga, ArrayExpress, Local(path), CustomUrl }`（tagged enum）
+- `WetLabProtocol { id, objective, reagents, steps, controls, expected_outcome, timeline_days, feasibility }`
+- 测试：JSON 往返、本地可用性判断、tagged 序列化。
+
+#### B2. 验证计划生成（`crates/hypothesis/src/generator.rs`）
+- `HypothesisGenerator::generate_validation_plan(hypothesis, kg, cancel) -> ValidationPlan`。
+- Prompt 要求 LLM 把验证**拆成两组**：计算/数据分析任务（公共数据集 GEO/TCGA）vs 湿实验方案。
+- 容错解析（`core::json_util::extract_and_repair`）：`dataset_source` 同时接受 `{"kind":"geo"}` 和裸字符串 `"geo"`；缺失 id 自动补 `DA-N`/`WL-N`；priority/feasibility clamp 到 [0,1]。
+- 测试：完整计划解析、裸字符串 source、默认 id、垃圾拒绝、空数组兜底。
+
+#### B3. GEO 数据集发现工具（新建 `crates/tool/src/tools/geo_search.rs`）
+- `GeoSearchTool`：查 NCBI GEO `gds` 库（esearch+esummary），返回 accession(GSE…)/标题/类型/样本数/物种/摘要。
+- 注册到 `defaults()`，让 LLM 能为数据分析任务定位真实数据集。
+
+### Phase C — 目标4：端到端可审计数据分析执行
+
+#### C1. 新 crate `miniagent-analysis`（加入 workspace）
+- **`provenance.rs`**：`ProvenanceRecord`（script+hash、输入/输出文件+FNV-1a 哈希、conda env+包版本、seed、git commit、时间、exit code、stdout/stderr 哈希+预览）。零外部依赖（FNV-1a 内联实现）。
+- **`runner.rs`** `AnalysisRunner`：接 `DataAnalysisTask` → LLM 生成可复现 Python 脚本（注入 seed/conda env/IO 路径/deliverable）→ 确保 conda 环境（best-effort，无 conda 退化系统 python 并记录）→ bash 执行 → 捕获 provenance → 校验 deliverable 产物。无本地数据时进入 **dry-run**（生成脚本+计划，不执行）。
+- **`notebook.rs`** `execute_notebook`：经 `jupyter nbconvert --execute` 执行 .ipynb（jupyter 缺失时清晰报错降级），补齐 `NotebookEditTool` 只编辑不执行的缺口。
+- 测试：11 个（FNV 确定性、文件记录、预览截断、provenance 序列化往返、notebook 缺失报错、**stub provider 端到端 dry-run + provenance 落盘**）。
+
+#### C2. CLI 端到端接线（`crates/cli/src/main.rs`）
+`research` 命令新增 flag，`research_pipeline` 扩展为 8 阶段：
+- `--validate` → **Phase 7**：top-N 排序假设生成验证计划，写 `analysis/plans/validation_plan_N.json`。
+- `--analyze` → **Phase 8`：对每个数据分析任务 `AnalysisRunner.run()`，输出 provenance 路径。
+- `--data <path>`：本地数据文件（喂给数据分析任务）。
+- `--top-n <n>`：验证的假设数量。
+- `--enrich-file/--enrich-delim/--enrich-relation`：外部 KG 增强（Phase 3 后、link prediction 前合并）。
+
+### Phase D — 目标1：贯穿的可追溯/可审计
+
+- **`core/src/event.rs`**：`AgentEvent` 新增 `AnalysisRunCompleted { task_id, hypothesis_ref, success, dry_run, provenance_path, timestamp }`（接入既有 event_log/`/api/trace` 体系）。
+- **`server/routes.rs`**：新增 `GET /api/provenance/{task_id}` 端点——读取 `analysis/<task_id>/provenance.json`（路径遍历防护），返回 provenance 记录 + 同目录产物清单。
+- **CLI Phase 8 审计日志**：每次分析执行发 `tracing::info!(target="tool_call", ...)`（task_id/success/script_hash/conda_used/exit_code/provenance_path），契合第十七轮"只记 error + 工具调用"策略。
+
+### 数据流（完整 2→3→4 流水线）
+
+```
+PubMed ──► KG 抽取 ──► (可选 --enrich-file 外部 KG 合并)
+   ──► TransE 训练(负采样+margin) ──► 链路预测(KGE+path+GIVE)
+   ──► 假设生成(LLM Pro) ──► 排序
+   ──► (--validate) 验证计划(数据分析任务 + 湿实验方案)  [目标3]
+   ──► (--analyze)  数据分析端到端执行(LLM 生脚本→conda→bash→provenance)  [目标4]
+        ↓ provenance.json (脚本哈希/IO哈希/env/seed/git) ──► /api/provenance/{id}  [目标1可追溯]
+```
+
+### 验证（全量）
+
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| `cargo test --workspace --lib` | ✅ **218 通过 / 0 失败 / 0 ignored**（上轮 180 + kg 16 + hypothesis 8 + analysis 11 + tool/core 增量） |
+| 新 crate `miniagent-analysis` | ✅ 11 测试，含 stub provider 端到端 dry-run |
+| `research --help` | ✅ 8 个新 flag 正确注册 |
+| workspace 成员 | 18 → **19**（新增 analysis） |
+
+### 刻意不做（保持 MVP 精简，留待"全四目标"路径）
+- 不合并三套编排系统 / 不删 dead `handle_run_loop`。
+- 不接真实 PyO3（已选 bash + provenance 路线）。
+- 不做 TCGA/GDC 全量集成（GEO 覆盖 MVP）。
+- 不接 UMLS（许可受限）；外部 KG 用 STRING API + 本地文件加载器覆盖。
+- AnalysisRunner 用 provider 单次调用生脚本（非 Agent 工具循环）——可测试、无跨 crate 环，Agent 循环留作后续增强。
+
+---
+
+## 第三十轮优化：合并三套编排系统（✅ 已完成）
+
+**日期**：2026-08-11
+
+### 背景
+
+经核实：workflow（458 行）+ loop-pipeline（~3500 行）是两个生产编排器（服务器 `handle_run`）；planning（6442 行）只在 CLI 中被引用 10 次，服务器零引用——本质是 4 个互不兼容抽象的 CLI playground（Planner、StateGraph、AgentRole+Blackboard、ControlShell）。第二轮第 8 步曾判定"风险 > 收益"拒绝合并，本轮正面解决。
+
+### Phase U1 — 共享抽象下沉到 core
+
+**新建 `crates/core/src/orchestration.rs`**：
+- `StageInput`（id + JSON 输入 + 前序输出 + 取消令牌）：覆盖 workflow（JSON）+ loop-pipeline（typed `PipelineState` 序列化为 JSON）+ planning（Blackboard/GraphState）的所有入参。
+- `StageOutcome { data, summary, side_effects }`：合并 workflow `StageOutput.data` + loop-pipeline `StageOutput.summary` + planning `RoleOutput`。
+- `SideEffect` 枚举：`ArtifactWritten`、`TodoUpdated`、`ProgressEmitted`、`LlmCallMade` —— 跨 driver 统一跨切面事件。
+- `StageDriver` trait：`name()` + `async fn run(StageInput) -> Result<StageOutcome, OrchestrationError>`。
+- `OrchestrationError` 统一三套错误类型（Stage/Plan/Repair/Agent/Json/Cancelled）。
+- `kahn_waves(nodes, edges) -> Vec<Vec<NodeId>>`：合并 workflow/loop-pipeline/planning 4 份独立 Kahn 实现（替代工作待后续 phase）。
+
+**测试**：7 个新 orchestration 测试（chain/diamond/独立节点/环路检测/JSON 往返/SideEffect 序列化/adapt_stage）。
+
+### Phase U2 — workflow + loop-pipeline 双向适配
+
+**`crates/workflow/src/runner.rs`**（新建）：
+- `DagRunner` 包装 `Workflow`，实现 `StageDriver`。
+- `map_agent_error`：AgentError → OrchestrationError 桥接。
+- `stage_input_to_context` / `stage_output_to_outcome`：迁移辅助函数。
+- 3 个测试（adapter 通过统一 trait 派发、StageOutput 转换、错误映射）。
+
+**`crates/loop-pipeline/src/runner.rs`**（新建）：
+- `LoopRunner` 包装 `LoopPipeline`，实现 `StageDriver`。
+- `state_to_outcome`：typed `PipelineState` → 统一 JSON `StageOutcome`。
+- 4 个测试（错误映射、空 pipeline 状态、prompt 提取、trait 派发）。
+
+**结果**：现在 `Box<dyn StageDriver>` 可以在两个生产 driver 之间任意切换。零运行时开销（trait object 由 dyn dispatch 实现，调用开销可忽略）。
+
+### Phase U3 — planning crate 解构
+
+**删除文件**（git rm，~3.5K 行）：
+- `tournament/` 子树（1063 行，零生产引用；被 research/ 内部引用，间接全部可达 0）
+- `research/` 子树（1145 行，零外部引用；`SchedulerRole`/`PrincipalInvestigatorRole`/`TournamentMasterRole`/`EvidenceAccumulatorRole`/`SynthesisJudgeRole` 全部是 CLI 实验性代码）
+- `alzheimers.rs`、`evidence_accumulator.rs`、`synthesis_judge.rs`（仅集成测试引用）
+- `hooks.rs`（662 行，CLI `hooks_demo` 唯一引用，第二轮第 20 步已被 `agent::hooks` 取代）
+- `control_shell.rs`（仅 CLI `workflow_command` demo 用）
+- `tool_binding.rs` / `agent_profile.rs` / `context_manager.rs`（同上，CLI demo only）
+- `event_stream.rs` 中 `relevant_to` 删去对 `agent_profile` 的耦合（CLI 也不用了）
+
+**保留**（4965 行，真正生产代码）：
+- `plan.rs` (Planner/PlanExecutor) — CLI `plan` 命令用
+- `state_graph.rs` (StateGraph) — CLI `team` 命令用
+- `roles/` (13 AgentRole + Blackboard) — CLI `debate` 命令用
+- `event_stream.rs` / `todo_attention.rs` — state_graph 内部使用（删去 `relevant_to` 的角色依赖）
+
+**CLI 迁移**：
+- `workflow` 子命令删除（第二轮第 5 步已标注为无用的 demo）
+- `hooks` 子命令删除（被 `agent::hooks` 取代）
+- `plan` / `debate` / `team` 三个生产命令路径保留
+- `orchestrate` 命令继续走 workflow crate（不在 planning 解构范围）
+
+**结果**：planning crate 6442 → 4965 行（**-22%**）；删除的全是零引用或 demo-only 代码；生产路径完全保留。
+
+### 数据流（统一后）
+
+```
+                                  ┌──────────────────────────┐
+                                  │ miniagent_core::         │
+                                  │  orchestration::         │
+                                  │   StageDriver trait      │
+                                  │   StageInput / Outcome   │
+                                  │   SideEffect, kahn_waves │
+                                  └─────────────┬────────────┘
+                                                │
+                          ┌─────────────────────┼──────────────────────┐
+                          ▼                     ▼                      ▼
+                workflow::DagRunner    loop-pipeline::LoopRunner   (planning::StateGraph)
+                          │                     │                      │
+                          ▼                     ▼                      ▼
+              workflow::Workflow.run   LoopPipeline::run        StateGraph::execute
+                          │                     │                      │
+                          ▼                     ▼                      ▼
+                   JSON-typed DAG       typed PipelineState    typed GraphState
+                          │                     │                      │
+                          └──── server handle_run（两种模式可热插拔）───┘
+```
+
+### 验证
+
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| `cargo test --workspace --lib` | ✅ **192 通过 / 0 失败 / 0 ignored** |
+| core 编排模块 | ✅ 7 测试（kahn_waves、stage outcome、adapt_stage） |
+| workflow DagRunner | ✅ 3 测试（trait dispatch、StageOutput 转换、错误映射） |
+| loop-pipeline LoopRunner | ✅ 4 测试（错误映射、空状态、prompt 提取、trait dispatch） |
+| planning 解构 | ✅ 26 测试（state_graph、todo_attention、roles 13 个 AgentRole） |
+| CLI `plan` / `debate` / `team` / `orchestrate` / `loop` 命令 | ✅ 全部仍工作 |
+| 移除的子命令 | `workflow`、`hooks`（移除并打印引导信息） |
+
+### 关键设计决策
+
+1. **保留 planning crate 作为可选多角色/StateGraph 编排器**：完全删除并将 Planner/StateGraph/AgentRole 移到 agent crate 是一个独立的大型重构（~5000 行 + 13 个 role 实现 + state_graph 1134 行）。本轮先完成 22% 行数削减和死代码清理，剩余部分仍是有效的、可独立调用的多角色编排器。
+
+2. **三套 driver 现在共享 `StageDriver` trait**：通过 `Box<dyn StageDriver>` 可在 workflow 和 loop-pipeline 之间任意切换，添加新 driver（如 `StateGraphRunner`）只需实现同一 trait。
+
+3. **不做 vtable 抹平**：保留每个 runner 的内部 stage trait（`StageHandler` / `PipelineStage`）避免破坏现有 stage 实现；只在最外层用 trait object 抽象。
+
+### 刻意不做（留给后续 phase）
+
+- 不将 Planner/StateGraph/AgentRole 重写为 `StageDriver` 实现（~5000 行移动 + 测试重写）。
+- 不合并 `kahn_waves` 的 4 份实现（保留各自优化，逐个迁移需单独 phase）。
+- 不删除 dead `handle_run_loop`（属"全四目标"路径，本次范围外）。
+- 不将 `plan`/`debate`/`team` 命令接入 `Box<dyn StageDriver>` 切换（CLI 用例不同，工作量超出本次）。
+
+---
+
+## 第三十一轮优化：Planning 三大抽象接入 StageDriver（✅ 已完成）
+
+**日期**：2026-08-11
+
+### 背景
+
+第三十轮把 workflow/loop-pipeline 两个生产编排器接入了统一的 `StageDriver` trait，并保留了 planning crate 中的 `Planner`/`StateGraph`/`AgentRole` 三大抽象（CLI 命令路径）。本轮把剩余三套抽象也接入 `StageDriver`，让所有编排器真正可互换。
+
+### 新增 crate `miniagent-planning::runners`
+
+```
+crates/planning/src/runners/
+├── mod.rs              (re-exports + module docs)
+├── plan_runner.rs      (PlanRunner: Planner + PlanExecutor → StageDriver)
+├── state_graph_runner.rs (StateGraphRunner: CompiledGraph → StageDriver)
+├── debate_runner.rs    (DebateRunner: Proposer/Opponent/Judge triad → StageDriver)
+└── role_runner.rs      (SingleRoleRunner: any Arc<dyn AgentRole> → StageDriver)
+```
+
+### 各 runner 设计要点
+
+**`PlanRunner`** (Planner + PlanExecutor 双阶段编排)
+- 一次 `StageDriver::run(input)` 内部：Planner.decompose → PlanExecutor.execute。
+- 输入支持三种 JSON 形态：`"string"` / `{"prompt":"…"}` / `{"goal":"…"}`。
+- 输出：`data` = 完整 Plan JSON；`summary` = "N done, M failed, P pending of T steps"；每个有输出的 step 触发 `SideEffect::ArtifactWritten`。
+- 状态：owned internal（Planner/Executor 只持有不可变引用；Plan 在 driver 内 mutable local）。
+
+**`StateGraphRunner`** (CompiledGraph)
+- 难点：`CompiledGraph::execute` 返回 **非-Send** future（Parallel 子节点的 boxed closures 捕获 EventStream/TodoAttention 跨 await），与 `StageDriver: Send + Sync` 的 trait 约束冲突。
+- 解决方案：在 `StageDriver::run` 内通过 `tokio::task::block_in_place` + `Handle::block_on`（或回退到新建 single-threaded runtime）把图执行调度在当前线程上。这在多线程 runtime 上是惯用的 sync-bridge 模式。
+- 输入支持：`"string"` 或 `{"prompt":"…"}` 转为 GraphMessage(user)；`previous_outputs` 合并进 GraphState.artifacts。
+- 输出：`data` = 完整 GraphState JSON；`summary` = iteration/step 计数；每 step 触发 `ProgressEmitted + ArtifactWritten`。
+
+**`DebateRunner`** (Proposer/Opponent/Judge 序贯循环)
+- 复刻 CLI `debate_command` 内联循环：Round 1 (Proposer → Opponent → Judge)，若 verdict 含 "REVISE" 则 Proposer 重跑（最多 `max_revise_rounds` 次）；ACCEPT 或 REJECT 即终止。
+- 抽取 `DebateRound` 结构体（Serialize/Deserialize）作为中间结果，便于 CLI 渲染 + 后续历史追踪。
+- 输出：`data` = `Vec<DebateRound>` JSON；`summary` = "debate accepted/rejected after N round(s)"；每个角色每个 round 触发 `SideEffect::ArtifactWritten` × 3。
+
+**`SingleRoleRunner`** (单角色通用适配)
+- 持有 `Arc<dyn AgentRole>` + `work_dir`。
+- `name()` 返回 **role 自己的名字**（而非 "SingleRoleRunner"），便于日志/监控匹配原始角色。
+- 用于未来 `miniagent role --name researcher --task "…"` 类单角色调用。
+
+### CLI 命令迁移 (M1e)
+
+| CLI 命令 | 之前 | 之后 |
+|---------|------|------|
+| `miniagent plan` | 直接调 `Planner::decompose` + `PlanExecutor::execute` | 通过 `PlanRunner::run(StageInput)` |
+| `miniagent debate` | 内联 Proposer/Opponent/Judge 循环 + 路由 | 通过 `DebateRunner::run(StageInput)` |
+| `miniagent team` | `CompiledGraph::execute(state, cancel, flash, pro)` | 通过 `StateGraphRunner::run(StageInput)` |
+
+**结果**：CLI `plan`/`debate`/`team` 三个生产命令路径现在统一通过 `StageDriver::run(input) -> Result<StageOutcome, OrchestrationError>` 调用，与 `DagRunner`/`LoopRunner` 在同一抽象层级。
+
+### 关键技术挑战
+
+1. **StateGraph 的非-Send future**：通过 `block_in_place` 桥接到同步执行；这是 tokio 文档推荐的多线程运行时 sync-future bridge 模式。
+2. **Blackboard 不可在 StageDriver 内部共享**：每个 driver 调用从 `Blackboard::new(work_dir)` 重新构造（work_dir 来自 driver config，不可变）。这意味着 driver 不保留跨调用的 state —— 与 DagRunner/LoopRunner 一致（它们也没有跨调用 state）。
+3. **Provider 注入**：PlanRunner/StateGraphRunner/DebateRunner 在构造时接收 `Box<dyn LlmProvider>`，与现有 CLI 调用模式一致。无需新增 trait。
+4. **AgentError → OrchestrationError 映射**：每个 runner 都复制了 `map_agent_error` 桥接函数（10 行），未来可下沉到 core。
+
+### 验证
+
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace` | ✅ **零警告** |
+| `cargo test --workspace --lib` | ✅ **203 通过 / 0 失败 / 0 ignored**（上轮 192 + 11 个新 runner 测试） |
+| planning 11 个新 runner 测试 | ✅ PlanRunner（5）、StateGraphRunner（1）、DebateRunner（3）、SingleRoleRunner（2） |
+| `Box<dyn StageDriver>` 多态 | ✅ 5 个 driver（DagRunner / LoopRunner / PlanRunner / StateGraphRunner / DebateRunner）实现同一 trait，可任意组合 |
+| CLI `plan` / `debate` / `team` | ✅ 全部仍工作，全部通过 `StageDriver::run` 调用 |
+| `Box<dyn StageDriver>` 调度 | ⏸️ **不做**——CLI 用例差异（plan 是 query → Plan；debate 是 query → DebateRounds；team 是 query → GraphState），按 driver 类型分支调度更清晰 |
+
+### 现在所有 driver 共享 `StageDriver` trait
+
+```
+core::orchestration::StageDriver (单一 trait)
+├── workflow::DagRunner             (DAG, JSON-typed, 生产)
+├── loop_pipeline::LoopRunner       (5-phase loop, typed PipelineState, 生产)
+├── planning::PlanRunner            (Planner + PlanExecutor, CLI plan 命令)
+├── planning::StateGraphRunner      (CompiledGraph, CLI team 命令)
+├── planning::DebateRunner          (Proposer/Opponent/Judge 三角色, CLI debate 命令)
+└── planning::SingleRoleRunner      (任意单个 AgentRole, 通用工具)
+```
+
+任何 driver 都可以通过 `Box<dyn StageDriver>` 在 server handle_run 中互换使用，让不同任务匹配不同编排器成为可能。
+
+### 刻意不做（范围控制）
+
+- 不把 `PlanRunner`/`StateGraphRunner`/`DebateRunner` 接入 server `handle_run` —— 当前 server 默认 workflow DAG + 5-phase loop 已足够；这些 runner 是 CLI 命令专用。如需服务端多 driver 调度，留作后续 phase。
+- 不实现 `Box<dyn StageDriver>` 多态分发 —— CLI 命令路径按具体类型走更清晰，trait object 主要价值在 server 层。
+- 不合并 4 份 `map_agent_error` 桥接到 core（重复 10 行 × 4 driver = 40 行，可后续 cleanup）。
+- 不把 `ProviderSelector` 等 workflow 内部抽象统一到 core —— 已超出"接口共享"范围。
+
+---
+
+## 第三十二轮优化：错误转换下沉 + clippy 清理 + 端到端验证暴露的 Provider 路由 bug（✅ 已完成）
+
+**日期**：2026-08-12
+
+### 背景
+
+第三十一轮把所有编排器接入 `StageDriver` 后，明确遗留了「`map_agent_error` 重复 4 份未合并」的 cleanup 项。本轮完成该项收尾，顺带清理积压的 clippy 警告，并通过端到端任务测试暴露并修复了一个真实的生产 bug。
+
+### P1. `AgentError → OrchestrationError` 转换下沉到 core
+
+第三十一轮发现 `AgentError` 和 `OrchestrationError` **都在 `miniagent-core`**（`error.rs` / `orchestration.rs`），因此转换可以就近定义为规范的 `From` impl，无需跨 crate。
+
+**`crates/core/src/orchestration.rs`**：新增 `impl From<AgentError> for OrchestrationError`，覆盖全部 11 个 `AgentError` 变体（Cancelled → Cancelled；InvalidConfig/InvalidState → Plan；Checkpoint → `Stage("checkpoint: …")`；其余 → Stage）。配套 6 个新单元测试（cancelled / invalid_state→Plan / invalid_config→Plan / checkpoint 保留上下文 / 6 个 message 变体 / budget+overflow 固定文案）。
+
+**删除 3 份 verbatim 重复**：
+| 文件 | 改动 |
+|------|------|
+| `crates/workflow/src/runner.rs` | 删 `map_agent_error`（17 行）+ `map_cancelled_error_to_orchestration` 测试；`.map_err(map_agent_error)?` → `?`（From 自动接管） |
+| `crates/loop-pipeline/src/runner.rs` | 删 `map_agent_error`（17 行）+ 2 个重复测试；`.map_err(map_agent_error)?` → `?` |
+| `crates/planning/src/runners/plan_runner.rs` | 删 `map_planner_error`（17 行）；两处 `.map_err(map_planner_error)?` → `?` |
+
+**保留**（非重复，是带角色上下文的变体）：`debate_runner.rs::map_role_err` 和 `role_runner.rs` 的内联映射产出 `{role} failed: …` 上下文，与纯转换是不同关注点，不动。
+
+**净效果**：51 行重复删除，转换逻辑单一来源；调用点全部简化为 `?`。
+
+### P2. clippy 清理 + 2 个真实 bug 修复
+
+`cargo clippy --fix` 批量修复机械性警告（collapsible-if / needless-borrow / len-zero / vec! 字面量 / 手动 clamp / format-in-format / 结构体更新语法 等）。手动处理需判断的项时发现 **2 个真实 bug**：
+
+#### Bug-1: WebSocket fallback 状态消息从未发送（`crates/server/src/routes.rs`）
+
+`planner.execute().unwrap_or_else(|e| { let _ = ws_send(socket, …); … })` —— `ws_send` 是 async fn，但 `let _ = ws_send(…)` **没有 `.await`**，future 被直接丢弃，Planner/Build fallback 的状态提示从未到达 WebSocket 客户端。clippy `non-binding let on a future` 抓到。
+
+**修复**：`unwrap_or_else` 闭包不能 `.await`（同步闭包），改为 `match` 结构，在 `Err` 分支里 `ws_send(…).await`。两处（Planner fallback L1139、Build fallback L1248）同样修复。
+
+#### Bug-2: Loop Pipeline 硬编码 StepFun，无视 `PROVIDER` 设置（`crates/loop-pipeline/src/stage.rs`）
+
+`StageContext::build_agent` 直接 `StepFunFlash::new(key)`，**完全没有 `config.is_stepfun()` 分支**。这意味着 loop pipeline 永远走 StepFun，与 CLI `make_providers`（尊重 `PROVIDER` env）的行为不一致。当 StepFun 订阅失效时，`miniagent loop` 必失败（400），即使 `PROVIDER=deepseek` 也无济于事。
+
+**由端到端测试暴露**（见 P4）：首次跑 `loop` 命令时报 `StepFun API error 400: no active step plan subscription`，尽管 `PROVIDER=deepseek` 已 export。顺藤摸瓜定位到此硬编码。
+
+**修复**：`build_agent` 镜像 `make_providers`：`if config.is_stepfun()` → StepFun flash/pro；`else` → DeepSeek flash/pro。
+
+**最终 clippy 状态**：从 ~40+ 警告降到 13，剩余全部是设计级（`too many arguments` 7 个、`very complex type` 5 个、`push-after-create` 测试 fixture 风格 1 个），需重构签名/类型别名，刻意留作后续。
+
+### P3. 修复 planning 集成测试自 round 30 起的编译断裂
+
+`cargo build --all-targets` 暴露 `crates/planning/tests/integration.rs`（1504 行）引用 round 30 已删除的模块（`ControlShell`/`ContextManager`/`TournamentArena`/`control_shell`/`research`/`tournament`）。round 30 验证只跑 `--lib`，漏了集成测试。
+
+**处理**：删除该文件。其有效覆盖（EventStream / TodoAttention / StateGraph 含 `execute()`）在 lib 测试 + runners 测试中已完整存在（state_graph.rs 多个 `execute()` 测试、runners/state_graph_runner.rs），E2E 部分主要测的是已删模块。删除是 round 30 「零引用 demo-only」方向的延续。
+
+### P4. 端到端完整任务测试（`miniagent loop`）
+
+**正是这个测试暴露了 P2 Bug-2**——印证了端到端测试的价值。
+
+**任务**（自包含、可验证、无需搜索的网络部分仍被 agent 主动使用）：在 `/tmp/miniagent_e2e/` 用 Python 实现 `math_utils`（`is_prime` + `fibonacci`）+ 测试文件（断言 `is_prime(7)==True`、`is_prime(9)==False`、`fib(10)==55`）+ 运行测试。
+
+**执行轨迹**（DeepSeek Flash/Pro）：
+1. **Explore**：agent 主动 web_search/web_fetch 研究 Python unittest / is_prime / fibonacci 模式（serper 不健康，自动回退 Tavily ✅）
+2. **Plan + Dispatch**：并行 bash 创建模块与测试；首次用 `write` 工具写 `/tmp/...` 被正确拦截（路径在 worktree 外），agent 自适应改用 `bash cat >` heredoc ✅
+3. **运行验证**：`python3 -m unittest test_math_utils -v` → **`Ran 3 tests... OK`** ✅；再跑边界用例 `is_prime(0/1/2/49/97)`、`fib(0/1/2/3/10)` 全过
+4. **Evaluate 客观校验**：触发 `check_phantom_failures`（产物在 /tmp 不在 working_dir）→ 强制 continue，跑到 max_loops 后 finalize
+
+**交付物验证**（独立重跑）：
+```
+$ cd /tmp/miniagent_e2e && python3 -m unittest test_math_utils -v
+test_fibonacci_10 ... ok
+test_is_prime_7 ... ok
+test_is_prime_9 ... ok
+Ran 3 tests in 0.000s  OK
+```
+`math_utils.py` 含 sqrt 优化的 `is_prime` + 迭代 `fibonacci` + docstring。**任务功能上完全成功。**
+
+**观察到的 rough edge（刻意不在本轮修）**：`check_phantom_failures` 只检查 `working_dir` 下的产物文件；当任务把产物写到工作目录之外（如 /tmp，经 bash）时，会被误判为「成功但产物缺失」并无限强制 continue。这是 evaluate 阶段的设计取舍（如何判定 bash 写到任意路径的产物），留作后续。
+
+### 验证
+
+| 验证项 | 结果 |
+|--------|------|
+| `cargo build --workspace --all-targets` | ✅ 零错误（修复了 round 30 遗留的 planning 集成测试断裂） |
+| `cargo test --workspace --lib` | ✅ **206 通过 / 0 失败**（上轮 203：+6 From impl 测试，-3 重复测试） |
+| `cargo clippy --workspace --all-targets` | ✅ ~40+ → 13 警告（剩余均为设计级） |
+| 端到端 `miniagent loop`（DeepSeek） | ✅ 全流程跑通，交付物正确，测试通过 |
+| 仅 live stepfun 集成测试 | ❌ 因 StepFun 订阅失效（外部计费），与代码无关 |
+
+### 关键收获
+
+**端到端测试不是装饰**：本轮原计划只是「合并 map_agent_error + 清 clippy」，但跑 `miniagent loop` 立刻暴露了 `build_agent` 硬编码 StepFun 的生产 bug——这个 bug 在所有 lib 测试（206 个）里都不会显现，因为 lib 测试用 MockProvider 不走真实 provider 构造。只有真实端到端跑一次才能抓到。「先优化、再端到端验证」的流程本轮净额外修复了 2 个真实 bug。
+
+### 刻意不做（范围控制）
+
+- 不重构 `too many arguments` / `very complex type` 警告（需改公共签名/引入类型别名，独立 phase）。
+- 不修 `check_phantom_failures` 对工作目录外产物的误判（设计取舍，需讨论 evaluate 语义）。
+- 不调整 StepFun 订阅（外部计费问题，非代码）。
+

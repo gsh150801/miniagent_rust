@@ -46,8 +46,9 @@
 | 工具 Tools | `tool` | 9 个内置工具 (read/write/edit/glob/grep/bash/fetch/search/pubmed) + 多后端搜索回退 |
 | 记忆 Memory | `memory` | 4 层: L0 工作 → L1 情景 (SQLite FTS5) → L2 语义 (向量) → L3 技能 |
 | 持久化 Persistence | `checkpoint` | SQLite 检查点 + 恢复 |
-| 工作流 Workflow | `workflow` | DAG 引擎 + 动态规划器 + 6 Stage + 重试 + Mermaid 可视化 + 进度回调 |
-| 规划 Planning | `planning` | 任务分解 + 角色 + 黑板 + Hook + StateGraph + 控制壳 |
+| 工作流 Workflow | `workflow` | DAG 引擎 + 动态规划器 + 6 Stage + 重试 + Mermaid 可视化 + 进度回调（生产 `DagRunner` 通过 `StageDriver` trait 接入） |
+| 循环 Loop-pipeline | `loop-pipeline` | Explore→Plan→Dispatch→Evaluate→Repair 5 阶段循环 + 三角色协作（生产 `LoopRunner` 通过 `StageDriver` trait 接入） |
+| 规划 Planning | `planning` | 可选：任务分解（Planner）+ StateGraph 动态调度 + 13 个 AgentRole 多角色编排（CLI 命令 `plan`/`team`/`debate`） |
 | 知识图谱 KG | `kg` | 实体抽取、TransE/RotatE 嵌入、GIVE 链路预测 |
 | 假设 Hypothesis | `hypothesis` | LLM 验证假设 + 实验设计 |
 | 自改进 Self-Improve | `self-improve` | 在线: Step-Reflection + Q-Router + Lifecycle Guard。离线: Experience Graph + Skill Manager + Sleeptime |

@@ -183,7 +183,7 @@ impl Tool for KgQueryTool {
                         let body = entity_to_json(e);
                         Ok(ToolOutput {
                             content: serde_json::to_string_pretty(&body)
-                                .map_err(|e| AgentError::tool("kg_query", &e.to_string()))?,
+                                .map_err(|e| AgentError::tool("kg_query", e.to_string()))?,
                             metadata: None,
                         })
                     }
@@ -198,7 +198,7 @@ impl Tool for KgQueryTool {
                     AgentError::tool("kg_query", "missing 'entity' for neighborhood")
                 })?;
                 let entity = kg.find_entity_by_name(name).ok_or_else(|| {
-                    AgentError::tool("kg_query", &format!("entity '{name}' not found"))
+                    AgentError::tool("kg_query", format!("entity '{name}' not found"))
                 })?;
                 let neighbors: Vec<Value> = kg
                     .neighborhood(&entity.id)
@@ -218,7 +218,7 @@ impl Tool for KgQueryTool {
                 let body = json!({ "entity": entity.name, "neighbors": neighbors });
                 Ok(ToolOutput {
                     content: serde_json::to_string_pretty(&body)
-                        .map_err(|e| AgentError::tool("kg_query", &e.to_string()))?,
+                        .map_err(|e| AgentError::tool("kg_query", e.to_string()))?,
                     metadata: None,
                 })
             }
@@ -231,10 +231,10 @@ impl Tool for KgQueryTool {
                     .ok_or_else(|| AgentError::tool("kg_query", "missing 'to' for paths"))?;
                 let max_depth = input["max_depth"].as_u64().unwrap_or(3) as usize;
                 let from = kg.find_entity_by_name(from_name).ok_or_else(|| {
-                    AgentError::tool("kg_query", &format!("entity '{from_name}' not found"))
+                    AgentError::tool("kg_query", format!("entity '{from_name}' not found"))
                 })?;
                 let to = kg.find_entity_by_name(to_name).ok_or_else(|| {
-                    AgentError::tool("kg_query", &format!("entity '{to_name}' not found"))
+                    AgentError::tool("kg_query", format!("entity '{to_name}' not found"))
                 })?;
                 let paths = kg.find_paths(&from.id, &to.id, max_depth);
                 let rendered: Vec<Value> = paths
@@ -260,7 +260,7 @@ impl Tool for KgQueryTool {
                 let body = json!({ "from": from_name, "to": to_name, "paths": rendered });
                 Ok(ToolOutput {
                     content: serde_json::to_string_pretty(&body)
-                        .map_err(|e| AgentError::tool("kg_query", &e.to_string()))?,
+                        .map_err(|e| AgentError::tool("kg_query", e.to_string()))?,
                     metadata: None,
                 })
             }
@@ -271,13 +271,13 @@ impl Tool for KgQueryTool {
                 });
                 Ok(ToolOutput {
                     content: serde_json::to_string_pretty(&body)
-                        .map_err(|e| AgentError::tool("kg_query", &e.to_string()))?,
+                        .map_err(|e| AgentError::tool("kg_query", e.to_string()))?,
                     metadata: None,
                 })
             }
             other => Err(AgentError::tool(
                 "kg_query",
-                &format!("unknown action '{other}'"),
+                format!("unknown action '{other}'"),
             )),
         }
     }
@@ -441,7 +441,7 @@ impl Tool for KgAddTool {
                         None => {
                             return Err(AgentError::tool(
                                 "kg_add",
-                                &format!("relation references unknown entity '{from_name}'"),
+                                format!("relation references unknown entity '{from_name}'"),
                             ))
                         }
                     },
@@ -453,13 +453,13 @@ impl Tool for KgAddTool {
                         None => {
                             return Err(AgentError::tool(
                                 "kg_add",
-                                &format!("relation references unknown entity '{to_name}'"),
+                                format!("relation references unknown entity '{to_name}'"),
                             ))
                         }
                     },
                 };
                 let rel_type = RelationType::parse(rel_str).ok_or_else(|| {
-                    AgentError::tool("kg_add", &format!("unknown relation type '{rel_str}'"))
+                    AgentError::tool("kg_add", format!("unknown relation type '{rel_str}'"))
                 })?;
                 let confidence = r["confidence"].as_f64().unwrap_or(1.0);
                 let evidence = r["evidence"].as_str().unwrap_or("").to_string();
@@ -486,7 +486,7 @@ impl Tool for KgAddTool {
         });
         Ok(ToolOutput {
             content: serde_json::to_string_pretty(&body)
-                .map_err(|e| AgentError::tool("kg_add", &e.to_string()))?,
+                .map_err(|e| AgentError::tool("kg_add", e.to_string()))?,
             metadata: None,
         })
     }
@@ -560,7 +560,7 @@ impl Tool for HypothesisSuggestTool {
         let rel_type = RelationType::parse(rel_str).ok_or_else(|| {
             AgentError::tool(
                 "hypothesis_suggest",
-                &format!("unknown relation type '{rel_str}'"),
+                format!("unknown relation type '{rel_str}'"),
             )
         })?;
 
@@ -571,7 +571,7 @@ impl Tool for HypothesisSuggestTool {
             let head = kg.find_entity_by_name(head_name).ok_or_else(|| {
                 AgentError::tool(
                     "hypothesis_suggest",
-                    &format!("head entity '{head_name}' not found in KG"),
+                    format!("head entity '{head_name}' not found in KG"),
                 )
             })?;
             scorer.predict_tails(&head.id, &rel_type, &kg, max_results)
@@ -688,7 +688,7 @@ impl Tool for HypothesisSuggestTool {
         });
         Ok(ToolOutput {
             content: serde_json::to_string_pretty(&body)
-                .map_err(|e| AgentError::tool("hypothesis_suggest", &e.to_string()))?,
+                .map_err(|e| AgentError::tool("hypothesis_suggest", e.to_string()))?,
             metadata: None,
         })
     }
@@ -722,10 +722,7 @@ mod tests {
     #[tokio::test]
     async fn kg_query_stats_and_lookup() {
         let tool = KgQueryTool::new(make_handle_with_data());
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
 
         let out = tool
             .execute(json!({"action": "stats"}), &ctx, CancellationToken::new())
@@ -749,10 +746,7 @@ mod tests {
     #[tokio::test]
     async fn kg_add_is_idempotent_by_name() {
         let tool = KgAddTool::new(make_handle_with_data());
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
 
         // BRCA1 已存在，应被跳过；TP53 应新增
         let out = tool
@@ -777,10 +771,7 @@ mod tests {
     #[tokio::test]
     async fn kg_add_relation_resolves_names() {
         let tool = KgAddTool::new(make_handle_with_data());
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
 
         let out = tool
             .execute(
@@ -809,10 +800,7 @@ mod tests {
         // 先加一条关系
         {
             let tool = KgAddTool::new(handle.clone());
-            let ctx = ToolContext {
-                working_dir: ".".into(),
-                session_id: "test".into(),
-            };
+            let ctx = ToolContext::new(".".to_string(), "test".to_string());
             tool.execute(
                 json!({"relations": [{"from": "BRCA1", "relation": "associated_with", "to": "breast cancer"}]}),
                 &ctx,
@@ -822,10 +810,7 @@ mod tests {
             .unwrap();
         }
         let tool = KgQueryTool::new(handle);
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
         let out = tool
             .execute(
                 json!({"action": "neighborhood", "entity": "BRCA1"}),
@@ -843,10 +828,7 @@ mod tests {
     #[tokio::test]
     async fn kg_query_unknown_action_errors() {
         let tool = KgQueryTool::new(KgHandle::new());
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
         let res = tool
             .execute(json!({"action": "bogus"}), &ctx, CancellationToken::new())
             .await;
@@ -856,10 +838,7 @@ mod tests {
     #[tokio::test]
     async fn kg_query_missing_entity_errors() {
         let tool = KgQueryTool::new(KgHandle::new());
-        let ctx = ToolContext {
-            working_dir: ".".into(),
-            session_id: "test".into(),
-        };
+        let ctx = ToolContext::new(".".to_string(), "test".to_string());
         let res = tool
             .execute(
                 json!({"action": "neighborhood", "entity": "nonexistent"}),

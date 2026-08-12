@@ -1,10 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 // ── Plan Types ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     pub id: uuid::Uuid,
     pub goal: String,
@@ -54,45 +54,48 @@ impl Plan {
         self.steps.iter().all(|s| matches!(s.status, StepStatus::Completed | StepStatus::Skipped))
     }
 
-    /// Topological order for execution (respects dependencies)
-    pub fn execution_order(&self) -> Vec<Vec<usize>> {
-        let mut in_degree: HashMap<usize, usize> = HashMap::new();
-        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    /// Topological order for execution (respects dependencies).
+///
+/// Delegates to the canonical Kahn scheduler in
+/// `miniagent_core::orchestration::kahn_waves`. Returns waves of indices
+/// into `self.steps` (matches the pre-consolidation API).
+pub fn execution_order(&self) -> Vec<Vec<usize>> {
+    use miniagent_core::orchestration::{kahn_waves, DagEdge};
 
-        for (i, step) in self.steps.iter().enumerate() {
-            in_degree.entry(i).or_insert(step.depends_on.len());
-            for dep_id in &step.depends_on {
-                if let Some(dep_idx) = self.steps.iter().position(|s| s.id == *dep_id) {
-                    children.entry(dep_idx).or_default().push(i);
-                }
-            }
-        }
+    // Build (nodes, edges) using UUID-string IDs.
+    let nodes: Vec<String> = self.steps.iter().map(|s| s.id.to_string()).collect();
+    let edges: Vec<DagEdge> = self
+        .steps
+        .iter()
+        .flat_map(|step| {
+            step.depends_on.iter().map(move |dep_id| DagEdge {
+                to: step.id.to_string(),
+                depends_on: dep_id.to_string(),
+            })
+        })
+        .collect();
 
-        let mut waves = Vec::new();
-        let mut queue: VecDeque<usize> = in_degree.iter()
-            .filter(|(_, deg)| **deg == 0)
-            .map(|(&i, _)| i)
-            .collect();
+    // Map UUID strings back to step indices.
+    let id_to_idx: HashMap<String, usize> = self
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.to_string(), i))
+        .collect();
 
-        while !queue.is_empty() {
-            let wave: Vec<usize> = queue.drain(..).collect();
-            let mut next = VecDeque::new();
-            for &idx in &wave {
-                if let Some(kids) = children.get(&idx) {
-                    for &kid in kids {
-                        if let Some(deg) = in_degree.get_mut(&kid) {
-                            *deg -= 1;
-                            if *deg == 0 { next.push_back(kid); }
-                        }
-                    }
-                }
-            }
-            waves.push(wave);
-            queue = next;
-        }
-
-        waves
-    }
+    // Run the canonical algorithm. Cycles are silently tolerated (matches
+    // the pre-consolidation behavior): a cycle just means those steps never
+    // reach in-degree 0 and so won't appear in any wave.
+    let waves = kahn_waves(&nodes, &edges).unwrap_or_default();
+    waves
+        .into_iter()
+        .map(|wave| {
+            wave.into_iter()
+                .filter_map(|id| id_to_idx.get(&id).copied())
+                .collect()
+        })
+        .collect()
+}
 
     /// Generate a status display
     pub fn status_display(&self) -> String {

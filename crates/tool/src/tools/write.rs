@@ -71,7 +71,7 @@ mod tests {
     use crate::traits::ToolContext;
 
     fn ctx_with_workdir(dir: &str) -> ToolContext {
-        ToolContext { working_dir: dir.to_string(), session_id: "test".to_string() }
+        ToolContext::new(dir.to_string(), "test".to_string() )
     }
 
     #[tokio::test]

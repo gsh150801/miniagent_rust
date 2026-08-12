@@ -38,20 +38,25 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, AgentError> {
         let cmd = input["command"].as_str()
             .ok_or_else(|| AgentError::tool("bash", "missing 'command'"))?;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(60_000);
 
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
+        // 绑定工作目录（参考 cc-python-claude bash_tool 的 cwd 约束）
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if !ctx.working_dir.is_empty() {
+            command.current_dir(&ctx.working_dir);
+        }
+
+        let child = command
             .spawn()
             .map_err(|e| AgentError::tool("bash", format!("spawn: {e}")))?;
 
@@ -77,14 +82,28 @@ impl Tool for BashTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
+        // 输出截断（参考 cc-python-claude 的 MAX_OUTPUT_BYTES=200KB）
+        // 防止大输出（cat 大文件/find /）撑爆上下文窗口或内存
+        const MAX_OUTPUT_BYTES: usize = 200_000;
+
         let mut content = String::new();
         if !stdout.is_empty() {
-            content.push_str(&stdout);
+            if stdout.len() > MAX_OUTPUT_BYTES {
+                content.push_str(&stdout[..MAX_OUTPUT_BYTES]);
+                content.push_str(&format!("\n... (stdout truncated, {} more bytes)", stdout.len() - MAX_OUTPUT_BYTES));
+            } else {
+                content.push_str(&stdout);
+            }
         }
         if !stderr.is_empty() {
             if !content.is_empty() { content.push('\n'); }
             content.push_str("STDERR:\n");
-            content.push_str(&stderr);
+            if stderr.len() > MAX_OUTPUT_BYTES {
+                content.push_str(&stderr[..MAX_OUTPUT_BYTES]);
+                content.push_str(&format!("\n... (stderr truncated, {} more bytes)", stderr.len() - MAX_OUTPUT_BYTES));
+            } else {
+                content.push_str(&stderr);
+            }
         }
         if content.is_empty() {
             content.push_str("(no output)");

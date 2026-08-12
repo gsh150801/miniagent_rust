@@ -101,16 +101,14 @@ pub fn extract_json_object(text: &str) -> Option<String> {
                 }
                 depth += 1;
             }
-            '}' => {
-                if depth > 0 {
+            '}'
+                if depth > 0 => {
                     depth -= 1;
-                    if depth == 0 {
-                        if let Some(start) = last_start {
+                    if depth == 0
+                        && let Some(start) = last_start {
                             last_range = Some(start..i + 1);
                         }
-                    }
                 }
-            }
             _ => {}
         }
     }

@@ -92,7 +92,7 @@ Task ID: {task_id}
 
             let provider = ctx.agent.router().pro();
             let request = CompletionRequest {
-                system: "You are an expert failure analyst. Diagnose issues and suggest fixes. Output ONLY valid JSON.".into(),
+                system: format!("You are an expert failure analyst. {} Diagnose issues and suggest fixes. Output ONLY valid JSON.", miniagent_core::context_info::date_hint()),
                 messages: vec![Message::user(&prompt)],
                 tools: vec![],
                 config: InferenceConfig {

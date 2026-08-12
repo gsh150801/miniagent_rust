@@ -46,6 +46,15 @@ impl ToolExecutor {
                     "tool '{name}': {reason}"
                 )));
             }
+            ApprovalDecision::Ask(reason) => {
+                // executor 层无法交互式询问用户（不持有 socket），
+                // Ask 在此退化为 Deny。交互式询问由 server 层的
+                // WhitelistApproval::NonInteractive 或 ask_user 处理。
+                tracing::warn!(tool = name, reason = %reason, "tool requires approval but executor cannot ask — denying");
+                return Err(AgentError::PolicyDenied(format!(
+                    "tool '{name}': {reason} (no interactive approval available)"
+                )));
+            }
         }
 
         let start = Instant::now();
@@ -130,10 +139,10 @@ impl ToolExecutor {
                     async move {
                         let worktree = wt_dir.join(format!("tool_{}", id.0));
                         let _ = std::fs::create_dir_all(&worktree);
-                        let tool_ctx = ToolContext {
-                            working_dir: worktree.to_string_lossy().to_string(),
-                            session_id: format!("{}_{}", base_dir, id.0),
-                        };
+                        let tool_ctx = ToolContext::new(
+                            worktree.to_string_lossy().to_string(),
+                            format!("{}_{}", base_dir, id.0),
+                        );
                         match Self::execute_raw_via(&registry, &name, &input, &tool_ctx, token).await {
                             Ok(out) => (id, out),
                             Err(e) => (id, ToolOutput {

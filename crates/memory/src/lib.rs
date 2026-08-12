@@ -5,6 +5,7 @@ pub mod semantic;
 pub mod procedural;
 pub mod manager;
 pub mod decay;
+pub mod extractor;
 
 pub use manager::MemoryManager;
 pub use types::*;

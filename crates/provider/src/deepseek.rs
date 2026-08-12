@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -6,7 +7,7 @@ use miniagent_core::event::{ContentBlock, StopReason, Usage};
 use miniagent_core::message::MessageRole;
 use miniagent_core::secrets::ApiKey;
 use miniagent_core::types::ToolCallId;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -216,9 +217,13 @@ pub struct DeepSeekClient {
 
 impl DeepSeekClient {
     pub fn new(api_key: &ApiKey, model: &str, is_reasoner: bool) -> Self {
+        let mut builder = Client::builder().timeout(Duration::from_secs(300));
+        if let Some(proxy_url) = Self::proxy_from_env()
+            && let Ok(proxy) = Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(300))
+            client: builder
                 .build()
                 .expect("failed to create HTTP client"),
             base_url: std::env::var("DEEPSEEK_BASE_URL")
@@ -243,6 +248,19 @@ impl DeepSeekClient {
     pub fn with_thinking_budget(mut self, tokens: u32) -> Self {
         self.thinking_budget = tokens;
         self
+    }
+
+    /// Build a proxy from standard environment variables.
+    /// Checks `ALL_PROXY` / `all_proxy` → `HTTPS_PROXY` / `https_proxy` → `HTTP_PROXY` / `http_proxy`.
+    fn proxy_from_env() -> Option<String> {
+        std::env::var("ALL_PROXY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("all_proxy").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("HTTPS_PROXY").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("https_proxy").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("http_proxy").ok().filter(|v| !v.is_empty()))
     }
 
     fn build_request(&self, request: &CompletionRequest, stream: bool) -> ChatRequest {
@@ -451,7 +469,17 @@ impl LlmProvider for DeepSeekClient {
                 .json(&chat_request)
                 .send() => r,
         }
-        .map_err(|e| AgentError::provider(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| {
+            let cause = e
+                .source()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(c) = cause {
+                AgentError::provider(format!("HTTP request failed: {e} (cause: {c})"))
+            } else {
+                AgentError::provider(format!("HTTP request failed: {e}"))
+            }
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -504,8 +532,17 @@ impl LlmProvider for DeepSeekClient {
             let response = match result {
                 Ok(r) => r,
                 Err(e) => {
+                    let cause = e
+                        .source()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    let detail = if let Some(c) = cause {
+                        format!("HTTP error: {e} (cause: {c})")
+                    } else {
+                        format!("HTTP error: {e}")
+                    };
                     let _ = tx
-                        .send(Err(AgentError::provider(format!("HTTP error: {e}"))))
+                        .send(Err(AgentError::provider(detail)))
                         .await;
                     return;
                 }

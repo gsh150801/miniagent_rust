@@ -58,7 +58,14 @@ impl Tool for SkillAsTool {
         let user_input = input["input"].as_str().unwrap_or("");
 
         let bundle = self.registry.get_by_name(skill_name)
-            .ok_or_else(|| AgentError::tool("skill_execute", format!("Skill '{skill_name}' not found")))?;
+            .ok_or_else(|| {
+                // 附上可用技能列表，帮助 LLM 自纠错（参考 cc-python-claude SkillTool）
+                let available: Vec<String> = self.registry.all_skill_names();
+                AgentError::tool("skill_execute", format!(
+                    "Skill '{skill_name}' not found. Available skills: [{}]",
+                    available.join(", ")
+                ))
+            })?;
 
         // Return the skill prompt body — the actual LLM execution happens
         // when the Agent feeds this into its context in the next turn.

@@ -12,6 +12,9 @@ mod conda_tool;
 mod patent_search;
 mod clinical_trials;
 mod kg_tools;
+mod ask_user;
+mod notebook_edit;
+mod geo_search;
 
 pub use read::ReadTool;
 pub use write::WriteTool;
@@ -27,8 +30,11 @@ pub use conda_tool::CondaTool;
 pub use patent_search::PatentSearchTool;
 pub use clinical_trials::ClinicalTrialsTool;
 pub use kg_tools::{KgHandle, KgQueryTool, KgAddTool, HypothesisSuggestTool};
+pub use geo_search::GeoSearchTool;
 
 use crate::registry::ToolRegistry;
+use ask_user::AskUserTool;
+use notebook_edit::NotebookEditTool;
 
 pub fn defaults() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -45,7 +51,10 @@ pub fn defaults() -> ToolRegistry {
         .register(GitTool::new())
         .register(CondaTool::new())
         .register(PatentSearchTool::new())
-        .register(ClinicalTrialsTool::new());
+        .register(ClinicalTrialsTool::new())
+        .register(AskUserTool::new())
+        .register(NotebookEditTool::new())
+        .register(GeoSearchTool::new());
     registry
 }
 
@@ -67,3 +76,5 @@ pub fn defaults_with_kg(
     });
     registry
 }
+
+

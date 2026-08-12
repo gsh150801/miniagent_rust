@@ -6,6 +6,7 @@ use miniagent_checkpoint::CheckpointStore;
 use miniagent_core::settings::AppConfig;
 use miniagent_memory::manager::MemoryManager;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -15,6 +16,11 @@ pub struct AppState {
     pub tasks: Arc<DashMap<String, TaskInfo>>,
     pub task_dir: PathBuf,
     pub config: Arc<AppConfig>,
+    /// Per-task cancellation tokens, keyed by task_id.
+    pub cancels: Arc<DashMap<String, CancellationToken>>,
+    /// Per-task ask reply channels: 当 task 执行需要向用户提问时，注册一个 oneshot::Sender；
+    /// 前端回复 {type:'ask_reply'} 时，handle_ws 取出 Sender 并 send(answer) 唤醒 task。
+    pub asks: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,17 +44,24 @@ pub struct TaskInfo {
     /// Per-stage execution data for replaying tool cards
     #[serde(default)]
     pub stage_outputs: Vec<serde_json::Value>,
+    /// Full event trace: every AgentEvent (tool calls, skill invocations, etc.)
+    /// persisted for post-hoc traceability (需求2: 全链路可追溯)。
+    /// Each entry is the serialized AgentEvent with a timestamp.
+    #[serde(default)]
+    pub event_log: Vec<serde_json::Value>,
 }
 
 impl AppState {
-    pub fn new(agent: Agent, config: Arc<AppConfig>) -> Self {
+    pub fn new(agent: Arc<Agent>, config: Arc<AppConfig>) -> Self {
         Self {
-            agent: Arc::new(agent),
+            agent,
             memory: None,
             checkpoint_store: None,
             tasks: Arc::new(DashMap::new()),
             task_dir: PathBuf::from("./result"),
             config,
+            cancels: Arc::new(DashMap::new()),
+            asks: Arc::new(DashMap::new()),
         }
     }
 

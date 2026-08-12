@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 pub use miniagent_core::{TaskPlan, TaskUnit};
-pub use miniagent_evolution::RetrievalContext;
 
 /// Result of the Explore stage: what we learned about the task
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,13 +18,21 @@ pub struct ExplorationResult {
 
 /// Result of a single task execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TaskResult {
     pub task_id: String,
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
     pub tokens_used: usize,
+    /// 校验员的校验报告（三角色协作产物）
+    #[serde(default)]
+    pub validation_report: Option<serde_json::Value>,
+    /// 仲裁员的决策："pass" / "revise" / "supplement"（三角色协作产物）
+    #[serde(default)]
+    pub arbiter_decision: Option<String>,
 }
+
 
 /// Evaluation result for the entire loop
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,9 +90,16 @@ pub struct PipelineState {
     /// Accumulated token usage across all loops (input + output).
     #[serde(default)]
     pub total_tokens_used: usize,
-    /// Memory retrieval context for the current loop iteration.
+    /// Collected stage outputs for history replay.
     #[serde(default)]
-    pub retrieval_context: RetrievalContext,
+    pub stage_outputs: Vec<StageOutputRecord>,
+}
+
+/// A lightweight record of a stage output for history replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageOutputRecord {
+    pub stage: String,
+    pub summary: serde_json::Value,
 }
 
 impl PipelineState {
@@ -105,7 +119,7 @@ impl PipelineState {
             final_output: None,
             no_progress_streak: 0,
             total_tokens_used: 0,
-            retrieval_context: RetrievalContext::default(),
+            stage_outputs: Vec::new(),
         }
     }
 

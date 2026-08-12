@@ -1,9 +1,12 @@
 use miniagent_core::error::AgentError;
+use miniagent_core::json_util;
 use miniagent_kg::link_prediction::HypothesisCandidate;
 use miniagent_kg::KnowledgeGraph;
 use miniagent_provider::traits::{CompletionRequest, LlmProvider};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+use crate::validation::{AnalysisVariables, DataAnalysisTask, DatasetSource, ValidationPlan, WetLabProtocol};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hypothesis {
@@ -219,10 +222,393 @@ Output as JSON:
             source_candidate: candidate.clone(),
         })
     }
+
+    /// Generate a structured validation plan for a hypothesis.
+    ///
+    /// The plan deliberately separates **computational data-analysis tasks**
+    /// (executable against public datasets or local files) from **wet-lab
+    /// protocols** (bench work). The prompt instructs the model to ground each
+    /// task in the hypothesis mechanism and to recommend concrete public
+    /// datasets (GEO/TCGA/ArrayExpress) where possible.
+    pub async fn generate_validation_plan(
+        &self,
+        hypothesis: &Hypothesis,
+        kg: &KnowledgeGraph,
+        cancel: CancellationToken,
+    ) -> Result<ValidationPlan, AgentError> {
+        let provider = self.pro_provider.as_ref().ok_or_else(|| {
+            AgentError::invalid_config(
+                "HypothesisGenerator requires a Pro provider for validation plan generation. \
+                 Call with_provider() before use."
+                    .to_string(),
+            )
+        })?;
+
+        let head_name = kg
+            .get_entity(&hypothesis.source_candidate.head)
+            .map(|e| e.name.as_str())
+            .unwrap_or("unknown");
+        let tail_name = kg
+            .get_entity(&hypothesis.source_candidate.tail)
+            .map(|e| e.name.as_str())
+            .unwrap_or("unknown");
+        let rel_name = format!("{:?}", hypothesis.source_candidate.relation).to_lowercase();
+
+        let evidence_text = if hypothesis.supporting_evidence.is_empty() {
+            "No prior supporting evidence enumerated.".to_string()
+        } else {
+            hypothesis
+                .supporting_evidence
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prompt = format!(
+            r#"You are a senior biomedical researcher designing a validation plan.
+
+**Hypothesis under validation:**
+{statement}
+
+**Proposed mechanism:**
+{mechanism}
+
+**Graph relationship:** {head} --[{rel}]--> {tail} (algorithm confidence {score:.3})
+
+**Supporting evidence from literature:**
+{evidence}
+
+**Task:** Design a concrete, executable validation plan that separates two tracks:
+
+1. **data_analysis_tasks** — computational analyses over *existing public datasets*
+   (GEO / TCGA / ArrayExpress) or a local data file. Each must specify a concrete
+   dataset (accession when known), cohort definition, variables (independent /
+   dependent / covariates), statistical method, expected outcome, and a concrete
+   deliverable (e.g. "volcano plot + DE gene table CSV"). These will be executed
+   automatically, so be precise.
+
+2. **wet_lab_protocols** — bench procedures that cannot be automated. Specify
+   reagents, ordered steps, controls, expected outcome, and timeline.
+
+Recommend at least one data-analysis task and at least one wet-lab protocol when
+applicable. Prefer datasets you can name by accession.
+
+Output ONLY valid JSON (no markdown fences, no commentary) with this schema:
+{{
+  "rationale": "why these validations test the hypothesis",
+  "data_analysis_tasks": [
+    {{
+      "id": "DA-1",
+      "objective": "...",
+      "dataset_source": {{"kind": "geo"}},
+      "dataset_accession": "GSE00000",
+      "cohort_definition": "...",
+      "variables": {{"independent": ["..."], "dependent": ["..."], "covariates": ["..."]}},
+      "statistical_method": "...",
+      "expected_outcome": "...",
+      "deliverable": "...",
+      "priority": 0.9
+    }}
+  ],
+  "wet_lab_protocols": [
+    {{
+      "id": "WL-1",
+      "objective": "...",
+      "reagents": ["..."],
+      "steps": ["..."],
+      "controls": ["..."],
+      "expected_outcome": "...",
+      "timeline_days": 14,
+      "feasibility": 0.7
+    }}
+  ]
+}}
+
+`dataset_source.kind` ∈ {{"geo", "tcga", "arrayexpress", "local", "custom_url"}}.
+For local/custom_url, also provide `value` (a path or URL)."#,
+            statement = hypothesis.statement,
+            mechanism = hypothesis.mechanism.as_deref().unwrap_or("(not specified)"),
+            head = head_name,
+            tail = tail_name,
+            rel = rel_name,
+            score = hypothesis.source_candidate.score,
+            evidence = evidence_text,
+        );
+
+        let request = CompletionRequest {
+            system: "You are a precise scientific planning engine. Output ONLY valid JSON.".into(),
+            messages: vec![miniagent_core::message::Message::user(&prompt)],
+            tools: vec![],
+            config: miniagent_core::config::InferenceConfig {
+                temperature: Some(0.2),
+                max_tokens: Some(4000),
+                ..Default::default()
+            },
+        };
+
+        let response = provider.complete(&request, cancel).await?;
+        let text = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        parse_validation_plan(&text, hypothesis.id)
+    }
+}
+
+/// Tolerantly parse an LLM-produced validation plan JSON into typed structs.
+fn parse_validation_plan(text: &str, hypothesis_id: uuid::Uuid) -> Result<ValidationPlan, AgentError> {
+    // strip fences, fix truncation, and extract the JSON object in one step.
+    let repaired = json_util::extract_and_repair(text);
+    let root: serde_json::Value =
+        serde_json::from_str(&repaired).map_err(|e| AgentError::invalid_config(
+            format!("validation plan JSON parse failed: {e}"),
+        ))?;
+
+    let rationale = root
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let data_analysis_tasks = root
+        .get("data_analysis_tasks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| parse_data_analysis_task(i, v))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let wet_lab_protocols = root
+        .get("wet_lab_protocols")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| parse_wet_lab_protocol(i, v))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(ValidationPlan {
+        hypothesis_id,
+        rationale,
+        data_analysis_tasks,
+        wet_lab_protocols,
+    })
+}
+
+fn parse_data_analysis_task(idx: usize, v: &serde_json::Value) -> DataAnalysisTask {
+    DataAnalysisTask {
+        id: v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("DA-{}", idx + 1)),
+        objective: as_string(v, "objective"),
+        dataset_source: parse_dataset_source(v.get("dataset_source")),
+        dataset_accession: v
+            .get("dataset_accession")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        cohort_definition: as_string(v, "cohort_definition"),
+        variables: parse_variables(v.get("variables")),
+        statistical_method: as_string(v, "statistical_method"),
+        expected_outcome: as_string(v, "expected_outcome"),
+        deliverable: as_string(v, "deliverable"),
+        priority: v
+            .get("priority")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
+    }
+}
+
+fn parse_wet_lab_protocol(idx: usize, v: &serde_json::Value) -> WetLabProtocol {
+    WetLabProtocol {
+        id: v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("WL-{}", idx + 1)),
+        objective: as_string(v, "objective"),
+        reagents: as_string_array(v, "reagents"),
+        steps: as_string_array(v, "steps"),
+        controls: as_string_array(v, "controls"),
+        expected_outcome: as_string(v, "expected_outcome"),
+        timeline_days: v
+            .get("timeline_days")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32),
+        feasibility: v
+            .get("feasibility")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
+    }
+}
+
+/// Tolerate both `{"kind":"geo"}` and a bare `"geo"` string.
+fn parse_dataset_source(v: Option<&serde_json::Value>) -> DatasetSource {
+    let Some(v) = v else {
+        return DatasetSource::Geo;
+    };
+    if let Some(s) = v.as_str() {
+        return parse_source_kind(s, None);
+    }
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("geo");
+    let value = v.get("value").and_then(|x| x.as_str()).unwrap_or("");
+    parse_source_kind(kind, Some(value))
+}
+
+fn parse_source_kind(kind: &str, value: Option<&str>) -> DatasetSource {
+    let value = value.unwrap_or("").to_string();
+    match kind.to_lowercase().as_str() {
+        "tcga" => DatasetSource::Tcga,
+        "arrayexpress" | "array_express" => DatasetSource::ArrayExpress,
+        "local" => DatasetSource::Local(if value.is_empty() {
+            "data.csv".to_string()
+        } else {
+            value
+        }),
+        "custom_url" | "customurl" | "url" => DatasetSource::CustomUrl(value),
+        _ => DatasetSource::Geo,
+    }
+}
+
+fn parse_variables(v: Option<&serde_json::Value>) -> AnalysisVariables {
+    let Some(v) = v else {
+        return AnalysisVariables::default();
+    };
+    AnalysisVariables {
+        independent: as_string_array_val(v, "independent"),
+        dependent: as_string_array_val(v, "dependent"),
+        covariates: as_string_array_val(v, "covariates"),
+    }
+}
+
+fn as_string(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn as_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
+    as_string_array_val(v, key)
+}
+
+fn as_string_array_val(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl Default for HypothesisGenerator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod validation_plan_tests {
+    use super::parse_validation_plan;
+
+    #[test]
+    fn parses_full_plan_with_tagged_dataset_source() {
+        let json = r#"```json
+{
+  "rationale": "BRCA1 loss should reduce DNA-repair capacity in tumor cells.",
+  "data_analysis_tasks": [
+    {
+      "id": "DA-1",
+      "objective": "Measure BRCA1 differential expression",
+      "dataset_source": {"kind": "geo"},
+      "dataset_accession": "GSE12345",
+      "cohort_definition": "tumor vs normal",
+      "variables": {"independent": ["BRCA1"], "dependent": ["status"], "covariates": ["age"]},
+      "statistical_method": "limma DE",
+      "expected_outcome": "BRCA1 downregulated in tumor",
+      "deliverable": "volcano + CSV",
+      "priority": 0.9
+    }
+  ],
+  "wet_lab_protocols": [
+    {
+      "id": "WL-1",
+      "objective": "Western blot",
+      "reagents": ["anti-BRCA1"],
+      "steps": ["lyse", "run gel"],
+      "controls": ["GAPDH"],
+      "expected_outcome": "reduced band",
+      "timeline_days": 3,
+      "feasibility": 0.8
+    }
+  ]
+}
+```"#;
+        let plan = parse_validation_plan(json, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(plan.data_analysis_tasks.len(), 1);
+        assert_eq!(plan.wet_lab_protocols.len(), 1);
+        let t = &plan.data_analysis_tasks[0];
+        assert_eq!(t.id, "DA-1");
+        assert_eq!(t.dataset_source, crate::validation::DatasetSource::Geo);
+        assert_eq!(t.dataset_accession.as_deref(), Some("GSE12345"));
+        assert_eq!(t.variables.independent, vec!["BRCA1".to_string()]);
+        assert!((t.priority - 0.9).abs() < 1e-9);
+        assert_eq!(plan.wet_lab_protocols[0].timeline_days, Some(3));
+    }
+
+    #[test]
+    fn tolerates_bare_string_dataset_source_and_local() {
+        let json = r#"{"rationale":"x","data_analysis_tasks":[
+            {"id":"DA-1","objective":"o","dataset_source":"local","dataset_accession":"data.csv","cohort_definition":"c","variables":{},"statistical_method":"t-test","expected_outcome":"e","deliverable":"d","priority":1.5}
+        ],"wet_lab_protocols":[]}"#;
+        let plan = parse_validation_plan(json, uuid::Uuid::new_v4()).unwrap();
+        let t = &plan.data_analysis_tasks[0];
+        // bare "local" string + default value path.
+        assert_eq!(t.dataset_source, crate::validation::DatasetSource::Local("data.csv".into()));
+        // priority clamped to 1.0.
+        assert!((t.priority - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fills_default_ids_when_missing() {
+        let json = r#"{"rationale":"x","data_analysis_tasks":[
+            {"objective":"o","statistical_method":"t","expected_outcome":"e","deliverable":"d"}
+        ],"wet_lab_protocols":[
+            {"objective":"p","expected_outcome":"e"}
+        ]}"#;
+        let plan = parse_validation_plan(json, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(plan.data_analysis_tasks[0].id, "DA-1");
+        assert_eq!(plan.wet_lab_protocols[0].id, "WL-1");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        let res = parse_validation_plan("not json at all", uuid::Uuid::new_v4());
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn empty_arrays_when_keys_absent() {
+        let json = r#"{"rationale":"x"}"#;
+        let plan = parse_validation_plan(json, uuid::Uuid::new_v4()).unwrap();
+        assert_eq!(plan.task_count(), 0);
+        assert_eq!(plan.rationale, "x");
     }
 }

@@ -84,6 +84,26 @@ pub enum AgentEvent {
         checkpoint_id: String,
         step_id: StepId,
     },
+
+    // sub-agent (AgentTool)
+    SubAgentCompleted {
+        task_id: String,
+        result: String,
+        success: bool,
+    },
+
+    // data-analysis execution (validation plan → AnalysisRunner)
+    // Captures the audit outcome of one data-analysis task: whether it
+    // succeeded, whether it was a dry-run, and where its provenance record
+    // lives on disk (queryable via /api/provenance/{task_id}).
+    AnalysisRunCompleted {
+        task_id: String,
+        hypothesis_ref: Option<uuid::Uuid>,
+        success: bool,
+        dry_run: bool,
+        provenance_path: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

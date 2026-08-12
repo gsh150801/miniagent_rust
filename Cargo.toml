@@ -19,7 +19,7 @@ members = [
     "crates/skill",
     "crates/planning",
     "crates/loop-pipeline",
-    "crates/evolution",
+    "crates/analysis",
 ]
 
 [workspace.package]
