@@ -491,8 +491,8 @@ impl PipelineStage for DispatchStage {
         // simple: skip review entirely
         // medium: critic only (auto-pass, feedback recorded)
         // hard:   full 3-party (critic + judge)
-        let flash_provider = ctx.agent.router().flash();
-        let pro_provider = ctx.agent.router().pro();
+        let flash_provider = ctx.agent.flash_provider();
+        let pro_provider = ctx.agent.pro_provider();
         let mut critique_entries: Vec<CritiqueEntry> = Vec::new();
         for result in &all_results {
             if !result.success { continue; }
@@ -511,7 +511,7 @@ impl PipelineStage for DispatchStage {
                 "medium" => {
                     let critique = run_critic(
                         &result.task_id, &result.output, desc, expected,
-                        flash_provider, ctx.config.loop_critic_max_tokens, cancel.child_token(),
+                        flash_provider.as_ref(), ctx.config.loop_critic_max_tokens, cancel.child_token(),
                     ).await;
                     tracing::info!(task_id = %result.task_id, "Medium task: critic review (auto-pass)");
                     critique_entries.push(CritiqueEntry {
@@ -525,12 +525,12 @@ impl PipelineStage for DispatchStage {
                 _ => {
                     let critique = run_critic(
                         &result.task_id, &result.output, desc, expected,
-                        flash_provider, ctx.config.loop_critic_max_tokens, cancel.child_token(),
+                        flash_provider.as_ref(), ctx.config.loop_critic_max_tokens, cancel.child_token(),
                     ).await;
 
                     let judge_result = run_judge(
                         &result.task_id, &result.output, &critique, desc, expected,
-                        pro_provider, ctx.config.loop_judge_max_tokens, cancel.child_token(),
+                        pro_provider.as_ref(), ctx.config.loop_judge_max_tokens, cancel.child_token(),
                     ).await;
 
                     if !judge_result.passed {

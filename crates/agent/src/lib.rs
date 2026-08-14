@@ -47,7 +47,9 @@ fn estimate_history_tokens(history: &[Message]) -> usize {
 }
 
 pub struct Agent {
-    provider_router: ProviderRouter,
+    /// 运行时可替换的 provider 路由（RwLock 支持在 Arc<Agent> 上调用
+    /// replace_providers 热切换模型，无需重建 Agent）。
+    provider_router: Arc<std::sync::RwLock<ProviderRouter>>,
     /// 运行时可替换的 ToolExecutor（用 Arc<Mutex<Option<...>>> 支持
     /// 在 Arc<Agent> 上调用 replace_tools 而不需要 &mut self）。
     tool_executor: Arc<std::sync::Mutex<Option<Arc<ToolExecutor>>>>,
@@ -82,7 +84,7 @@ pub struct AgentDelta {
 impl Agent {
     pub fn new(flash: Box<dyn LlmProvider>, pro: Box<dyn LlmProvider>) -> Self {
         Self {
-            provider_router: ProviderRouter::new(flash, pro),
+            provider_router: Arc::new(std::sync::RwLock::new(ProviderRouter::new(flash, pro))),
             tool_executor: Arc::new(std::sync::Mutex::new(None)),
             memory: None,
             checkpoint_store: None,
@@ -92,6 +94,16 @@ impl Agent {
             event_sender: None,
             sub_agent_rx: None,
         }
+    }
+
+    /// 运行时热切换 flash/pro provider（模型注册表激活新模型时调用）。
+    /// 进行中的请求继续用旧 provider 完成，新请求立即生效。
+    pub fn replace_providers(
+        &self,
+        flash: std::sync::Arc<dyn LlmProvider>,
+        pro: std::sync::Arc<dyn LlmProvider>,
+    ) {
+        *self.provider_router.write().unwrap() = ProviderRouter::new_arc(flash, pro);
     }
 
     pub fn with_tools(self, executor: ToolExecutor) -> Self {
@@ -157,8 +169,14 @@ impl Agent {
         self.self_improver.as_deref()
     }
 
-    pub fn router(&self) -> &ProviderRouter {
-        &self.provider_router
+    /// Owned provider handles (safe to hold across `.await`).
+    /// flash 用于简单任务，pro 用于复杂/推理任务。
+    pub fn flash_provider(&self) -> std::sync::Arc<dyn LlmProvider> {
+        self.provider_router.read().unwrap().flash_arc()
+    }
+
+    pub fn pro_provider(&self) -> std::sync::Arc<dyn LlmProvider> {
+        self.provider_router.read().unwrap().pro_arc()
     }
 
     pub fn memory(&self) -> Option<&MemoryManager> {
@@ -176,7 +194,11 @@ impl Agent {
         context: &RunContext,
         cancel: CancellationToken,
     ) -> Result<AgentDelta, AgentError> {
-        let provider = self.provider_router.select(context.complexity, context.provider_override);
+        let provider = self
+            .provider_router
+            .read()
+            .unwrap()
+            .select_arc(context.complexity, context.provider_override);
         let mut inference_config = Self::config_for_complexity(context.complexity);
         if let Some(max_tokens) = context.max_tokens {
             inference_config.max_tokens = Some(max_tokens.min(393216));
@@ -794,7 +816,9 @@ impl Agent {
 
         let provider = self
             .provider_router
-            .select(TaskComplexity::Simple, None);
+            .read()
+            .unwrap()
+            .select_arc(TaskComplexity::Simple, None);
 
         let request = CompletionRequest {
             system: "You are a context summarizer. Extract key findings, tool results, \

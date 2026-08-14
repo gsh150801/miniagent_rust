@@ -16,3 +16,4 @@ scripts/
 .zcode/
 __pycache__/
 stdout.txt
+models.json

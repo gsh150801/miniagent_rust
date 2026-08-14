@@ -4,9 +4,33 @@
 //! mid-generation. These helpers normalise and repair such output so that
 //! `serde_json::from_str` has the best chance of succeeding.
 
+/// Remove `<think>...</think>` reasoning blocks from model output.
+///
+/// Reasoning-style models (DeepSeek reasoner, MiniMax M3, …) may emit chain-of-
+/// thought inline. When raw output is used *as data* (e.g. a search query, a
+/// file path, a script), the reasoning must be stripped first or downstream
+/// systems receive truncated thinking text. Handles both closed blocks and an
+/// unterminated `<think>` prefix (truncation mid-reasoning).
+pub fn strip_reasoning_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        match after.find("</think>") {
+            Some(end) => rest = &after[end + "</think>".len()..],
+            None => {
+                // Unterminated reasoning block: drop everything after it.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 /// Strip ```` ```json ```` / ```` ``` ```` markdown fences surrounding JSON.
-pub fn strip_markdown_fences(s: &str) -> String {
-    let trimmed = s.trim();
+pub fn strip_markdown_fences(s: &str) -> String {    let trimmed = s.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return trimmed.to_string();
     };
@@ -132,7 +156,7 @@ pub fn extract_json_object(text: &str) -> Option<String> {
 /// Convenience for the common case where an LLM response contains
 /// fenced, possibly-truncated JSON among other text.
 pub fn extract_and_repair(text: &str) -> String {
-    let cleaned = strip_markdown_fences(text);
+    let cleaned = strip_markdown_fences(&strip_reasoning_tags(text));
     let repaired = fix_truncated_json(&cleaned);
     extract_json_object(&repaired).unwrap_or_else(|| repaired.trim().to_string())
 }
@@ -140,6 +164,33 @@ pub fn extract_and_repair(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_reasoning_closed() {
+        assert_eq!(
+            strip_reasoning_tags("<think>reasoning here</think>actual query"),
+            "actual query"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_unterminated() {
+        // truncated mid-think: everything after <think> is dropped
+        assert_eq!(strip_reasoning_tags("prefix <think>half of a thou"), "prefix");
+    }
+
+    #[test]
+    fn test_strip_reasoning_multiple() {
+        assert_eq!(
+            strip_reasoning_tags("<think>a</think>x<think>b</think>y"),
+            "xy"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_none() {
+        assert_eq!(strip_reasoning_tags("  plain text  "), "plain text");
+    }
 
     #[test]
     fn test_strip_json_fence() {

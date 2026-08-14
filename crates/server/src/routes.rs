@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
     http::{StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -13,9 +13,8 @@ use miniagent_agent::Agent;
 use miniagent_agent::context::RunContext;
 use miniagent_core::config::{InferenceConfig, TaskComplexity};
 use miniagent_core::message::Message as AgentMessage;
-use miniagent_provider::deepseek::DeepSeekFlash;
-use miniagent_provider::stepfun::StepFunFlash;
-use miniagent_provider::minimax::MiniMaxFlash;
+use miniagent_core::models::{ModelKind, ModelProfile};
+use miniagent_provider::factory::{build_provider, build_provider_pair, ProviderTier};
 use miniagent_provider::traits::{CompletionRequest, LlmProvider, StreamChunk};
 use miniagent_core::types::StageId;
 use miniagent_workflow::builder::{WorkflowBuilder, WorkflowSpec, StageSpec};
@@ -64,6 +63,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/metrics", get(metrics_handler))
         .route("/api/run", post(run_handler))
         .route("/api/resume", post(resume_handler))
+        // Runtime LLM model registry (add / select / delete models)
+        .route("/api/models", get(models_handler).post(add_model_handler))
+        .route("/api/models/{id}", axum::routing::put(update_model_handler).delete(delete_model_handler))
+        .route("/api/models/{id}/activate", post(activate_model_handler))
         .with_state(state)
 }
 
@@ -1011,11 +1014,19 @@ async fn handle_run(
     file_ids: Vec<String>,
     existing_task_id: Option<String>,
 ) {
-    let api_key = state.config.require_active_key().unwrap_or_else(|e| {
-        // This should not happen — server validates key at startup
-        eprintln!("FATAL: {e}");
-        std::process::exit(1);
-    });
+    // Resolve the active model profile once per task; every stage provider
+    // is built from it (no hardcoded model names anywhere).
+    let active_profile = state.models.read().unwrap().active().clone();
+    let (_flash_provider, pro_provider) = match build_provider_pair(&active_profile) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error",
+                "message": format!("当前模型配置不可用: {e}"),
+            })).await;
+            return;
+        }
+    };
     let agent_arc = state.agent.clone();
 
     let (task_id, task_brief, task_dir, task_workflow_dir) =
@@ -1052,13 +1063,8 @@ async fn handle_run(
     })).await;
 
     // Explore：用 planner provider 分析问题，提取关键上下文
-    let explore_provider: Box<dyn LlmProvider> = if state.config.is_minimax() {
-        Box::new(MiniMaxFlash::new(api_key))
-    } else if state.config.is_stepfun() {
-        Box::new(StepFunFlash::new(api_key))
-    } else {
-        Box::new(DeepSeekFlash::new(api_key))
-    };
+    let explore_provider: Box<dyn LlmProvider> =
+        build_provider(&active_profile, ProviderTier::Flash).expect("validated above");
     let explore_ctx = miniagent_core::config::InferenceConfig {
         temperature: Some(0.3), max_tokens: Some(2000), ..Default::default()
     };
@@ -1126,13 +1132,8 @@ async fn handle_run(
     })).await;
 
     // Plan via LLM（根据 PROVIDER 配置选择 provider，尊重 PROVIDER=stepfun）
-    let planner_flash: Box<dyn LlmProvider> = if state.config.is_minimax() {
-        Box::new(MiniMaxFlash::new(api_key))
-    } else if state.config.is_stepfun() {
-        Box::new(StepFunFlash::new(api_key))
-    } else {
-        Box::new(DeepSeekFlash::new(api_key))
-    };
+    let planner_flash: Box<dyn LlmProvider> =
+        build_provider(&active_profile, ProviderTier::Flash).expect("validated above");
     let planner = PlannerStage::new(planner_flash);
     let plan_ctx = StageContext::new(
         StageId::new(),
@@ -1296,7 +1297,7 @@ async fn handle_run(
         // Multi-stage: run all stages except the last with progress,
         // then stream the final synthesis stage directly.
         run_multi_stage_with_streaming(
-            socket, workflow, &spec, &task_workflow_dir, api_key,
+            socket, workflow, &spec, &task_workflow_dir, pro_provider.clone(),
             &task_id, &task_brief, &task_dir, state, &agent_arc, cancel,
         ).await;
     } else {
@@ -1321,13 +1322,8 @@ async fn handle_run(
     };
 
     // Provider for validator/arbiter/feedback
-    let feedback_provider: Box<dyn LlmProvider> = if state.config.is_minimax() {
-        Box::new(MiniMaxFlash::new(api_key))
-    } else if state.config.is_stepfun() {
-        Box::new(StepFunFlash::new(api_key))
-    } else {
-        Box::new(DeepSeekFlash::new(api_key))
-    };
+    let feedback_provider: Box<dyn LlmProvider> =
+        build_provider(&active_profile, ProviderTier::Flash).expect("validated above");
 
     // ── 三角色逐 stage 校验（接入 execute_with_roles 的 Validator+Arbiter）──
     // 对每个 stage 产物做 Validator 校验 + Arbiter 决策
@@ -1557,7 +1553,7 @@ async fn run_multi_stage_with_streaming(
     workflow: miniagent_workflow::Workflow,
     spec: &WorkflowSpec,
     task_workflow_dir: &StdPath,
-    api_key: &miniagent_core::secrets::ApiKey,
+    pro_provider: std::sync::Arc<dyn LlmProvider>,
     task_id: &str,
     task_brief: &str,
     task_dir: &StdPath,
@@ -1659,7 +1655,7 @@ async fn run_multi_stage_with_streaming(
 
             if !response_text.is_empty() {
                 // Stream the synthesis text token by token via the pro model
-                let stream_result = stream_synthesis(socket, api_key, &response_text, state.config.is_minimax(), state.config.is_stepfun(), cancel).await;
+                let stream_result = stream_synthesis(socket, pro_provider.clone(), &response_text, cancel).await;
                 if !stream_result {
                     // Fallback: send as one chunk
                     let _ = ws_send(socket, serde_json::json!({
@@ -1751,19 +1747,11 @@ fn filter_thinking_tags(text: &str, in_thinking: &mut bool, buf: &mut String) ->
 /// Re-stream synthesis text through provider.stream() for real token-by-token output.
 async fn stream_synthesis(
     socket: &Arc<Mutex<WsSink>>,
-    api_key: &miniagent_core::secrets::ApiKey,
+    pro_provider: std::sync::Arc<dyn LlmProvider>,
     synthesis_text: &str,
-    is_minimax: bool,
-    is_stepfun: bool,
     cancel: CancellationToken,
 ) -> bool {
-    let pro: Box<dyn LlmProvider> = if is_minimax {
-        Box::new(MiniMaxFlash::new(api_key))
-    } else if is_stepfun {
-        Box::new(StepFunFlash::new(api_key))
-    } else {
-        Box::new(miniagent_provider::deepseek::DeepSeekPro::new(api_key))
-    };
+    let pro = pro_provider;
     let request = CompletionRequest {
         system: "You are presenting final research output. Output the following text faithfully, maintaining all structure and content. Do not add or remove information.".into(),
         messages: vec![AgentMessage::user(format!("Present this output:\n\n{synthesis_text}"))],
@@ -2302,5 +2290,193 @@ fn sanitize_task_brief(prompt: &str) -> String {
         "task".into()
     } else {
         brief.into()
+    }
+}
+
+// ── Model registry API（运行时 LLM 管理：列表/添加/修改/删除/切换）──
+
+/// UI-safe view of a ModelProfile: the API key is always masked.
+#[derive(Debug, Serialize)]
+struct ModelProfileView {
+    id: String,
+    display_name: String,
+    kind: String,
+    kind_label: String,
+    base_url: String,
+    model_name: String,
+    pro_model_name: Option<String>,
+    api_key_masked: String,
+    has_key: bool,
+    builtin: bool,
+}
+
+impl From<&ModelProfile> for ModelProfileView {
+    fn from(p: &ModelProfile) -> Self {
+        Self {
+            id: p.id.clone(),
+            display_name: p.display_name.clone(),
+            kind: serde_json::to_string(&p.kind).unwrap_or_default().trim_matches('"').to_string(),
+            kind_label: p.kind.label().to_string(),
+            base_url: p.base_url.clone(),
+            model_name: p.model_name.clone(),
+            pro_model_name: p.pro_model_name.clone(),
+            api_key_masked: p.masked_key(),
+            has_key: p.resolve_key().is_some(),
+            builtin: p.builtin,
+        }
+    }
+}
+
+async fn models_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.models.read().unwrap();
+    Json(serde_json::json!({
+        "active_id": reg.active_id(),
+        "models": reg.list().iter().map(|p| ModelProfileView::from(*p)).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AddModelRequest {
+    display_name: String,
+    /// One of: deepseek | stepfun | minimax | openai_compatible | anthropic_compatible
+    kind: String,
+    #[serde(default)]
+    base_url: String,
+    model_name: String,
+    #[serde(default)]
+    pro_model_name: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Optional env-var name to resolve the key from instead of a literal key.
+    #[serde(default)]
+    api_key_env: Option<String>,
+}
+
+async fn add_model_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AddModelRequest>,
+) -> Response {
+    let kind = match ModelKind::from_str_loose(&req.kind) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("未知模型类型: {}", req.kind)})),
+            ).into_response()
+        }
+    };
+    if req.display_name.trim().is_empty() || req.model_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "名称和模型名不能为空"})),
+        ).into_response();
+    }
+    if req.api_key.as_deref().map_or(true, |k| k.is_empty())
+        && req.api_key_env.as_deref().map_or(true, |v| v.is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "必须提供 API key 或 key 的环境变量名"})),
+        ).into_response();
+    }
+    let default_url = match kind {
+        ModelKind::DeepSeek => "https://api.deepseek.com",
+        ModelKind::StepFun => "https://api.stepfun.com/step_plan/v1",
+        ModelKind::MiniMax => "https://api.minimaxi.com/v1",
+        ModelKind::OpenAiCompatible | ModelKind::AnthropicCompatible => "",
+    };
+    let profile = ModelProfile {
+        id: String::new(),
+        display_name: req.display_name.trim().to_string(),
+        kind,
+        base_url: if req.base_url.trim().is_empty() {
+            default_url.to_string()
+        } else {
+            req.base_url.trim().trim_end_matches('/').to_string()
+        },
+        model_name: req.model_name.trim().to_string(),
+        pro_model_name: req.pro_model_name.filter(|s| !s.trim().is_empty()),
+        api_key: req.api_key.filter(|k| !k.is_empty()),
+        api_key_env: req.api_key_env.filter(|v| !v.is_empty()),
+        builtin: false,
+    };
+    // Validate constructability before persisting.
+    if let Err(e) = build_provider(&profile, ProviderTier::Flash) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    let mut reg = state.models.write().unwrap();
+    let id = reg.add(profile);
+    let view = reg.get(&id).map(ModelProfileView::from);
+    (StatusCode::CREATED, Json(serde_json::json!({"id": id, "model": view}))).into_response()
+}
+
+async fn update_model_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddModelRequest>,
+) -> Response {
+    let kind = match ModelKind::from_str_loose(&req.kind) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("未知模型类型: {}", req.kind)})),
+            ).into_response()
+        }
+    };
+    let patch = ModelProfile {
+        id: id.clone(),
+        display_name: req.display_name,
+        kind,
+        base_url: req.base_url,
+        model_name: req.model_name,
+        pro_model_name: req.pro_model_name,
+        api_key: req.api_key,
+        api_key_env: req.api_key_env,
+        builtin: false,
+    };
+    let mut reg = state.models.write().unwrap();
+    match reg.update(&id, patch) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn delete_model_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let mut reg = state.models.write().unwrap();
+    match reg.remove(&id) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Switch the active model: persists the selection and hot-swaps the shared
+/// Agent's providers. In-flight requests finish on the old provider; new
+/// requests pick up the new one immediately.
+async fn activate_model_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let (profile, set_result) = {
+        let mut reg = state.models.write().unwrap();
+        match reg.set_active(&id) {
+            Ok(()) => (reg.active().clone(), ()),
+            Err(e) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+        }
+    };
+    let _ = set_result;
+    match build_provider_pair(&profile) {
+        Ok((flash, pro)) => {
+            state.agent.replace_providers(flash, pro);
+            tracing::info!(
+                model = %profile.model_name,
+                profile = %profile.display_name,
+                "active model switched"
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "active_id": id}))).into_response()
+        }
+        Err(e) => {
+            // Roll back the persisted selection so UI state stays consistent.
+            let mut reg = state.models.write().unwrap();
+            let _ = reg.set_active(&profile.id);
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response()
+        }
     }
 }

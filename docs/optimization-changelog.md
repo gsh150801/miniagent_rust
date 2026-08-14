@@ -2218,3 +2218,48 @@ Ran 3 tests in 0.000s  OK
   从本地历史中彻底清除（重写后经 `git log -S` 验证为空）；该 key 已失效（订阅过期）仍建议作废处理。
 - `.env`（含 anysearch key）确认被 gitignore；`ANYSEARCH_API_KEY` 仅存在于 `.env`。
 - `.gitignore` 补充 `.worktrees/`、`__pycache__/`、`.zcode/`、`stdout.txt`。
+
+---
+
+## Round 34: 运行时模型注册表 + 验证门（DeepSeek harness 思想借鉴）
+
+### 任务背景
+
+四任务循环：① 去除硬编码模型名、前端/后端支持添加与切换 LLM、端到端首跑总结不足；② 借鉴 DeepSeek harness（dsh）设计思想做针对性修改；③ 阿尔兹海默症端到端回归；④ 硬编码密钥审计后更新 GitHub。
+
+### 任务一：模型注册表（去除硬编码模型名）
+
+**核心改动**：新增 `crates/core/src/models.rs` `ModelRegistry` —— 模型配置档案（`ModelProfile`）注册表：
+
+- **档案来源**：内置档案（从 `.env`/`AppConfig` 派生 deepseek/stepfun/minimax 三条）+ 自定义档案（`models.json` 持久化，已加入 `.gitignore`，含 API key）。
+- **协议族**（`ModelKind`）：deepseek / stepfun / minimax / openai_compatible / anthropic_compatible。后两者由 `MiniMaxClient` 双协议自动检测承载（OpenAI Chat Completions + Anthropic Messages），任意兼容端点（SiliconFlow/OpenRouter/vLLM…）即插即用。
+- **工厂**（`crates/provider/src/factory.rs`）：`build_provider(profile, tier)` 单一构造入口；`with_model_name`/`with_base_url` 强制覆盖，env 变量不再能悄悄覆盖显式选择。模型名默认值**只存在于** `ModelRegistry::builtin_profiles` 一处。
+- **热切换**：`Agent.provider_router` 改为 `Arc<RwLock<ProviderRouter>>`，新增 `Agent::replace_providers()` —— `ProviderRouter` 内部字段改 `Arc<dyn LlmProvider>` 并新增 `select_arc/flash_arc/pro_arc`（owned 句柄，可跨 await）。进行中请求用旧 provider 收尾，新请求立即生效。
+- **Server API**：`GET/POST /api/models`、`PUT/DELETE /api/models/{id}`、`POST /api/models/{id}/activate`。响应中 key 永远掩码（`ApiKey::masked`）；激活时先验证可构造性，失败回滚选择。routes.rs 中 4 处按 `is_minimax()/is_stepfun()` 分支构造 provider 的代码全部改为每任务从 active profile 构造。
+- **前端**：header 模型下拉选择器 + ⚙ 管理弹窗（列表/使用中徽标/添加表单/删除），连接建立时 `loadModels()` 拉取。
+- CLI `make_providers` 同步走注册表；`miniagent-server.rs` 的 `unwrap_or("step-3.7-flash")` 硬编码 fallback 与 minimax 分支缺失问题一并消除。
+
+### 任务一端到端首跑暴露的缺陷（帕金森病 6 篇）
+
+1. **`<think>` 标签污染数据管道**（MiniMax-M3 等推理模型内联 CoT）：查询翻译输出带截断的 think 块被直接当 PubMed 查询 → **0 检索结果，流水线空跑仍报 Complete**。
+2. **KG 抽取静默失败**：`serde_json::from_str(json_str).unwrap_or_default()` 解析失败变成空 JSON → 6 篇论文全部"0 实体"，无任何告警。
+3. **无阶段验证门**：上游产出为空时下游全部 skip 但进程 exit 0，审计上"成功"实为空跑。
+4. server 启动二进制缺 `PROVIDER=minimax` 分支（本轮注册表重构顺带修复）。
+
+### 任务二：借鉴的 dsh 设计思想与落地
+
+| dsh / harness engineering 思想 | 落地修改 |
+|---|---|
+| Everything is a plugin（模型适配器可插拔） | ModelRegistry + provider factory：LLM 成为运行时可增删切换的插件，配置组合而非改码 |
+| Self-verification / PreCompletionCheck（完成前强制校验产物） | research 流水线两个验证门：Phase 1 检索 0 PMID、Phase 3 非空语料 0 实体 → manifest 记 Failed + `stage_validation_failed` 事件 + 明确报错中止，不再静默"完成" |
+| Append-only session log（一切可审计可重放） | 验证门失败写入 `project.json` event_log；KG 解析失败打印 PMID + 输出头部 160 字符 |
+| Fail loudly（禁止静默默认值吞错） | KG 抽取 `unwrap_or_default()` → 显式 match + 告警日志；`extract_and_repair` 全链路 think-safe |
+| 输出 sanitization 是 harness 责任而非模型责任 | `strip_reasoning_tags()`（core::json_util，处理闭合/未闭合 think 块）应用于：查询翻译、`extract_and_repair`（覆盖 hypothesis/debate 全部 JSON 解析）、分析脚本提取 |
+| Reasoning-compute allocation（flash/pro 分层） | 既有 ProviderRouter 分层保持；注册表档案支持 flash/pro 双模型名 |
+| Runtime modes/presets | 未落地（既有 `-n/--top-n/--debate` 参数组合已可调；列为后续项） |
+
+### 验证
+
+- `cargo test --workspace` 通过；新增 `strip_reasoning_tags`、`ModelKind` 解析、factory 构造单测。
+- server 冒烟：`/api/models` 列表（key 掩码）→ 添加自定义模型 → 激活热切换 → 删除保护（使用中不可删）→ `models.json` 持久化往返。
+- research 端到端（帕金森 6 篇）：修复后 42 实体/56 关系 → 5 假说 → 辩论 → 2 验证计划 → 7 个分析任务（notebook 生成；有 Jupyter 环境的真实执行，无本地数据的 dry-run 交付 script+notebook）。

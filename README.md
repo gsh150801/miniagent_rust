@@ -65,7 +65,7 @@
 ### 环境要求 / Prerequisites
 
 - Rust 1.85+
-- DeepSeek API key
+- 任一 LLM API key（DeepSeek / StepFun / MiniMax，或任意 OpenAI/Anthropic 兼容端点）
 
 ### 安装 / Setup
 
@@ -252,7 +252,11 @@ priority: 5
 
 | 变量 Variable | 默认 Default | 说明 Description |
 |--------------|-------------|----------------|
-| `DEEPSEEK_API_KEY` | 必填 | DeepSeek API 密钥 |
+| `DEEPSEEK_API_KEY` | 必填* | DeepSeek API 密钥 |
+| `PROVIDER` | `deepseek` | 启动时激活的内置模型档案（deepseek/stepfun/minimax） |
+
+\* 运行时可在 Web UI（页眉下拉框 → ⚙ 管理弹窗）添加自定义模型（OpenAI/Anthropic 兼容端点）
+并热切换，无需重启；自定义档案持久化在 `models.json`（已 gitignore）。
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 基础 URL |
 | `BOCHA_API_KEY` | 可选 | Bocha 搜索 API |
 | `TAVILY_API_KEY` | 可选 | Tavily 搜索 API |

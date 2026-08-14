@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use miniagent_agent::Agent;
 use miniagent_checkpoint::CheckpointStore;
+use miniagent_core::models::ModelRegistry;
 use miniagent_core::settings::AppConfig;
 use miniagent_memory::manager::MemoryManager;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,9 @@ pub struct AppState {
     pub tasks: Arc<DashMap<String, TaskInfo>>,
     pub task_dir: PathBuf,
     pub config: Arc<AppConfig>,
+    /// Runtime LLM model registry (built-ins from env + customs from
+    /// models.json). RwLock: /api/models handlers mutate; task paths read.
+    pub models: Arc<std::sync::RwLock<ModelRegistry>>,
     /// Per-task cancellation tokens, keyed by task_id.
     pub cancels: Arc<DashMap<String, CancellationToken>>,
     /// Per-task ask reply channels: 当 task 执行需要向用户提问时，注册一个 oneshot::Sender；
@@ -53,6 +57,7 @@ pub struct TaskInfo {
 
 impl AppState {
     pub fn new(agent: Arc<Agent>, config: Arc<AppConfig>) -> Self {
+        let models = ModelRegistry::load(&config);
         Self {
             agent,
             memory: None,
@@ -60,6 +65,7 @@ impl AppState {
             tasks: Arc::new(DashMap::new()),
             task_dir: PathBuf::from("./result"),
             config,
+            models: Arc::new(std::sync::RwLock::new(models)),
             cancels: Arc::new(DashMap::new()),
             asks: Arc::new(DashMap::new()),
         }

@@ -40,6 +40,10 @@
       <button class="menu-btn" onclick="toggleSidebarMobile()">&#9776;</button>
       <div class="stage-pills" id="stagePills"></div>
       <h3 id="chatTitle"></h3>
+      <div class="model-select-wrap" id="modelSelectWrap" title="切换 LLM 模型">
+        <select id="modelSelect" onchange="onModelSelectChange(this.value)"></select>
+        <button class="btn-header" onclick="openModelModal()" title="管理模型配置" style="width:30px;height:30px;font-size:14px">&#9881;</button>
+      </div>
       <button class="btn-cancel" id="btnCancel" onclick="cancelTask()" title="Cancel running task">&#9632; Stop</button>
       <button class="btn-header" id="btnToggleRight" onclick="toggleRightPanel()" title="Toggle progress / files panel">&#9776;&#9776;</button>
     </div>
@@ -110,6 +114,57 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- ── Model management modal（添加 / 选择 / 删除 LLM）── -->
+<div class="modal-overlay" id="modelModal" onclick="if(event.target===this)closeModelModal()">
+  <div class="modal-dialog">
+    <div class="modal-head">
+      <h3>模型管理</h3>
+      <button class="preview-close" onclick="closeModelModal()" title="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div id="modelList" class="model-list"></div>
+      <div class="model-form-head" onclick="toggleModelForm()">
+        <span>+ 添加自定义模型（OpenAI / Anthropic 兼容端点）</span>
+        <span id="modelFormChevron">&#9660;</span>
+      </div>
+      <div class="model-form" id="modelForm" style="display:none">
+        <div class="form-row">
+          <label>名称</label>
+          <input id="mfName" type="text" placeholder="例如: SiliconFlow GLM">
+        </div>
+        <div class="form-row">
+          <label>类型</label>
+          <select id="mfKind">
+            <option value="openai_compatible">OpenAI 兼容</option>
+            <option value="anthropic_compatible">Anthropic 兼容</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="stepfun">StepFun</option>
+            <option value="minimax">MiniMax</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Base URL</label>
+          <input id="mfBaseUrl" type="text" placeholder="https://api.example.com/v1（留空用类型默认值）">
+        </div>
+        <div class="form-row">
+          <label>模型名</label>
+          <input id="mfModel" type="text" placeholder="例如: glm-4.7">
+        </div>
+        <div class="form-row">
+          <label>Pro 模型名<small>（可选，复杂任务用）</small></label>
+          <input id="mfProModel" type="text" placeholder="留空则与模型名相同">
+        </div>
+        <div class="form-row">
+          <label>API Key</label>
+          <input id="mfKey" type="password" placeholder="sk-...">
+        </div>
+        <button class="btn-model-add" onclick="addModel()">添加</button>
+        <p class="form-hint">Key 保存在服务端 models.json（已 gitignore），不会出现在代码仓库中。</p>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="/marked.min.js"></script>
 <script src="/app.js"></script>

@@ -245,6 +245,13 @@ impl DeepSeekClient {
         self
     }
 
+    /// Force-override the model name, bypassing any env-var override.
+    /// Used by the model-profile registry so explicit selections always win.
+    pub fn with_model_name(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     pub fn with_thinking_budget(mut self, tokens: u32) -> Self {
         self.thinking_budget = tokens;
         self

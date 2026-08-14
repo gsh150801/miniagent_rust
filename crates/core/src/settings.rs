@@ -25,7 +25,7 @@ pub struct AppConfig {
     pub stepfun_base_url: String,
     pub stepfun_model_name: Option<String>,
 
-    // ── MiniMax (Token-Plan subscription, Anthropic-compatible API) ──
+    // ── MiniMax (Token-Plan subscription, OpenAI-compatible API) ──
     pub minimax_api_key: Option<ApiKey>,
     pub minimax_base_url: String,
     pub minimax_model_name: Option<String>,
@@ -106,7 +106,7 @@ impl AppConfig {
 
             minimax_api_key: ApiKey::from_env("MINIMAX_API_KEY"),
             minimax_base_url: Self::var("MINIMAX_BASE_URL")
-                .unwrap_or_else(|| "https://api.minimaxi.com/anthropic".into()),
+                .unwrap_or_else(|| "https://api.minimaxi.com/v1".into()),
             minimax_model_name: Self::var("MINIMAX_MODEL_NAME"),
 
             bocha_api_key: ApiKey::from_env("BOCHA_API_KEY"),

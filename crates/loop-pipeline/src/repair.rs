@@ -90,7 +90,7 @@ Task ID: {task_id}
                 error_output = result.error.as_deref().unwrap_or("No error details"),
             );
 
-            let provider = ctx.agent.router().pro();
+            let provider = ctx.agent.pro_provider();
             let request = CompletionRequest {
                 system: format!("You are an expert failure analyst. {} Diagnose issues and suggest fixes. Output ONLY valid JSON.", miniagent_core::context_info::date_hint()),
                 messages: vec![Message::user(&prompt)],

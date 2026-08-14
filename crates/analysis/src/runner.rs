@@ -389,8 +389,9 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             .collect::<Vec<_>>()
             .join("");
 
-        // Strip markdown fences if the model added them despite instructions.
-        Ok(json_util::strip_markdown_fences(&text).trim().to_string())
+        // Strip reasoning tags + markdown fences if the model added them
+        // despite instructions (reasoning models emit <think> inline).
+        Ok(json_util::strip_markdown_fences(&json_util::strip_reasoning_tags(&text)).trim().to_string())
     }
 
     #[allow(clippy::too_many_arguments)]

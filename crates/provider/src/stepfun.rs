@@ -208,6 +208,13 @@ impl StepFunClient {
         self
     }
 
+    /// Force-override the model name, bypassing any env-var override.
+    /// Used by the model-profile registry so explicit selections always win.
+    pub fn with_model_name(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     /// Build a proxy from standard environment variables.
     /// Checks `ALL_PROXY` / `all_proxy` → `HTTPS_PROXY` / `https_proxy` → `HTTP_PROXY` / `http_proxy`.
     fn proxy_from_env() -> Option<String> {

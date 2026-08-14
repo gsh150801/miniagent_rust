@@ -28,7 +28,7 @@ function connect() {
   setConnState('connecting');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
-  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); };
+  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); loadModels(); };
   ws.onmessage = (e) => {
     try { handleMsg(JSON.parse(e.data)); }
     catch(err) { handleMsg({ type: 'stream', text: e.data }); }
@@ -1381,3 +1381,146 @@ function md(text) {
 renderProgressView();
 renderFilesView();
 connect();
+
+// ── Model registry（运行时 LLM 添加 / 选择）──
+let modelState = { activeId: null, models: [] };
+
+async function loadModels() {
+  try {
+    const res = await fetch('/api/models');
+    if (!res.ok) return;
+    const data = await res.json();
+    modelState = { activeId: data.active_id, models: data.models || [] };
+    renderModelSelect();
+  } catch (e) { /* server offline — selector stays empty */ }
+}
+
+function renderModelSelect() {
+  const sel = document.getElementById('modelSelect');
+  if (!sel) return;
+  const prev = modelState.activeId;
+  sel.innerHTML = '';
+  for (const m of modelState.models) {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = `${m.display_name} · ${m.model_name}`;
+    if (m.id === modelState.activeId) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  if (prev !== modelState.activeId) loadModelsIfNeeded();
+}
+
+function loadModelsIfNeeded() { /* hook for future lazy refresh */ }
+
+async function onModelSelectChange(id) {
+  if (!id || id === modelState.activeId) return;
+  try {
+    const res = await fetch(`/api/models/${encodeURIComponent(id)}/activate`, { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(data.error || '切换模型失败', true);
+      await loadModels();
+      return;
+    }
+    modelState.activeId = id;
+    showToast('已切换模型: ' + (modelState.models.find(m => m.id === id)?.display_name || id), false, 'success');
+  } catch (e) {
+    showToast('切换模型失败: ' + e.message, true);
+  }
+}
+
+function openModelModal() {
+  renderModelList();
+  document.getElementById('modelModal').style.display = 'flex';
+}
+function closeModelModal() {
+  document.getElementById('modelModal').style.display = 'none';
+}
+function toggleModelForm() {
+  const form = document.getElementById('modelForm');
+  const chev = document.getElementById('modelFormChevron');
+  const open = form.style.display !== 'none';
+  form.style.display = open ? 'none' : 'block';
+  chev.textContent = open ? '\u25BC' : '\u25B2';
+}
+
+function renderModelList() {
+  const wrap = document.getElementById('modelList');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  for (const m of modelState.models) {
+    const row = document.createElement('div');
+    row.className = 'model-row' + (m.id === modelState.activeId ? ' active' : '');
+    const info = document.createElement('div');
+    info.className = 'model-row-info';
+    info.innerHTML = `
+      <div class="model-row-name">${esc(m.display_name)}${m.id === modelState.activeId ? ' <span class="model-badge">使用中</span>' : ''}</div>
+      <div class="model-row-meta">${esc(m.kind_label)} · ${esc(m.model_name)}${m.pro_model_name ? ' / ' + esc(m.pro_model_name) : ''} · ${esc(m.base_url)}</div>
+      <div class="model-row-key">key: ${esc(m.api_key_masked)}</div>`;
+    const ops = document.createElement('div');
+    ops.className = 'model-row-ops';
+    if (m.id !== modelState.activeId) {
+      const use = document.createElement('button');
+      use.textContent = '使用';
+      use.className = 'btn-model-use';
+      use.onclick = () => onModelSelectChange(m.id).then(loadModels).then(renderModelList);
+      ops.appendChild(use);
+    }
+    if (!m.builtin) {
+      const del = document.createElement('button');
+      del.textContent = '删除';
+      del.className = 'btn-model-del';
+      del.onclick = async () => {
+        if (!confirm(`删除模型配置 "${m.display_name}"？`)) return;
+        const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { showToast(data.error || '删除失败', true); return; }
+        await loadModels();
+        renderModelList();
+      };
+      ops.appendChild(del);
+    }
+    row.appendChild(info);
+    row.appendChild(ops);
+    wrap.appendChild(row);
+  }
+}
+
+async function addModel() {
+  const name = document.getElementById('mfName').value.trim();
+  const kind = document.getElementById('mfKind').value;
+  const baseUrl = document.getElementById('mfBaseUrl').value.trim();
+  const modelName = document.getElementById('mfModel').value.trim();
+  const proModel = document.getElementById('mfProModel').value.trim();
+  const apiKey = document.getElementById('mfKey').value.trim();
+  if (!name || !modelName) { showToast('名称和模型名不能为空', true); return; }
+  if (!apiKey) { showToast('API Key 不能为空', true); return; }
+  try {
+    const res = await fetch('/api/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        display_name: name, kind, base_url: baseUrl, model_name: modelName,
+        pro_model_name: proModel || null, api_key: apiKey,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '添加失败', true); return; }
+    document.getElementById('mfName').value = '';
+    document.getElementById('mfBaseUrl').value = '';
+    document.getElementById('mfModel').value = '';
+    document.getElementById('mfProModel').value = '';
+    document.getElementById('mfKey').value = '';
+    showToast('模型已添加', false, 'success');
+    await loadModels();
+    renderModelList();
+  } catch (e) {
+    showToast('添加失败: ' + e.message, true);
+  }
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}

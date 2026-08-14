@@ -12,49 +12,25 @@ use miniagent_provider::router::ProviderChoice;
 use miniagent_provider::traits::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
-/// 根据 `config.is_stepfun()` 构造 (flash, pro) provider 对。
+/// 构造 (flash, pro) provider 对，由模型注册表（ModelRegistry）决定具体模型。
 ///
-/// 所有 CLI 命令应通过此函数获取 provider，而非硬编码 `DeepSeekFlash`/`DeepSeekPro`。
-/// 这样 `PROVIDER=stepfun`（.env）能正确路由到 StepFun provider，而非用占位符
-/// DeepSeek key 调 API 导致 401。
-///
-/// StepFun 当前只有单一模型（`step-3.7-flash`），故 flash 和 pro 都用 StepFunFlash
-/// （`ProviderRouter` 会按 complexity 选其中一个，StepFun 不区分 flash/pro 也没问题）。
+/// 注册表 = .env 内置档案（deepseek/stepfun/minimax）+ models.json 自定义档案。
+/// 所有 CLI 命令应通过此函数获取 provider —— 代码中不出现硬编码模型名。
 fn make_providers(config: &AppConfig) -> (Box<dyn LlmProvider>, Box<dyn LlmProvider>) {
-    if config.is_stepfun() {
-        let key = config.require_stepfun_key()
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-        (
-            Box::new(StepFunFlash::new(key)),
-            Box::new(StepFunFlash::new(key)),
-        )
-    } else if config.is_minimax() {
-        let key = config.require_minimax_key()
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-        // MiniMax exposes one M-series model; both tiers map to it.
-        (
-            Box::new(MiniMaxFlash::new(key)),
-            Box::new(MiniMaxFlash::new(key)),
-        )
-    } else {
-        let key = config.require_deepseek_key()
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            });
-        (
-            Box::new(DeepSeekFlash::new(key)),
-            Box::new(DeepSeekPro::new(key)),
-        )
+    let registry = miniagent_core::models::ModelRegistry::load(config);
+    let active = registry.active().clone();
+    use miniagent_provider::factory::{build_provider, ProviderTier};
+    match (
+        build_provider(&active, ProviderTier::Flash),
+        build_provider(&active, ProviderTier::Pro),
+    ) {
+        (Ok(flash), Ok(pro)) => (flash, pro),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
 }
-
 
 // ── CLI ──────────────────────────────────────────────────────
 
@@ -619,11 +595,14 @@ async fn run_command(
         cancel_clone.cancel();
     });
 
-    let provider_name = match provider.as_str() {
-        "flash" => "DeepSeek Flash",
-        "pro" => "DeepSeek Pro (reasoning)",
-        _ => "Unknown",
+    let registry = miniagent_core::models::ModelRegistry::load(&config);
+    let profile = registry.active().clone();
+    let provider_name = if provider == "pro" && profile.pro_model_name.is_some() {
+        format!("{} ({})", profile.display_name, profile.pro_model())
+    } else {
+        profile.display_name.clone()
     };
+    let provider_name = provider_name.as_str();
 
     let tool_count = agent
         .tool_executor()
@@ -1141,11 +1120,23 @@ async fn research_pipeline(
         };
         match flash.complete(&request, cancel.child_token()).await {
             Ok(resp) => {
-                let translated = resp.content.iter()
-                    .filter_map(|b| match b {
-                        miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    }).collect::<Vec<_>>().join("").trim().to_string();
+                let translated = miniagent_core::json_util::strip_reasoning_tags(
+                    &resp.content.iter()
+                        .filter_map(|b| match b {
+                            miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        }).collect::<Vec<_>>().join(""),
+                );
+                // Guard: a query that still looks like reasoning output (or is
+                // empty after stripping) falls back to the raw user query.
+                let translated = if translated.is_empty()
+                    || translated.contains('<')
+                    || translated.len() > 400
+                {
+                    query.to_string()
+                } else {
+                    translated
+                };
                 eprintln!("   Query translated: {query} → {translated}");
                 translated
             }
@@ -1214,6 +1205,23 @@ async fn research_pipeline(
     println!("   PubMed: {total_hits} total, {} retrieved ({} batches)",
         pmids.len(), batches_needed);
     let phase1_dur = phase_start.elapsed();
+
+    // Validation gate (harness self-verification): an empty retrieval makes
+    // every downstream stage meaningless. Record the failure for audit and
+    // abort instead of "completing" an empty run.
+    if pmids.is_empty() {
+        manifest.record_stage(
+            "search",
+            miniagent_research::StageStatus::Failed,
+            phase1_dur,
+            vec![],
+            Some(serde_json::json!({ "retrieved": 0, "total_hits": total_hits })),
+        );
+        manifest.log_event("stage_validation_failed", "search: 0 PMIDs retrieved — aborting (check query translation / PubMed connectivity)");
+        let _ = manifest.save();
+        eprintln!("\n❌ Pipeline aborted: PubMed returned 0 results. The translated query may be malformed — see project.json event_log.");
+        return;
+    }
     manifest.record_stage(
         "search",
         miniagent_research::StageStatus::Completed,
@@ -1430,6 +1438,26 @@ async fn research_pipeline(
     let mut kg = kg.unwrap_or_else(KnowledgeGraph::new);
 
     println!("\n   📊 KG: {} entities, {} relations", kg.entity_count(), kg.relation_count());
+
+    // Validation gate (harness self-verification): extraction returning an
+    // empty graph from a non-empty corpus means every LLM parse failed —
+    // fail loudly for auditability instead of skipping the rest silently.
+    if kg.entity_count() == 0 && !paper_texts.is_empty() && !manifest.is_stage_done("kg_extraction") {
+        manifest.record_stage(
+            "kg_extraction",
+            miniagent_research::StageStatus::Failed,
+            phase_start.elapsed(),
+            vec![kg_path.clone()],
+            Some(serde_json::json!({ "entities": 0, "papers": paper_texts.len() })),
+        );
+        manifest.log_event(
+            "stage_validation_failed",
+            format!("kg_extraction: 0 entities from {} papers — all LLM output parses failed", paper_texts.len()),
+        );
+        let _ = manifest.save();
+        eprintln!("\n❌ Pipeline aborted: KG extraction produced 0 entities from {} papers. See warnings above and project.json event_log.", paper_texts.len());
+        return;
+    }
 
     // Print KG as Mermaid
     println!("\n   ── Knowledge Graph (Mermaid) ──");
@@ -2185,11 +2213,20 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
             miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         }).collect::<Vec<_>>().join("");
-    let json_str = response_text.trim()
-        .trim_start_matches("```json").trim_start_matches("```")
-        .trim_end_matches("```");
-    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
-    Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed))
+    // extract_and_repair strips <think> blocks + markdown fences and repairs
+    // truncated JSON; silent unwrap_or_default used to turn any parse failure
+    // into an empty KG (0 entities) with no trace of why.
+    let repaired = miniagent_core::json_util::extract_and_repair(&response_text);
+    match serde_json::from_str::<serde_json::Value>(&repaired) {
+        Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
+        Err(e) => {
+            eprintln!(
+                "   ⚠ KG extraction parse failed for PMID {pmid}: {e}; output head: {:?}",
+                repaired.chars().take(160).collect::<String>()
+            );
+            Ok(parse_extraction_result(uuid::Uuid::new_v4(), &serde_json::Value::Null))
+        }
+    }
 }
 
 /// Serialize a KG (ids preserved) for resume + audit.

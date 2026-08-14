@@ -135,7 +135,7 @@ impl PipelineStage for EvaluateStage {
             failed_ids_json = failed_ids_json,
         );
 
-        let provider = ctx.agent.router().flash();
+        let provider = ctx.agent.flash_provider();
         let request = CompletionRequest {
             system: format!("You are a thorough evaluator. The current date is {}. Assess task completion objectively. Output ONLY valid JSON.", miniagent_core::context_info::date_hint()),
             messages: vec![Message::user(&prompt)],

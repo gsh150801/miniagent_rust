@@ -1,0 +1,325 @@
+//! Runtime LLM model registry.
+//!
+//! Replaces the old "one hardcoded model name per provider crate" scheme with
+//! a persisted set of [`ModelProfile`]s. Profiles come from two sources:
+//!
+//! * built-ins, derived from `AppConfig` / `.env` on startup (deepseek,
+//!   stepfun, minimax), and
+//! * user-defined ones, added at runtime via the server UI and persisted to
+//!   `models.json` in the working directory (gitignored — contains API keys).
+//!
+//! The active profile decides which provider/model every component uses, and
+//! can be switched at runtime without restarting the process.
+
+use crate::secrets::ApiKey;
+use crate::settings::AppConfig;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Where custom profiles + active selection are persisted.
+pub const MODELS_FILE: &str = "models.json";
+
+/// Protocol family of a profile. Determines which client implementation
+/// serves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// DeepSeek OpenAI-compatible API (flash/pro tier split).
+    DeepSeek,
+    /// StepFun plan API.
+    StepFun,
+    /// MiniMax (protocol auto-detected from base_url).
+    MiniMax,
+    /// Any OpenAI-compatible endpoint (siliconflow, openrouter, vllm, ...).
+    OpenAiCompatible,
+    /// Any Anthropic Messages-compatible endpoint.
+    AnthropicCompatible,
+}
+
+impl ModelKind {
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "deepseek" | "deep_seek" => Some(Self::DeepSeek),
+            "stepfun" | "step_fun" => Some(Self::StepFun),
+            "minimax" | "mini_max" => Some(Self::MiniMax),
+            "openai" | "openai_compatible" => Some(Self::OpenAiCompatible),
+            "anthropic" | "anthropic_compatible" => Some(Self::AnthropicCompatible),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::DeepSeek => "DeepSeek",
+            Self::StepFun => "StepFun",
+            Self::MiniMax => "MiniMax",
+            Self::OpenAiCompatible => "OpenAI 兼容",
+            Self::AnthropicCompatible => "Anthropic 兼容",
+        }
+    }
+}
+
+/// A single configurable LLM endpoint/model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    /// Stable identifier ("builtin-deepseek", "custom-<uuid8>", ...).
+    pub id: String,
+    /// Human-readable name shown in the UI.
+    pub display_name: String,
+    /// Protocol family.
+    pub kind: ModelKind,
+    /// API base URL (protocol derived from kind + URL for MiniMax).
+    pub base_url: String,
+    /// Model name sent to the API (flash tier).
+    pub model_name: String,
+    /// Optional separate pro/reasoning-tier model; defaults to `model_name`.
+    #[serde(default)]
+    pub pro_model_name: Option<String>,
+    /// API key. Built-ins resolve lazily from env; customs store it here
+    /// (models.json is gitignored).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Env var name to resolve the key from (built-ins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// True for built-in profiles (cannot be deleted via the UI).
+    #[serde(default)]
+    pub builtin: bool,
+}
+
+impl ModelProfile {
+    /// Resolve the effective API key: explicit value first, env var second.
+    pub fn resolve_key(&self) -> Option<ApiKey> {
+        if let Some(k) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
+            return Some(ApiKey::new(k));
+        }
+        if let Some(var) = self.api_key_env.as_deref() {
+            return ApiKey::from_env(var);
+        }
+        None
+    }
+
+    /// Masked key for API responses (never leak the full secret to the UI).
+    pub fn masked_key(&self) -> String {
+        match self.resolve_key() {
+            Some(k) => k.masked(),
+            None => "(未设置)".into(),
+        }
+    }
+
+    pub fn pro_model(&self) -> &str {
+        self.pro_model_name.as_deref().unwrap_or(&self.model_name)
+    }
+}
+
+/// Serializable state persisted to `models.json`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct RegistryFile {
+    #[serde(default)]
+    active_id: Option<String>,
+    #[serde(default)]
+    custom: Vec<ModelProfile>,
+}
+
+/// Registry of all known profiles + the active selection.
+#[derive(Debug)]
+pub struct ModelRegistry {
+    builtins: Vec<ModelProfile>,
+    custom: Vec<ModelProfile>,
+    active_id: String,
+    path: PathBuf,
+}
+
+impl ModelRegistry {
+    /// Load the registry: built-ins from `AppConfig`, customs + active
+    /// selection from `models.json` (if present).
+    pub fn load(config: &AppConfig) -> Self {
+        let builtins = Self::builtin_profiles(config);
+        let path = PathBuf::from(MODELS_FILE);
+        let file: RegistryFile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let default_active = builtins
+            .iter()
+            .find(|p| match config.provider.as_str() {
+                "stepfun" => p.kind == ModelKind::StepFun,
+                "minimax" => p.kind == ModelKind::MiniMax,
+                _ => p.kind == ModelKind::DeepSeek,
+            })
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "builtin-deepseek".into());
+
+        let active_id = file
+            .active_id
+            .filter(|id| {
+                builtins.iter().any(|p| &p.id == id)
+                    || file.custom.iter().any(|p| &p.id == id)
+            })
+            .unwrap_or(default_active);
+
+        Self {
+            builtins,
+            custom: file.custom,
+            active_id,
+            path,
+        }
+    }
+
+    /// Built-in profiles seeded from environment configuration. These are the
+    /// only place default model names live — nothing else in the codebase
+    /// should embed model-name strings.
+    fn builtin_profiles(config: &AppConfig) -> Vec<ModelProfile> {
+        vec![
+            ModelProfile {
+                id: "builtin-deepseek".into(),
+                display_name: "DeepSeek".into(),
+                kind: ModelKind::DeepSeek,
+                base_url: config.deepseek_base_url.clone(),
+                model_name: config
+                    .deepseek_model_name
+                    .clone()
+                    .unwrap_or_else(|| "deepseek-chat".into()),
+                pro_model_name: Some(
+                    config
+                        .deepseek_model_name
+                        .clone()
+                        .unwrap_or_else(|| "deepseek-reasoner".into()),
+                ),
+                api_key: None,
+                api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                builtin: true,
+            },
+            ModelProfile {
+                id: "builtin-stepfun".into(),
+                display_name: "StepFun".into(),
+                kind: ModelKind::StepFun,
+                base_url: config.stepfun_base_url.clone(),
+                model_name: config
+                    .stepfun_model_name
+                    .clone()
+                    .unwrap_or_else(|| "step-3.7-flash".into()),
+                pro_model_name: None,
+                api_key: None,
+                api_key_env: Some("STEPFUN_API_KEY".into()),
+                builtin: true,
+            },
+            ModelProfile {
+                id: "builtin-minimax".into(),
+                display_name: "MiniMax".into(),
+                kind: ModelKind::MiniMax,
+                base_url: config.minimax_base_url.clone(),
+                model_name: config
+                    .minimax_model_name
+                    .clone()
+                    .unwrap_or_else(|| "MiniMax-M3".into()),
+                pro_model_name: None,
+                api_key: None,
+                api_key_env: Some("MINIMAX_API_KEY".into()),
+                builtin: true,
+            },
+        ]
+    }
+
+    pub fn list(&self) -> Vec<&ModelProfile> {
+        self.builtins.iter().chain(self.custom.iter()).collect()
+    }
+
+    pub fn get(&self, id: &str) -> Option<&ModelProfile> {
+        self.list().into_iter().find(|p| p.id == id)
+    }
+
+    pub fn active(&self) -> &ModelProfile {
+        self.get(&self.active_id)
+            .unwrap_or(&self.builtins[0])
+    }
+
+    pub fn active_id(&self) -> &str {
+        &self.active_id
+    }
+
+    /// Add a custom profile. Returns its generated id.
+    pub fn add(&mut self, mut profile: ModelProfile) -> String {
+        let id = format!("custom-{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
+        profile.id = id.clone();
+        profile.builtin = false;
+        self.custom.push(profile);
+        let _ = self.save();
+        id
+    }
+
+    /// Update an existing custom profile's mutable fields (name/url/model/key).
+    pub fn update(&mut self, id: &str, patch: ModelProfile) -> Result<(), String> {
+        let prof = self
+            .custom
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "只能修改自定义模型配置".to_string())?;
+        prof.display_name = patch.display_name;
+        prof.base_url = patch.base_url;
+        prof.model_name = patch.model_name;
+        prof.pro_model_name = patch.pro_model_name;
+        if patch.api_key.as_deref().map_or(false, |k| !k.is_empty()) {
+            prof.api_key = patch.api_key;
+        }
+        let _ = self.save();
+        Ok(())
+    }
+
+    /// Remove a custom profile. Fails for built-ins or the active profile.
+    pub fn remove(&mut self, id: &str) -> Result<(), String> {
+        if self.builtins.iter().any(|p| p.id == id) {
+            return Err("内置模型配置不可删除".into());
+        }
+        if self.active_id == id {
+            return Err("该模型正在使用中，请先切换到其他模型".into());
+        }
+        self.custom.retain(|p| p.id != id);
+        let _ = self.save();
+        Ok(())
+    }
+
+    /// Switch the active profile and persist the selection.
+    pub fn set_active(&mut self, id: &str) -> Result<(), String> {
+        if self.get(id).is_none() {
+            return Err(format!("未找到模型配置: {id}"));
+        }
+        self.active_id = id.to_string();
+        let _ = self.save();
+        Ok(())
+    }
+
+    /// Persist custom profiles + active selection to `models.json`.
+    fn save(&self) -> std::io::Result<()> {
+        let file = RegistryFile {
+            active_id: Some(self.active_id.clone()),
+            custom: self.custom.clone(),
+        };
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&self.path, json)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_parsing() {
+        assert_eq!(ModelKind::from_str_loose("openai_compatible"), Some(ModelKind::OpenAiCompatible));
+        assert_eq!(ModelKind::from_str_loose("Anthropic"), Some(ModelKind::AnthropicCompatible));
+        assert_eq!(ModelKind::from_str_loose("nope"), None);
+    }
+
+    #[test]
+    fn registry_active_fallback() {
+        let config = AppConfig::load();
+        let reg = ModelRegistry::load(&config);
+        // active profile must resolve to something with a sane kind
+        let active = reg.active();
+        assert!(!active.id.is_empty());
+        assert!(!active.model_name.is_empty());
+    }
+}

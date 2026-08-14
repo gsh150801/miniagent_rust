@@ -7,6 +7,7 @@ pub mod event;
 pub mod json_util;
 pub mod message;
 pub mod model_tier;
+pub mod models;
 pub mod orchestration;
 pub mod secrets;
 pub mod settings;

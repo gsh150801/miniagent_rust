@@ -175,14 +175,16 @@ Output as JSON:
         text: &str,
         candidate: &HypothesisCandidate,
     ) -> Result<Hypothesis, AgentError> {
-        let json_str = text
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
+        // extract_and_repair strips <think> blocks + fences and repairs
+        // truncated JSON; parse failures propagate as errors instead of
+        // silently producing a hypothesis with an empty statement.
+        let repaired = miniagent_core::json_util::extract_and_repair(text);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).map_err(|e| {
+            AgentError::invalid_config(format!(
+                "hypothesis JSON parse failed: {e}; output head: {:?}",
+                repaired.chars().take(160).collect::<String>()
+            ))
+        })?;
 
         Ok(Hypothesis {
             id: uuid::Uuid::new_v4(),

@@ -67,11 +67,11 @@ impl PipelineStage for PlanStage {
 
         let prompt = build_plan_prompt(task, loop_count, &repair_suggestions, &prior_tasks, needs_decomposition);
 
-        let provider = ctx.agent.router().flash();
+        let provider = ctx.agent.flash_provider();
 
         // Attempt plan generation with retry: if the LLM returns only 1 task
         // when decomposition is needed, retry once with a stronger emphasis.
-        let mut plan = match try_generate_plan(provider, &prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await {
+        let mut plan = match try_generate_plan(provider.as_ref(), &prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "Plan generation failed, using fallback");
@@ -97,7 +97,7 @@ impl PipelineStage for PlanStage {
         if plan.tasks.len() == 1 && needs_decomposition {
             tracing::info!("Plan returned 1 task but decomposition needed — retrying with stronger prompt");
             let retry_prompt = build_plan_prompt_retry(task, loop_count);
-            if let Ok(retry_plan) = try_generate_plan(provider, &retry_prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await
+            if let Ok(retry_plan) = try_generate_plan(provider.as_ref(), &retry_prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await
                 && retry_plan.tasks.len() > 1 {
                     tracing::info!(tasks = retry_plan.tasks.len(), "Retry succeeded: decomposed into multiple tasks");
                     plan = retry_plan;
