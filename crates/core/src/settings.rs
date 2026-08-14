@@ -10,7 +10,7 @@ use crate::secrets::ApiKey;
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     // ── Provider selection ───────────────────────────────────────
-    /// Which LLM provider to use: "deepseek" (default) or "stepfun".
+    /// Which LLM provider to use: "deepseek" (default), "stepfun", or "minimax".
     /// Set via PROVIDER env var. Allows switching providers without code changes.
     pub provider: String,
 
@@ -25,12 +25,18 @@ pub struct AppConfig {
     pub stepfun_base_url: String,
     pub stepfun_model_name: Option<String>,
 
+    // ── MiniMax (Token-Plan subscription, Anthropic-compatible API) ──
+    pub minimax_api_key: Option<ApiKey>,
+    pub minimax_base_url: String,
+    pub minimax_model_name: Option<String>,
+
     // ── Search backends ───────────────────────────────────────────
     pub bocha_api_key: Option<ApiKey>,
     pub tavily_api_key: Option<ApiKey>,
     pub serpapi_api_key: Option<ApiKey>,
     pub serper_api_key: Option<ApiKey>,
     pub langsearch_api_key: Option<ApiKey>,
+    pub anysearch_api_key: Option<ApiKey>,
 
     // ── Academic APIs ─────────────────────────────────────────────
     pub pubmed_api_key: Option<ApiKey>,
@@ -98,11 +104,17 @@ impl AppConfig {
                 .unwrap_or_else(|| "https://api.stepfun.com/step_plan/v1".into()),
             stepfun_model_name: Self::var("STEPFUN_MODEL_NAME"),
 
+            minimax_api_key: ApiKey::from_env("MINIMAX_API_KEY"),
+            minimax_base_url: Self::var("MINIMAX_BASE_URL")
+                .unwrap_or_else(|| "https://api.minimaxi.com/anthropic".into()),
+            minimax_model_name: Self::var("MINIMAX_MODEL_NAME"),
+
             bocha_api_key: ApiKey::from_env("BOCHA_API_KEY"),
             tavily_api_key: ApiKey::from_env("TAVILY_API_KEY"),
             serpapi_api_key: ApiKey::from_env("SERPAPI_API_KEY"),
             serper_api_key: ApiKey::from_env("SERPER_API_KEY"),
             langsearch_api_key: ApiKey::from_env("LANGSEARCH_API_KEY"),
+            anysearch_api_key: ApiKey::from_env("ANYSEARCH_API_KEY"),
 
             pubmed_api_key: ApiKey::from_env("PUBMED_API_KEY"),
 
@@ -158,6 +170,18 @@ impl AppConfig {
         self.provider == "stepfun"
     }
 
+    /// Require the MiniMax subscription API key, returning a descriptive error if unset.
+    pub fn require_minimax_key(&self) -> Result<&ApiKey, String> {
+        self.minimax_api_key
+            .as_ref()
+            .ok_or_else(|| "MINIMAX_API_KEY not set. Add it to .env or export it.".to_string())
+    }
+
+    /// Returns true if the active provider is MiniMax.
+    pub fn is_minimax(&self) -> bool {
+        self.provider == "minimax"
+    }
+
     /// Returns true if the active provider is DeepSeek (default).
     pub fn is_deepseek(&self) -> bool {
         self.provider == "deepseek"
@@ -167,6 +191,8 @@ impl AppConfig {
     pub fn require_active_key(&self) -> Result<&ApiKey, String> {
         if self.is_stepfun() {
             self.require_stepfun_key()
+        } else if self.is_minimax() {
+            self.require_minimax_key()
         } else {
             self.require_deepseek_key()
         }

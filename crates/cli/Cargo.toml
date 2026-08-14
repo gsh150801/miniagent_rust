@@ -19,12 +19,14 @@ miniagent-workflow = { path = "../workflow" }
 miniagent-kg = { path = "../kg" }
 miniagent-hypothesis = { path = "../hypothesis" }
 miniagent-analysis = { path = "../analysis" }
+miniagent-research = { path = "../research" }
 miniagent-self-improve = { path = "../self-improve" }
 miniagent-telemetry = { path = "../telemetry" }
 miniagent-skill = { path = "../skill" }
 miniagent-planning = { path = "../planning" }
 miniagent-loop-pipeline = { path = "../loop-pipeline" }
 clap = { version = "4", features = ["derive", "env"] }
+serde.workspace = true
 tokio = { version = "1", features = ["full"] }
 tokio-util.workspace = true
 serde_json.workspace = true

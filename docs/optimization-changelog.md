@@ -2154,3 +2154,67 @@ Ran 3 tests in 0.000s  OK
 - 不修 `check_phantom_failures` 对工作目录外产物的误判（设计取舍，需讨论 evaluate 语义）。
 - 不调整 StepFun 订阅（外部计费问题，非代码）。
 
+
+## Round 33: AnySearch 集成 + research 流水线质量修复（DeepSeek harness 思想借鉴）
+
+### 任务背景
+
+四目标循环：① 集成 AnySearch 搜索源并端到端跑一次找不足；② 借鉴 DeepSeek harness（dsh）设计思想做针对性修改；③ 阿尔兹海默症端到端回归；④ 清理硬编码密钥后更新 GitHub。
+
+### AnySearch 集成（任务一）
+
+- `web_search` 工具新增 `anysearch` 后端（`crates/tool/src/tools/web_search.rs`）：
+  JSON-RPC 2.0 over `https://api.anysearch.com/mcp`（`tools/call` → `search`），`Authorization: Bearer as_sk_…`，
+  支持 `domain` 垂直检索参数（academic/health/…），`max_results` 上限 10（API 限制），
+  输出整体截断至 10k 字符防止页面全文淹没上下文。
+- 接入既有基础设施：启动健康探测（`health.rs` `probe_anysearch`）、运行时熔断、
+  `AppConfig.anysearch_api_key`（`ANYSEARCH_API_KEY`）、`miniagent config` 掩码显示。
+  回退链变为 Serper → Tavily → Bocha → LangSearch → **AnySearch** → DDG。
+
+### 端到端首跑暴露的缺陷（任务一结论，帕金森病 12 篇）
+
+1. **Phase 7 全军覆没**：deepseek-reasoner 8192 max_tokens 被 CoT 耗尽 → 正文为空 →
+   两个验证计划全部 JSON 解析失败，Phase 8 无从执行（目标 3/4 断链）。
+2. **文献相关性污染**：混入一篇肌少症文献，其 hub 实体（mortality risk/fractures）
+   主导链接预测 → 全部 5 个假说偏离帕金森（目标 2 落空）。
+3. **实体合并遗留悬空边**：重名实体被跳过时，该文献 relation 仍指向未入库的旧 id。
+4. **min_year=2023 硬编码**，不可配置不透明。
+5. **辩论无外部证据**：debate prompt 要求"using the broader published literature"但无任何检索注入。
+
+### 借鉴的 DeepSeek harness（dsh）设计思想（任务二）
+
+| dsh 思想 | 落地修改 |
+|---|---|
+| 上下文工程（工具输出去噪限幅） | AnySearch 输出 10k 截断；辩论证据 4k 截断 |
+| 证据外置、只把结论喂给模型 | 相关性过滤在进 KG 前丢弃离题摘要 |
+| Append-only Trajectory（一切可审计可重放） | 拒稿清单 `papers_rejected.json`、辩论证据 `debate_evidence.json` 全部落盘 + manifest 事件 |
+| 失败可恢复（reversible/retry） | Phase 7 空响应自动重试（预算翻倍至 16384） |
+| 一切皆插件 + 健康探测/熔断 | AnySearch 按既有 backend 插件模式接入 |
+
+### 修改清单（任务二）
+
+- **Phase 2b 相关性过滤**：flash 模型逐篇 0-10 打分（并发 6，fail-open），<5 剔除；
+  拒稿与理由持久化。阶段可 resume。
+- **Phase 7 空响应重试**（`crates/hypothesis/src/generator.rs`）。
+- **别名归并 + 悬空边修复**（`crates/kg/src/extraction.rs` `merge_extraction_canonical`）：
+  大小写不敏感 name+alias 索引，relation 端点重映射到 canonical id。
+- **疾病锚定**（Phase 4）：查询 token 与 Disease 实体重叠度最高者为锚，
+  候选过滤为包含锚实体的子集（≥3 个才生效，否则回退）。
+- **辩论外部证据**（`debate_and_refine_with_evidence`）：辩论前对 top-4 假说
+  web_search 检索（自动走含 AnySearch 的后端链），证据注入双方辩论 prompt。
+- **`--min-year` CLI 参数**（默认 2023，解除硬编码）。
+
+### 阿尔兹海默症回归（任务三）
+
+`research -q "Alzheimer's disease pathogenesis mechanisms" -n 12 --validate --analyze --top-n 2`：
+
+- Phase 2b：kept 10/10（语料本就切题）；别名归并 26 个重复实体、0 条悬空边（旧实现会全部悬空）。
+- 疾病锚定生效：`Alzheimer's disease dementia` 锚定 16/614 候选，全部假说围绕 AD。
+- 辩论证据检索成功（serper 探测不健康自动回退其余后端链）。
+
+### 密钥安全（任务四）
+
+- `.env.example` 中泄露的真实 StepFun key 替换为占位符，并以 `git filter-branch`
+  从本地历史中彻底清除（重写后经 `git log -S` 验证为空）；该 key 已失效（订阅过期）仍建议作废处理。
+- `.env`（含 anysearch key）确认被 gitignore；`ANYSEARCH_API_KEY` 仅存在于 `.env`。
+- `.gitignore` 补充 `.worktrees/`、`__pycache__/`、`.zcode/`、`stdout.txt`。

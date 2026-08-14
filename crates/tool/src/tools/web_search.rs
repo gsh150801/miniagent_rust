@@ -54,7 +54,8 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {"type": "string", "description": "Search query in ENGLISH for best results. Translate non-English queries to English. Use precise domain terminology."},
                 "num": {"type": "integer", "description": "Number of results (default: 10, max: 50)"},
-                "backend": {"type": "string", "description": "Force backend: serper, tavily, bocha"}
+                "backend": {"type": "string", "description": "Force backend: serper, tavily, bocha, langsearch, anysearch, ddgs"},
+                "domain": {"type": "string", "description": "AnySearch vertical domain (optional): general, academic, health, finance, legal, code, etc. Only used by the anysearch backend."}
             },
             "required": ["query"]
         })
@@ -70,8 +71,9 @@ impl Tool for WebSearchTool {
             .ok_or_else(|| AgentError::tool("web_search", "missing 'query'"))?;
         let num = input["num"].as_u64().unwrap_or(10).min(50);
         let backend = input["backend"].as_str();
+        let anysearch_domain = input["domain"].as_str();
 
-        // Try backends in order: Serper → Tavily → Bocha → LangSearch → DDG
+        // Try backends in order: Serper → Tavily → Bocha → LangSearch → AnySearch → DDG
         if let Some("tavily") = backend {
             return self.search_tavily(query, num, cancel).await;
         }
@@ -80,6 +82,16 @@ impl Tool for WebSearchTool {
         }
         if let Some("langsearch") = backend {
             return self.search_langsearch(query, num, cancel).await;
+        }
+        if let Some("anysearch") = backend {
+            let key = env_opt("ANYSEARCH_API_KEY").unwrap_or_default();
+            if key.is_empty() {
+                return Ok(ToolOutput {
+                    content: "AnySearch unavailable: ANYSEARCH_API_KEY not set.".into(),
+                    metadata: None,
+                });
+            }
+            return self.search_anysearch(query, num, &key, anysearch_domain, cancel).await;
         }
         if let Some("ddgs") = backend {
             return self.search_ddgs(query, num, cancel).await;
@@ -92,6 +104,7 @@ impl Tool for WebSearchTool {
         let tavily_key = env_opt("TAVILY_API_KEY");
         let bocha_key = env_opt("BOCHA_API_KEY");
         let langsearch_key = env_opt("LANGSEARCH_API_KEY");
+        let anysearch_key = env_opt("ANYSEARCH_API_KEY");
 
         // Try Serper
         if let Some(ref key) = serper_key {
@@ -153,6 +166,21 @@ impl Tool for WebSearchTool {
                 eprintln!("[web_search] langsearch skipped (unhealthy from startup probe)");
             }
         }
+        // Try AnySearch
+        if let Some(ref key) = anysearch_key {
+            let hs = health::health_state().await;
+            let usable = hs.is_healthy("anysearch");
+            let disabled = hs.is_disabled("anysearch");
+            drop(hs);
+            if usable {
+                match self.search_anysearch(query, num, key, anysearch_domain, cancel.clone()).await {
+                    Ok(out) => { self.mark_backend_ok("anysearch").await; return Ok(out); }
+                    Err(e) => { self.disable_backend("anysearch", &e).await; }
+                }
+            } else if !disabled {
+                eprintln!("[web_search] anysearch skipped (unhealthy from startup probe)");
+            }
+        }
         // Try DDG (no key required — always available unless blocked)
         {
             let hs = health::health_state().await;
@@ -168,7 +196,7 @@ impl Tool for WebSearchTool {
                 eprintln!("[web_search] ddgs skipped (unhealthy from startup probe)");
             }
         }
-        Err(AgentError::tool("web_search", "All search backends (Serper, Tavily, Bocha, LangSearch, DDG) failed or were unavailable"))
+        Err(AgentError::tool("web_search", "All search backends (Serper, Tavily, Bocha, LangSearch, AnySearch, DDG) failed or were unavailable"))
     }
 }
 
@@ -381,6 +409,71 @@ impl WebSearchTool {
         Ok(ToolOutput { content: out, metadata: None })
     }
 
+    /// Search via AnySearch API (JSON-RPC 2.0 over https://api.anysearch.com/mcp).
+    /// Returns markdown results that may include page extracts; output is
+    /// truncated to keep the agent context bounded.
+    async fn search_anysearch(
+        &self, query: &str, num: u64, api_key: &str, domain: Option<&str>, cancel: CancellationToken,
+    ) -> Result<ToolOutput, AgentError> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("query".into(), json!(query));
+        // AnySearch enforces a per-request maximum of 10 results.
+        arguments.insert("max_results".into(), json!(num.min(10)));
+        if let Some(d) = domain.filter(|d| !d.is_empty()) {
+            arguments.insert("domain".into(), json!(d));
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": arguments},
+        });
+
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+            r = self.client.post("https://api.anysearch.com/mcp")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&payload).send() => r,
+        }.map_err(|e| AgentError::tool("anysearch", format!("HTTP: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let b = response.text().await.unwrap_or_default();
+            return Err(AgentError::tool("anysearch", format!("{status}: {}", truncate_str(&b, 500))));
+        }
+
+        let result: serde_json::Value = response.json().await
+            .map_err(|e| AgentError::tool("anysearch", format!("parse: {e}")))?;
+
+        if let Some(err) = result["error"].as_object() {
+            return Err(AgentError::tool("anysearch", format!(
+                "API error: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"))));
+        }
+
+        // The MCP-style response carries markdown text in result.content[].
+        let mut text = String::new();
+        if let Some(items) = result["result"]["content"].as_array() {
+            for item in items {
+                if item["type"].as_str() == Some("text") {
+                    if let Some(t) = item["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+
+        let mut out = String::from("## AnySearch Results\n\n");
+        if text.trim().is_empty() {
+            out.push_str(&format!("No results for '{}'", query));
+        } else {
+            // Each result embeds a full page extract — cap the total size so a
+            // single search cannot flood the agent's context window.
+            out.push_str(&truncate_str(text.trim(), 10_000));
+        }
+        Ok(ToolOutput { content: out, metadata: None })
+    }
+
     /// Search via DuckDuckGo HTML endpoint (no API key required).
     /// Uses a proxy if the `all_proxy` or `https_proxy` env var is set.
     async fn search_ddgs(&self, query: &str, num: u64, cancel: CancellationToken) -> Result<ToolOutput, AgentError> {
@@ -478,4 +571,15 @@ fn strip_html_tags(s: &str) -> String {
 
 fn env_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Truncate a string to at most `max` chars, appending an ellipsis marker when cut.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push_str("\n\n[... truncated ...]");
+        t
+    }
 }

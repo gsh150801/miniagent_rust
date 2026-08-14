@@ -7,10 +7,12 @@
 //! via [`execute_notebook`](notebook::execute_notebook).
 
 pub mod notebook;
+pub mod notebook_gen;
 pub mod provenance;
 pub mod runner;
 
 pub use notebook::{execute_notebook, jupyter_available, NotebookResult};
+pub use notebook_gen::{build_notebook, split_code_into_cells, write_notebook};
 pub use provenance::{
     current_git_commit, fnv1a_hex, preview, record_dir_shallow, record_file, FileRecord,
     ProvenanceRecord,

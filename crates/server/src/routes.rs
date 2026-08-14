@@ -15,6 +15,7 @@ use miniagent_core::config::{InferenceConfig, TaskComplexity};
 use miniagent_core::message::Message as AgentMessage;
 use miniagent_provider::deepseek::DeepSeekFlash;
 use miniagent_provider::stepfun::StepFunFlash;
+use miniagent_provider::minimax::MiniMaxFlash;
 use miniagent_provider::traits::{CompletionRequest, LlmProvider, StreamChunk};
 use miniagent_core::types::StageId;
 use miniagent_workflow::builder::{WorkflowBuilder, WorkflowSpec, StageSpec};
@@ -1051,7 +1052,9 @@ async fn handle_run(
     })).await;
 
     // Explore：用 planner provider 分析问题，提取关键上下文
-    let explore_provider: Box<dyn LlmProvider> = if state.config.is_stepfun() {
+    let explore_provider: Box<dyn LlmProvider> = if state.config.is_minimax() {
+        Box::new(MiniMaxFlash::new(api_key))
+    } else if state.config.is_stepfun() {
         Box::new(StepFunFlash::new(api_key))
     } else {
         Box::new(DeepSeekFlash::new(api_key))
@@ -1123,7 +1126,9 @@ async fn handle_run(
     })).await;
 
     // Plan via LLM（根据 PROVIDER 配置选择 provider，尊重 PROVIDER=stepfun）
-    let planner_flash: Box<dyn LlmProvider> = if state.config.is_stepfun() {
+    let planner_flash: Box<dyn LlmProvider> = if state.config.is_minimax() {
+        Box::new(MiniMaxFlash::new(api_key))
+    } else if state.config.is_stepfun() {
         Box::new(StepFunFlash::new(api_key))
     } else {
         Box::new(DeepSeekFlash::new(api_key))
@@ -1316,7 +1321,9 @@ async fn handle_run(
     };
 
     // Provider for validator/arbiter/feedback
-    let feedback_provider: Box<dyn LlmProvider> = if state.config.is_stepfun() {
+    let feedback_provider: Box<dyn LlmProvider> = if state.config.is_minimax() {
+        Box::new(MiniMaxFlash::new(api_key))
+    } else if state.config.is_stepfun() {
         Box::new(StepFunFlash::new(api_key))
     } else {
         Box::new(DeepSeekFlash::new(api_key))
@@ -1652,7 +1659,7 @@ async fn run_multi_stage_with_streaming(
 
             if !response_text.is_empty() {
                 // Stream the synthesis text token by token via the pro model
-                let stream_result = stream_synthesis(socket, api_key, &response_text, state.config.is_stepfun(), cancel).await;
+                let stream_result = stream_synthesis(socket, api_key, &response_text, state.config.is_minimax(), state.config.is_stepfun(), cancel).await;
                 if !stream_result {
                     // Fallback: send as one chunk
                     let _ = ws_send(socket, serde_json::json!({
@@ -1746,10 +1753,13 @@ async fn stream_synthesis(
     socket: &Arc<Mutex<WsSink>>,
     api_key: &miniagent_core::secrets::ApiKey,
     synthesis_text: &str,
+    is_minimax: bool,
     is_stepfun: bool,
     cancel: CancellationToken,
 ) -> bool {
-    let pro: Box<dyn LlmProvider> = if is_stepfun {
+    let pro: Box<dyn LlmProvider> = if is_minimax {
+        Box::new(MiniMaxFlash::new(api_key))
+    } else if is_stepfun {
         Box::new(StepFunFlash::new(api_key))
     } else {
         Box::new(miniagent_provider::deepseek::DeepSeekPro::new(api_key))

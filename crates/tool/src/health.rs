@@ -187,6 +187,18 @@ pub async fn probe_all_backends() -> Vec<BackendHealth> {
         record_unhealthy("langsearch", "LANGSEARCH_API_KEY not set", 0).await;
     }
 
+    // AnySearch probe
+    let anysearch_key = env_opt("ANYSEARCH_API_KEY");
+    if let Some(key) = anysearch_key {
+        let client = client.clone();
+        let q = test_query.to_string();
+        handles.push(tokio::spawn(async move {
+            probe_anysearch(&client, &q, &key).await
+        }));
+    } else {
+        record_unhealthy("anysearch", "ANYSEARCH_API_KEY not set", 0).await;
+    }
+
     // DDG probe (no key required — always try)
     {
         let client = client.clone();
@@ -382,6 +394,44 @@ async fn probe_langsearch(client: &reqwest::Client, query: &str, api_key: &str) 
         },
         Err(e) => BackendHealth {
             name: "langsearch".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("{e}")),
+        },
+    }
+}
+
+/// Probe AnySearch API health (JSON-RPC 2.0 endpoint, Bearer auth).
+async fn probe_anysearch(client: &reqwest::Client, query: &str, api_key: &str) -> BackendHealth {
+    let start = std::time::Instant::now();
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "search", "arguments": {"query": query, "max_results": 1}},
+    });
+    match client
+        .post("https://api.anysearch.com/mcp")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => BackendHealth {
+            name: "anysearch".into(),
+            healthy: true,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        },
+        Ok(resp) => BackendHealth {
+            name: "anysearch".into(),
+            healthy: false,
+            latency_ms: start.elapsed().as_millis() as u64,
+            error: Some(format!("HTTP {}", resp.status())),
+        },
+        Err(e) => BackendHealth {
+            name: "anysearch".into(),
             healthy: false,
             latency_ms: start.elapsed().as_millis() as u64,
             error: Some(format!("{e}")),

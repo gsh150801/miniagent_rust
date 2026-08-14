@@ -55,6 +55,18 @@ impl Default for RunOpts {
     }
 }
 
+/// How an analysis task was executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionBackend {
+    /// Executed in place as a Jupyter notebook (`.ipynb` carries outputs).
+    Jupyter,
+    /// The `.py` script ran directly (notebook saved without outputs).
+    Python,
+    /// No execution: script + notebook generated for manual running.
+    DryRun,
+}
+
 /// Outcome of running one analysis task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
@@ -62,6 +74,11 @@ pub struct AnalysisResult {
     pub success: bool,
     pub dry_run: bool,
     pub script_path: PathBuf,
+    /// Always produced: the Jupyter notebook (executed-with-outputs when
+    /// `execution_backend == Jupyter`, code-only otherwise).
+    pub notebook_path: PathBuf,
+    pub notebook_executed: bool,
+    pub execution_backend: ExecutionBackend,
     pub output_files: Vec<PathBuf>,
     pub provenance_path: Option<PathBuf>,
     pub provenance: ProvenanceRecord,
@@ -91,6 +108,7 @@ impl AnalysisRunner {
             .map_err(|e| AgentError::Checkpoint(format!("create task dir: {e}")))?;
 
         let script_path = task_dir.join("script.py");
+        let notebook_path = task_dir.join("analysis.ipynb");
         let started_at = Utc::now();
         let instant = std::time::Instant::now();
 
@@ -113,7 +131,12 @@ impl AnalysisRunner {
             .map_err(|e| AgentError::Checkpoint(format!("write script: {e}")))?;
         let script_hash = fnv1a_hex(script.as_bytes());
 
-        // In dry-run mode we stop here: deliver script + plan, no execution.
+        // Always build a Jupyter notebook from the generated script + task
+        // metadata, so the analysis is viewable/re-runnable as a .ipynb.
+        let notebook = crate::notebook_gen::build_notebook(task, hypothesis_ref, &script);
+        crate::notebook_gen::write_notebook(&notebook, &notebook_path)?;
+
+        // In dry-run mode we stop here: deliver script + notebook + plan, no execution.
         if dry_run {
             let provenance = self.finalize_provenance(
                 task,
@@ -129,6 +152,9 @@ impl AnalysisRunner {
                 "",
                 "",
                 false,
+                Some(&notebook_path),
+                false,
+                ExecutionBackend::DryRun,
             );
             let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
             return Ok(AnalysisResult {
@@ -136,17 +162,21 @@ impl AnalysisRunner {
                 success: true,
                 dry_run: true,
                 script_path,
+                notebook_path,
+                notebook_executed: false,
+                execution_backend: ExecutionBackend::DryRun,
                 output_files: vec![],
                 provenance_path: Some(provenance_path),
                 provenance,
                 error: Some(format!(
-                    "dry-run: no local data available (source={:?}); script generated for manual execution",
+                    "dry-run: no local data available (source={:?}); script + notebook generated for manual execution",
                     task.dataset_source
                 )),
             });
         }
 
-        // Ensure conda env (best-effort).
+        // Ensure conda env (best-effort) — needed for the python fallback and
+        // harmless for the jupyter path.
         let conda_bin = detect_conda();
         let conda_used = if let Some(ref bin) = conda_bin {
             ensure_env(bin, &opts.conda_env, &opts.extra_packages).await
@@ -155,23 +185,20 @@ impl AnalysisRunner {
             false
         };
 
-        // Execute the script.
-        let exec = run_script(
-            conda_bin.as_deref(),
-            &opts.conda_env,
-            &script_path,
-            working_dir,
-            &cancel,
-        )
-        .await;
-        let (stdout, stderr, exit_code) = match exec {
-            Ok(o) => (o.stdout, o.stderr, o.exit_code),
+        // Execute. Prefer running the notebook in place via Jupyter (so the
+        // saved .ipynb carries outputs); fall back to running the .py script
+        // directly when Jupyter is missing or the notebook execution fails.
+        let exec = self
+            .execute_analysis(&conda_bin, &opts.conda_env, &script_path, &notebook_path, working_dir, &cancel)
+            .await;
+        let (stdout, stderr, exit_code, notebook_executed, backend) = match exec {
+            Ok(o) => (o.stdout, o.stderr, o.exit_code, o.notebook_executed, o.backend),
             Err(e) => {
                 let stderr = e.to_string();
                 let provenance = self.finalize_provenance(
                     task, hypothesis_ref, &script_path, script_hash, &local_data_path,
                     &task_dir, opts, started_at, instant.elapsed(), None, "", &stderr,
-                    conda_used,
+                    conda_used, Some(&notebook_path), false, ExecutionBackend::Python,
                 );
                 let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
                 return Ok(AnalysisResult {
@@ -179,19 +206,23 @@ impl AnalysisRunner {
                     success: false,
                     dry_run: false,
                     script_path,
+                    notebook_path,
+                    notebook_executed: false,
+                    execution_backend: ExecutionBackend::Python,
                     output_files: vec![],
                     provenance_path: Some(provenance_path),
                     provenance,
-                    error: Some(format!("script execution failed: {e}")),
+                    error: Some(format!("analysis execution failed: {e}")),
                 });
             }
         };
 
         // Capture outputs and provenance.
-        let output_files = collect_outputs(&task_dir, &script_path);
+        let output_files = collect_outputs(&task_dir, &script_path, &notebook_path);
         let provenance = self.finalize_provenance(
             task, hypothesis_ref, &script_path, script_hash, &local_data_path, &task_dir,
             opts, started_at, instant.elapsed(), exit_code, &stdout, &stderr, conda_used,
+            Some(&notebook_path), notebook_executed, backend,
         );
         let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
 
@@ -200,14 +231,67 @@ impl AnalysisRunner {
             success: exit_code == Some(0),
             dry_run: false,
             script_path,
+            notebook_path,
+            notebook_executed,
+            execution_backend: backend,
             output_files,
             provenance_path: Some(provenance_path),
             provenance,
             error: if exit_code == Some(0) {
                 None
             } else {
-                Some(format!("script exited with code {exit_code:?}"))
+                Some(format!("analysis exited with code {exit_code:?}"))
             },
+        })
+    }
+
+    /// Execute the analysis, preferring an in-place Jupyter run and falling
+    /// back to the `.py` script. Returns the captured stdout/stderr, exit
+    /// code, whether the notebook itself was executed, and the backend used.
+    async fn execute_analysis(
+        &self,
+        conda_bin: &Option<String>,
+        env: &str,
+        script: &Path,
+        notebook: &Path,
+        working_dir: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<ExecOutcome, AgentError> {
+        // Try Jupyter first.
+        if crate::notebook::jupyter_available() {
+            match crate::notebook::execute_notebook(notebook, Some(notebook), 600) {
+                Ok(nb) if nb.exit_code == 0 => {
+                    return Ok(ExecOutcome {
+                        stdout: nb.stdout,
+                        stderr: nb.stderr,
+                        exit_code: Some(nb.exit_code),
+                        notebook_executed: true,
+                        backend: ExecutionBackend::Jupyter,
+                    });
+                }
+                Ok(nb) => {
+                    // Notebook execution failed — fall back to the script so we
+                    // still capture a concrete error / partial outputs.
+                    tracing::warn!(
+                        exit_code = nb.exit_code,
+                        "notebook execution failed (exit {}); falling back to script",
+                        nb.exit_code
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("jupyter unavailable ({e}); falling back to script execution");
+                }
+            }
+        }
+
+        // Fallback: run the .py script directly.
+        let o = run_script(conda_bin.as_deref(), env, script, working_dir, cancel).await?;
+        Ok(ExecOutcome {
+            stdout: o.stdout,
+            stderr: o.stderr,
+            exit_code: o.exit_code,
+            notebook_executed: false,
+            backend: ExecutionBackend::Python,
         })
     }
 
@@ -259,7 +343,12 @@ SEED = {seed}
 Requirements:
 1. Set seeds at the top: `import numpy as np, random; np.random.seed({seed}); random.seed({seed})`.
 2. Read the input data with pandas. Use robust parsing (delimiters, missing values).
-3. Perform exactly the stated statistical method. Prefer scipy / statsmodels / scikit-learn.
+3. Adapt the stated statistical method to the ACTUAL columns shown in the data
+   preview. If the planned method is impossible with the available columns
+   (e.g. it needs gene-expression rows but the file is a per-sample biomarker
+   table), implement the closest valid equivalent on the real columns instead
+   of failing. Never reference columns that are not in the preview. Prefer
+   scipy / statsmodels / scikit-learn.
 4. Write all deliverables (tables as CSV, figures as PNG) into OUTPUT_DIR.
 5. Print a final JSON line `RESULT = {{...}}` summarizing key numbers (effect sizes, p-values, CIs).
 6. Include brief comments. No external services, no GUI. No `plt.show()`.
@@ -320,6 +409,9 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
         stdout: &str,
         stderr: &str,
         conda_used: bool,
+        notebook_path: Option<&Path>,
+        notebook_executed: bool,
+        backend: ExecutionBackend,
     ) -> ProvenanceRecord {
         let inputs: Vec<FileRecord> = local_data
             .iter()
@@ -327,7 +419,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             .collect();
         let outputs = record_dir_shallow(task_dir)
             .into_iter()
-            .filter(|r| r.path != script_path)
+            .filter(|r| r.path != script_path && Some(r.path.as_path()) != notebook_path)
             .collect();
 
         ProvenanceRecord {
@@ -359,6 +451,14 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             stderr_hash: fnv1a_hex(stderr.as_bytes()),
             stdout_preview: preview(stdout.as_bytes(), 2000),
             stderr_preview: preview(stderr.as_bytes(), 2000),
+            notebook_path: notebook_path.map(|p| p.to_path_buf()),
+            notebook_executed,
+            execution_backend: match backend {
+                ExecutionBackend::Jupyter => "jupyter",
+                ExecutionBackend::Python => "python",
+                ExecutionBackend::DryRun => "dry_run",
+            }
+            .to_string(),
         }
     }
 
@@ -381,6 +481,15 @@ struct ExecOutput {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
+}
+
+/// Resolved execution outcome from `execute_analysis`.
+struct ExecOutcome {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    notebook_executed: bool,
+    backend: ExecutionBackend,
 }
 
 async fn run_script(
@@ -497,10 +606,10 @@ fn read_data_preview(path: Option<&Path>) -> String {
     }
 }
 
-fn collect_outputs(task_dir: &Path, script: &Path) -> Vec<PathBuf> {
+fn collect_outputs(task_dir: &Path, script: &Path, notebook: &Path) -> Vec<PathBuf> {
     record_dir_shallow(task_dir)
         .into_iter()
-        .filter(|r| r.path != script)
+        .filter(|r| r.path != script && r.path != notebook)
         .map(|r| r.path)
         .collect()
 }

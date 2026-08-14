@@ -11,3 +11,8 @@ miniagent_context/
 *.py
 scripts/
 *_key_findings.md
+.worktrees/
+**/.worktrees/
+.zcode/
+__pycache__/
+stdout.txt

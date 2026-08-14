@@ -42,6 +42,10 @@ impl KnowledgeGraph {
         self.entities.get(id)
     }
 
+    pub fn get_entity_mut(&mut self, id: &EntityId) -> Option<&mut Entity> {
+        self.entities.get_mut(id)
+    }
+
     pub fn find_entity_by_name(&self, name: &str) -> Option<&Entity> {
         let lower = name.to_lowercase();
         self.entities.values().find(|e| {

@@ -18,10 +18,14 @@ pub struct NotebookResult {
     pub stderr: String,
 }
 
-/// Check whether a Jupyter executable is available on PATH.
+/// Check whether `jupyter nbconvert` is actually usable on PATH.
+///
+/// `jupyter --version` succeeds even when the nbconvert subcommand is not
+/// installed (observed on machines with a partial pip install), which used to
+/// make every execution attempt fail and fall back to the raw script.
 pub fn jupyter_available() -> bool {
     std::process::Command::new("jupyter")
-        .arg("--version")
+        .args(["nbconvert", "--version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

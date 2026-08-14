@@ -8,6 +8,7 @@ use miniagent_tool::executor::ToolExecutor;
 use miniagent_tool::tools;
 use miniagent_provider::deepseek::{DeepSeekFlash, DeepSeekPro};
 use miniagent_provider::stepfun::StepFunFlash;
+use miniagent_provider::minimax::MiniMaxFlash;
 use miniagent_provider::traits::LlmProvider;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,12 @@ impl StageContext {
             // StepFun uses a single model for all roles; clone as "pro" for repair/judge stages.
             let pro = StepFunFlash::new(key).with_base_url(config.stepfun_base_url.clone());
             (Box::new(StepFunFlash::new(key)), Box::new(pro))
+        } else if config.is_minimax() {
+            let key = config
+                .require_minimax_key()
+                .expect("MINIMAX_API_KEY required for loop pipeline");
+            let pro = MiniMaxFlash::new(key).with_base_url(config.minimax_base_url.clone());
+            (Box::new(MiniMaxFlash::new(key)), Box::new(pro))
         } else {
             let key = config
                 .require_deepseek_key()

@@ -20,6 +20,7 @@ members = [
     "crates/planning",
     "crates/loop-pipeline",
     "crates/analysis",
+    "crates/research",
 ]
 
 [workspace.package]
@@ -48,3 +49,4 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 anyhow = "1"
+miniagent-research = { path = "crates/research" }

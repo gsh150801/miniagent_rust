@@ -7,15 +7,26 @@
 /// Strip ```` ```json ```` / ```` ``` ```` markdown fences surrounding JSON.
 pub fn strip_markdown_fences(s: &str) -> String {
     let trimmed = s.trim();
-    if trimmed.starts_with("```") {
-        let without_start = trimmed
-            .trim_start_matches("```json")
-            .trim_start_matches("```JSON")
-            .trim_start_matches("```");
-        without_start.trim_end_matches("```").trim().to_string()
-    } else {
-        trimmed.to_string()
-    }
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    // Drop the fence's language tag (```python, ```json, …). The tag is the
+    // remainder of the first line when it looks like an identifier; code that
+    // starts on the same line as the fence (rare, e.g. "```{") is kept.
+    let content = match rest.find('\n') {
+        Some(nl) => {
+            let tag = &rest[..nl];
+            let is_tag = !tag.is_empty()
+                && tag.len() <= 16
+                && tag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '_'));
+            if is_tag { &rest[nl + 1..] } else { rest }
+        }
+        // single-line fence (```code```): nothing to strip beyond the fences
+        None => rest,
+    };
+    content.trim_end_matches("```").trim().to_string()
 }
 
 /// Attempt to fix truncated JSON by closing open strings, braces, and brackets.
@@ -157,6 +168,17 @@ mod tests {
     #[test]
     fn test_strip_no_fence() {
         assert_eq!(strip_markdown_fences("  {\"a\": 1}  "), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn test_strip_python_fence_keeps_code_without_tag() {
+        // regression: the language tag used to leak into the code body,
+        // producing a leading `python` line that broke generated scripts
+        assert_eq!(
+            strip_markdown_fences("```python\nimport numpy as np\nprint(1)\n```"),
+            "import numpy as np\nprint(1)"
+        );
+        assert_eq!(strip_markdown_fences("```Python\nimport os\n```"), "import os");
     }
 
     #[test]

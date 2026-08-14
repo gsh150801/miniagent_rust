@@ -342,13 +342,15 @@ For local/custom_url, also provide `value` (a path or URL)."#,
             tools: vec![],
             config: miniagent_core::config::InferenceConfig {
                 temperature: Some(0.2),
-                max_tokens: Some(4000),
+                // Reasoning models burn part of the budget on CoT before the
+                // JSON answer; 4000 left empty content on deepseek-reasoner.
+                max_tokens: Some(8192),
                 ..Default::default()
             },
         };
 
-        let response = provider.complete(&request, cancel).await?;
-        let text = response
+        let response = provider.complete(&request, cancel.clone()).await?;
+        let mut text = response
             .content
             .iter()
             .filter_map(|b| match b {
@@ -357,6 +359,34 @@ For local/custom_url, also provide `value` (a path or URL)."#,
             })
             .collect::<Vec<_>>()
             .join("");
+
+        // Reasoning models can exhaust the token budget on chain-of-thought and
+        // return empty text. One retry with a doubled budget recovers most
+        // cases; without it the whole validation/analysis tail of the pipeline
+        // silently produces nothing.
+        if text.trim().is_empty() {
+            tracing::warn!("validation plan: empty response ({}), retrying with larger budget", hypothesis.id);
+            let retry = CompletionRequest {
+                system: request.system.clone(),
+                messages: request.messages.clone(),
+                tools: vec![],
+                config: miniagent_core::config::InferenceConfig {
+                    temperature: Some(0.2),
+                    max_tokens: Some(16_384),
+                    ..Default::default()
+                },
+            };
+            let response = provider.complete(&retry, cancel).await?;
+            text = response
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+        }
 
         parse_validation_plan(&text, hypothesis.id)
     }

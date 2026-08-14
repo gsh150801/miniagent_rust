@@ -133,3 +133,98 @@ pub fn merge_into_kg(kg: &mut KnowledgeGraph, result: ExtractionResult) {
         kg.add_relation(relation);
     }
 }
+
+/// Stats reported by [`merge_extraction_canonical`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExtractionMergeStats {
+    pub entities_added: usize,
+    pub entities_merged: usize,
+    pub relations_added: usize,
+    /// Relations dropped because an endpoint could not be canonicalized.
+    pub relations_dropped: usize,
+}
+
+/// Merge an extraction into the KG with alias-aware canonicalization.
+///
+/// Unlike [`merge_into_kg`], this remaps relation endpoints to the canonical
+/// entity ids of the merged KG. The per-paper extraction assigns fresh ids to
+/// every entity; merging by name without remapping leaves relations pointing
+/// at ids that were never inserted (dangling edges that break neighborhood
+/// queries and link prediction).
+///
+/// Canonicalization is case-insensitive over both names and aliases, so
+/// "α-synuclein" / "alpha-synuclein" / "Alpha-Syn" collapse to one node when
+/// they appear as name/alias pairs across papers.
+pub fn merge_extraction_canonical(
+    kg: &mut KnowledgeGraph,
+    result: ExtractionResult,
+) -> ExtractionMergeStats {
+    // Index existing entities by lowercase name and alias → canonical id.
+    let mut index: std::collections::HashMap<String, EntityId> = std::collections::HashMap::new();
+    for e in kg.all_entities() {
+        index.entry(e.name.to_lowercase()).or_insert(e.id);
+        for a in &e.aliases {
+            index.entry(a.to_lowercase()).or_insert(e.id);
+        }
+    }
+
+    let mut stats = ExtractionMergeStats::default();
+    // Paper-local entity id → canonical KG id.
+    let mut id_map: std::collections::HashMap<EntityId, EntityId> =
+        std::collections::HashMap::new();
+
+    for entity in result.entities {
+        let key = entity.name.to_lowercase();
+        if let Some(&canonical_id) = index.get(&key) {
+            // Existing entity: fold the new aliases in, drop the duplicate node.
+            let mut new_aliases: Vec<String> = Vec::new();
+            if let Some(existing) = kg.get_entity(&canonical_id) {
+                for a in &entity.aliases {
+                    if !existing.aliases.iter().any(|x| x.eq_ignore_ascii_case(a))
+                        && !existing.name.eq_ignore_ascii_case(a)
+                    {
+                        new_aliases.push(a.clone());
+                    }
+                }
+            }
+            if !new_aliases.is_empty() {
+                if let Some(existing) = kg.get_entity_mut(&canonical_id) {
+                    existing.aliases.extend(new_aliases);
+                }
+            }
+            id_map.insert(entity.id, canonical_id);
+            stats.entities_merged += 1;
+        } else {
+            let new_id = EntityId::new();
+            index.insert(key, new_id);
+            for a in &entity.aliases {
+                index.entry(a.to_lowercase()).or_insert(new_id);
+            }
+            id_map.insert(entity.id, new_id);
+            kg.add_entity(Entity {
+                id: new_id,
+                ..entity
+            });
+            stats.entities_added += 1;
+        }
+    }
+
+    for relation in result.relations {
+        match (id_map.get(&relation.from_id), id_map.get(&relation.to_id)) {
+            (Some(from), Some(to)) => {
+                kg.add_relation(Relation {
+                    id: RelationId::new(),
+                    from_id: *from,
+                    to_id: *to,
+                    ..relation
+                });
+                stats.relations_added += 1;
+            }
+            _ => {
+                stats.relations_dropped += 1;
+            }
+        }
+    }
+
+    stats
+}

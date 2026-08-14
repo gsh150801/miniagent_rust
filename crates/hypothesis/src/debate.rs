@@ -141,6 +141,21 @@ impl HypothesisDebater {
         kg: &KnowledgeGraph,
         cancel: CancellationToken,
     ) -> Result<DebateOutcome, AgentError> {
+        self.debate_and_refine_with_evidence(hypotheses, kg, &Default::default(), cancel)
+            .await
+    }
+
+    /// Debate with externally retrieved evidence (e.g. web-search results)
+    /// injected per hypothesis. Grounding the debate in retrieved literature
+    /// instead of parametric memory alone is what makes the verdicts auditable:
+    /// every supporting/contradicting point can be traced back to a source.
+    pub async fn debate_and_refine_with_evidence(
+        &self,
+        hypotheses: &[Hypothesis],
+        kg: &KnowledgeGraph,
+        evidence: &std::collections::HashMap<uuid::Uuid, String>,
+        cancel: CancellationToken,
+    ) -> Result<DebateOutcome, AgentError> {
         // Trivial cases: nothing to debate.
         if hypotheses.is_empty() {
             return Ok(DebateOutcome {
@@ -153,7 +168,9 @@ impl HypothesisDebater {
         if hypotheses.len() == 1 {
             // Still worth a single debate pass so the lone hypothesis is
             // stress-tested, but skip cross-comparison.
-            let v = self.debate_one(&hypotheses[0], kg, cancel.clone()).await?;
+            let v = self
+                .debate_one(&hypotheses[0], kg, evidence.get(&hypotheses[0].id).map(|s| s.as_str()), cancel.clone())
+                .await?;
             let mut refined = hypotheses.to_vec();
             if v.verdict == Verdict::Revise {
                 refined = self
@@ -175,7 +192,9 @@ impl HypothesisDebater {
         // Phase A: per-hypothesis debate (opponent provider, cheaper when set).
         let mut verdicts = Vec::with_capacity(hypotheses.len());
         for h in hypotheses {
-            let v = self.debate_one(h, kg, cancel.clone()).await?;
+            let v = self
+                .debate_one(h, kg, evidence.get(&h.id).map(|s| s.as_str()), cancel.clone())
+                .await?;
             verdicts.push(v);
         }
 
@@ -244,15 +263,25 @@ impl HypothesisDebater {
         &self,
         h: &Hypothesis,
         kg: &KnowledgeGraph,
+        external_evidence: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<HypothesisVerdict, AgentError> {
         let provider: &dyn LlmProvider = self.opponent.as_deref().unwrap_or(self.pro.as_ref());
         let ctx = render_hypothesis_context(h, kg);
+        let evidence_block = external_evidence
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                format!(
+                    "\n**Retrieved literature evidence (web search — cite these where applicable):**\n{s}\n"
+                )
+            })
+            .unwrap_or_default();
 
         let prompt = format!(
             r#"You are a rigorous biomedical debate panel. Argue BOTH sides of the hypothesis below using the broader published literature, then adjudicate.
 
 {ctx}
+{evidence_block}
 
 **Your task:**
 1. `supporting_points` — the 2-4 strongest pieces of evidence / reasoning that SUPPORT the hypothesis (cite the kind of literature, e.g. "GEO expression studies", "GWAS", "prior reviews").
@@ -271,10 +300,26 @@ Output ONLY valid JSON (no markdown fences):
 }}"#
         );
 
-        let text = complete_json(provider, "You are a precise scientific debate engine. Output ONLY valid JSON.", &prompt, cancel).await?;
+        let text = complete_json(provider, "You are a precise scientific debate engine. Output ONLY valid JSON.", &prompt, cancel.clone()).await?;
         let repaired = json_util::extract_and_repair(&text);
-        let root: serde_json::Value = serde_json::from_str(&repaired)
-            .map_err(|e| AgentError::invalid_config(format!("debate verdict parse failed: {e}")))?;
+        // Same corrective retry as `compare`: one bad quote must not kill the
+        // whole debate pipeline.
+        let root: serde_json::Value = match serde_json::from_str(&repaired) {
+            Ok(v) => v,
+            Err(first_err) => {
+                tracing::warn!("debate verdict parse failed ({first_err}); retrying");
+                let retry_prompt = format!(
+                    "{prompt}\n\nYour previous output was NOT valid JSON ({first_err}). \
+                     Re-output the same content as STRICTLY valid JSON. Escape all quotes \
+                     inside strings; output ONLY the JSON object."
+                );
+                let text = complete_json(provider, "You are a precise scientific debate engine. Output ONLY valid JSON.", &retry_prompt, cancel).await?;
+                let repaired = json_util::extract_and_repair(&text);
+                serde_json::from_str(&repaired).map_err(|e| {
+                    AgentError::invalid_config(format!("debate verdict parse failed: {e}"))
+                })?
+            }
+        };
 
         Ok(HypothesisVerdict {
             hypothesis_id: h.id,
@@ -346,12 +391,35 @@ Output ONLY valid JSON (no markdown fences):
             self.pro.as_ref(),
             "You are a precise scientific judge. Output ONLY valid JSON.",
             &prompt,
-            cancel,
+            cancel.clone(),
         )
         .await?;
         let repaired = json_util::extract_and_repair(&text);
-        let root: serde_json::Value = serde_json::from_str(&repaired)
-            .map_err(|e| AgentError::invalid_config(format!("debate comparison parse failed: {e}")))?;
+        // Reasoning models occasionally emit slightly malformed JSON (stray
+        // quotes in `reason` strings). One corrective retry keeps a whole
+        // debate from being discarded over a single bad field.
+        let root: serde_json::Value = match serde_json::from_str(&repaired) {
+            Ok(v) => v,
+            Err(first_err) => {
+                tracing::warn!("debate comparison parse failed ({first_err}); retrying");
+                let retry_prompt = format!(
+                    "{prompt}\n\nYour previous output was NOT valid JSON ({first_err}). \
+                     Re-output the same content as STRICTLY valid JSON. Escape all quotes \
+                     inside strings; output ONLY the JSON object."
+                );
+                let text = complete_json(
+                    self.pro.as_ref(),
+                    "You are a precise scientific judge. Output ONLY valid JSON.",
+                    &retry_prompt,
+                    cancel,
+                )
+                .await?;
+                let repaired = json_util::extract_and_repair(&text);
+                serde_json::from_str(&repaired).map_err(|e| {
+                    AgentError::invalid_config(format!("debate comparison parse failed: {e}"))
+                })?
+            }
+        };
 
         let contradictions = root
             .get("contradictions_between")

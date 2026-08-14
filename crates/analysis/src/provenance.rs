@@ -42,6 +42,16 @@ pub struct ProvenanceRecord {
     pub stderr_hash: String,
     pub stdout_preview: String,
     pub stderr_preview: String,
+    /// Path to the generated Jupyter notebook (`.ipynb`), when produced.
+    #[serde(default)]
+    pub notebook_path: Option<PathBuf>,
+    /// Whether the `.ipynb` itself was executed in place (has outputs). False
+    /// when only the `.py` script ran or it was a dry-run.
+    #[serde(default)]
+    pub notebook_executed: bool,
+    /// `"jupyter"`, `"python"`, or `"dry_run"` — how the analysis was executed.
+    #[serde(default)]
+    pub execution_backend: String,
 }
 
 impl ProvenanceRecord {
@@ -193,6 +203,9 @@ mod tests {
             stderr_hash: fnv1a_hex(b""),
             stdout_preview: "done".into(),
             stderr_preview: "".into(),
+            notebook_path: Some(PathBuf::from("analysis.ipynb")),
+            notebook_executed: true,
+            execution_backend: "jupyter".into(),
         };
         let json = rec.to_json_pretty().unwrap();
         assert!(json.contains("\"task_id\": \"DA-1\""));

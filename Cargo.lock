@@ -1009,12 +1009,14 @@ dependencies = [
  "miniagent-memory",
  "miniagent-planning",
  "miniagent-provider",
+ "miniagent-research",
  "miniagent-self-improve",
  "miniagent-skill",
  "miniagent-telemetry",
  "miniagent-tool",
  "miniagent-workflow",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1158,6 +1160,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "miniagent-research"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
