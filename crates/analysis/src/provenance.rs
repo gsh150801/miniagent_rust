@@ -71,7 +71,7 @@ pub fn record_file(path: &Path) -> Option<FileRecord> {
     Some(FileRecord {
         path: path.to_path_buf(),
         size_bytes: meta.len(),
-        hash: fnv1a_hex(&bytes),
+        hash: sha256_hex(&bytes),
     })
 }
 
@@ -118,6 +118,10 @@ pub fn current_git_commit(working_dir: &Path) -> Option<String> {
 }
 
 /// FNV-1a 64-bit hash of bytes, returned as lowercase hex.
+///
+/// Kept for legacy provenance records; new records use [`sha256_hex`]
+/// (FNV-1a is non-cryptographic — collisions are trivially craftable, which
+/// undermines "these bytes are provably the ones that ran").
 pub fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -125,6 +129,14 @@ pub fn fnv1a_hex(bytes: &[u8]) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
+}
+
+/// SHA-256 of bytes as lowercase hex — the provenance hash of record.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Truncate a potentially large buffer to a preview string (UTF-8 lossy, capped).
@@ -152,6 +164,19 @@ mod tests {
     }
 
     #[test]
+    fn sha256_known_vector() {
+        // Well-known SHA-256 of the empty string and of "abc".
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn record_file_captures_hash_and_size() {
         let dir = std::env::temp_dir().join("miniagent_provenance_tests");
         std::fs::create_dir_all(&dir).unwrap();
@@ -161,8 +186,8 @@ mod tests {
         f.write_all(content).unwrap();
         let rec = record_file(&path).unwrap();
         assert_eq!(rec.size_bytes, content.len() as u64);
-        assert_eq!(rec.hash.len(), 16);
-        assert_eq!(rec.hash, fnv1a_hex(content));
+        assert_eq!(rec.hash.len(), 64);
+        assert_eq!(rec.hash, sha256_hex(content));
         assert!(!rec.hash.contains(' '));
         std::fs::remove_file(path).ok();
     }

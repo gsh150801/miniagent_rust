@@ -212,6 +212,7 @@ impl StageDriver for DebateRunner {
             data,
             summary,
             side_effects,
+            mode: "debate".to_string(),
         })
     }
 }

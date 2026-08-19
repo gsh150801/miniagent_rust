@@ -271,6 +271,81 @@ impl KgeModel {
         d
     }
 
+    /// Hold-out evaluation: train on `(1 - test_frac)` of the edges, then
+    /// rank each held-out triple against every entity as a corrupted tail
+    /// (raw — unfiltered — ranking; good enough as a printed diagnostic).
+    ///
+    /// Returns `(mrr, hits_at_10, n_test)`. Same test edges are used for
+    /// every call with the same KG so numbers are comparable across runs of
+    /// the pipeline.
+    pub fn holdout_evaluate(
+        dim: usize,
+        kg: &KnowledgeGraph,
+        epochs: usize,
+        lr: f64,
+        test_frac: f64,
+    ) -> (f64, usize, usize) {
+        let relations = kg.all_relations();
+        if relations.len() < 10 {
+            return (0.0, 0, 0); // too small to evaluate meaningfully
+        }
+        let n_test = ((relations.len() as f64) * test_frac.clamp(0.05, 0.3)) as usize;
+        let n_test = n_test.max(1);
+
+        // Deterministic split: stride sampling keeps it stable and cheap.
+        let stride = relations.len() / n_test.max(1);
+        let test: Vec<&crate::schema::Relation> = (0..n_test)
+            .map(|i| &relations[(i * stride).min(relations.len() - 1)])
+            .collect();
+        let test_keys: std::collections::HashSet<(usize, usize)> = test
+            .iter()
+            .map(|r| (r.from_id.0.as_u128() as usize, r.to_id.0.as_u128() as usize))
+            .collect();
+
+        let mut train_kg = KnowledgeGraph::new();
+        for e in kg.all_entities() {
+            train_kg.add_entity(e.clone());
+        }
+        for r in relations {
+            let key = (r.from_id.0.as_u128() as usize, r.to_id.0.as_u128() as usize);
+            if !test_keys.contains(&key) {
+                train_kg.add_relation(r.clone());
+            }
+        }
+
+        let mut model = KgeModel::new(dim);
+        model.train(&train_kg, epochs, lr);
+
+        let all_entity_ids: Vec<crate::schema::EntityId> =
+            kg.all_entities().map(|e| e.id).collect();
+        let mut reciprocal_ranks = Vec::with_capacity(test.len());
+        let mut hits = 0usize;
+        for rel in &test {
+            // Rank the true tail against all entities.
+            let mut scored: Vec<(f64, bool)> = all_entity_ids
+                .iter()
+                .map(|cand| {
+                    let d = model.distance(&rel.from_id, &rel.relation_type, cand);
+                    (d, *cand == rel.to_id)
+                })
+                .collect();
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(rank0) = scored.iter().position(|(_, truth)| *truth) {
+                let rank = rank0 + 1;
+                reciprocal_ranks.push(1.0 / rank as f64);
+                if rank <= 10 {
+                    hits += 1;
+                }
+            }
+        }
+        let mrr = if reciprocal_ranks.is_empty() {
+            0.0
+        } else {
+            reciprocal_ranks.iter().sum::<f64>() / reciprocal_ranks.len() as f64
+        };
+        (mrr, hits, test.len())
+    }
+
     fn uniform_vec(dim: usize, bound: f64) -> Vec<f64> {
         let mut rng = rand::thread_rng();
         (0..dim)
@@ -331,6 +406,8 @@ mod tests {
                 confidence: 0.9,
                 evidence: "test".into(),
                 source_paper_id: None,
+                support_count: 1,
+                supporting_papers: vec![],
             });
         }
         kg

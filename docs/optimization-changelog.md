@@ -2263,3 +2263,61 @@ Ran 3 tests in 0.000s  OK
 - `cargo test --workspace` 通过；新增 `strip_reasoning_tags`、`ModelKind` 解析、factory 构造单测。
 - server 冒烟：`/api/models` 列表（key 掩码）→ 添加自定义模型 → 激活热切换 → 删除保护（使用中不可删）→ `models.json` 持久化往返。
 - research 端到端（帕金森 6 篇）：修复后 42 实体/56 关系 → 5 假说 → 辩论 → 2 验证计划 → 7 个分析任务（notebook 生成；有 Jupyter 环境的真实执行，无本地数据的 dry-run 交付 script+notebook）。
+
+---
+
+## Round 35: 统一路径锚定 + 写围栏 + 审计报告（DeepSeek harness 思想借鉴）
+
+### 任务背景
+
+四任务循环：① 统一工作流模式，修复结果目录散落（部分任务结果落在 `.worktrees/result/{id}_{name}` 或仓库根而非 `result/{id}_{name}`）；② 借鉴 DeepSeek harness（dsh）设计思想做针对性修改；③ 渐冻症（ALS）端到端回归；④ 硬编码密钥审计后更新 GitHub。
+
+### 任务一：诊断与统一
+
+**根因**（`.worktrees` 逃逸本体已在 Round 33 修复，本轮清扫残余同类缺陷）：
+
+1. 所有产物路径都以**进程 CWD 相对路径**为锚（`./result`、`models.json`、`./result/.workflow`、`./result/loop-pipeline`）——从其他目录启动 server/CLI 时结果整体落错位置。
+2. workflow 模式的 `AgentStage`/`ResearcherStage`/`AnalystStage`/`OrchestratorStage` 构建 `RunContext` 时**不设 working_dir** → agent 工具（bash/write/edit）以进程 CWD 执行，相对路径写入全部逃逸（仓库根的 `miniagent_context/`、`miniagent_debate/` 残留即此因）。
+3. planning 角色统一入口 `call_llm_with_tools` 同样不设 working_dir（13 个角色文件全部受影响）；`Blackboard`/`GraphState` 默认 `./miniagent_workspace`、agent 上下文转储 `./miniagent_context`、research 流水线 `ToolContext` 用 `current_dir()` —— 五处 CWD 相对散落源。
+4. 任务目录命名 `sanitize_task_brief`/`{id}_{brief}` 在 server 与 CLI 各写一份（漂移风险）。
+
+**修改**：
+
+- 新增 `crates/core/src/paths.rs` —— 单一来源：`workspace_root()`（`MINIAGENT_ROOT` > 从 CWD/exe 向上找 `[workspace]` Cargo.toml 或 `.miniagent-root` 标记 > CWD 兜底）、`result_root()`（`MINIAGENT_RESULT_DIR` > `<root>/result`，create+canonicalize 保证绝对路径）、`models_file()`、`sanitize_task_brief()`/`task_dir_name()`。带单测。
+- 接入点全量替换：server `AppState.task_dir`、CLI `run`/`research`/`literature-review`/`debate` 四处、loop-pipeline 默认目录、workflow `default_workflow_dir()`（替换 `WORKFLOW_DIR` 常量，builder/engine 回退同步）、`ModelRegistry` 的 `models.json` 路径。
+- **写围栏（writes fenced）**：workflow 四个 stage 的 `RunContext` 全部 `.with_working_dir(task_workflow_dir)`；`call_llm_with_tools` 增加 `work_dir` 参数（13 个角色调用点批量接入，传 `blackboard.work_dir_str()`）；`Blackboard`/`GraphState` 默认目录、agent 上下文转储、research `ToolContext` 全部锚定。
+- server `create_new_task` 目录创建失败从 `let _ =` 改为 error 日志（fail loudly）。
+- `.env.example` 增加 `MINIAGENT_ROOT`/`MINIAGENT_RESULT_DIR` 说明。
+- 前后端贴合确认：四模式（workflow/loop/debate/research）统一走 `create_new_task` → plan pills → progress 事件 → `finalize_task` 生命周期，mode 随 WS 消息传递、未知值回退 workflow；loop 阶段名小写对齐 workflow 渲染。
+
+### 任务二：借鉴的 dsh 设计思想与落地
+
+| dsh 思想 | 本轮落地 |
+|---|---|
+| Append-only trajectory（模型看到的一切可从日志还原） | research 流水线启动即写 `run_config` 事件：模型档案 id/名称/协议族/flash+pro 模型名 + 全量选项快照（n/top-n/debate/min_year…），任何阶段可从 `project.json` 复原归因 |
+| 审计对人类可读（trajectory ≠ 只给机器） | 新增 `ProjectManifest::write_run_report()` → `run_report.md`：阶段表（状态/时长/产物）、假说/验证计划/分析清单、完整 append-only 事件时间线；随 finalize 自动出现在前端文件列表 |
+| Writes fenced（写权限围栏） | 上文 working_dir 全量注入——工具相对路径写入被锚定在任务目录内 |
+| Fail loudly（禁止静默吞错） | 任务目录创建失败显式 error；`run_report.md`/manifest 写入失败打印告警并记事件 |
+| Everything is a plugin 的路径层对应 | 路径解析本身可注入（env 覆盖 > 标记文件探测 > 兜底），部署形态（本机/服务器/容器）无需改码 |
+
+### 验证
+
+- `cargo check --workspace` 干净；`cargo test --workspace`（除已知环境失败的 StepFun 在线订阅外）全部通过，含 loop-pipeline 37 项集成（真实 DeepSeek API 全流程）与 core 新增 paths 单测。
+- 帕金森病快速 e2e（任务一验证）与渐冻症完整 e2e（任务三）结果见下文。
+
+### 验证过程中暴露并修复的缺陷（帕金森首跑）
+
+1. **中文查询翻译回显**：MiniMax 对翻译请求原样回显中文 → 直接送 PubMed 必然 0 检索（验证门正确拦截，但任务无法进行）。修复（dsh self-verification）：翻译结果必须通过"纯 ASCII PubMed 查询"校验，失败带纠正性指令重试一次，仍失败记 `query_translation_failed` 事件后回退原查询。
+2. **`fix_truncated_json` 闭合顺序错误**（辩论精炼 `expected ',' or '}'` 的真正根因）：旧实现先补全部 `]` 再补全部 `}`，截断发生在数组元素内部时产出 `…"]}}`（数组在元素对象闭合前关闭）→ 必然解析失败。修复为栈序闭合（`}` `]` `}`），并处理截断在反斜杠后的边角情况。
+3. **辩论 JSON 截断无抢救**：重试两次仍失败即整阶段失败。新增 `salvage_truncated()`：迭代截掉尾部不完整片段并重新闭合，直到前缀可解析——精炼输出是逐项数组，部分项远好于整阶段丢失；`complete_json` max_tokens 3500→8000 降低截断概率。带单测。
+
+- server 冒烟：启动恢复 40 个历史任务（新路径解析生效）、`/api/models` 正常（active=builtin-minimax）、搜索后端健康探测 4/7（tavily/pubmed/langsearch/anysearch）。
+- 帕金森 e2e：全部工件（papers/kg/hypotheses/debate_evidence/plans/analysis notebooks）仅落在 `result/58906165_帕金森病致病机理/`，仓库根目录 diff 为空（零散落）。
+
+### ALS 端到端回归（任务三）
+
+ALS 完整管线（`cargo run -p miniagent-cli -- research -q "肌萎缩侧索硬化（渐冻症，ALS）的致病机理" -n 12 --validate --analyze --top-n 2`）：
+
+- **辩论修复确认**：辩论阶段（帕金森跑失败的关键环节）在 ALS run 上首次成功完成（`debate_completed`），精炼产出 `hypotheses_refined.json` + `hypotheses_refined_full.json`，验证了任务二/任务三修复的截断抢救 + 栈序闭合 + max_tokens 提升组合有效。
+- **计划生成**：2 个验证计划（`plans/validation_plan_0/1.json`），每个 4 数据分析任务 + 3~4 湿实验方案。
+- **工件全部就位**：仅落在 `result/8e55dd4e_肌萎缩侧索硬化_渐冻症_ALS_的致病机理/` 下（含 `debate_report.json` 与精炼 hypothesis 文件），仓库根目录无散落。

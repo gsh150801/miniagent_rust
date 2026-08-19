@@ -14,7 +14,10 @@ miniagent-checkpoint = { path = "../checkpoint" }
 miniagent-telemetry = { path = "../telemetry" }
 miniagent-workflow = { path = "../workflow" }
 miniagent-loop-pipeline = { path = "../loop-pipeline" }
+miniagent-planning = { path = "../planning" }
 miniagent-skill = { path = "../skill" }
+miniagent-research = { path = "../research" }
+miniagent-analysis = { path = "../analysis" }
 tokio-util.workspace = true
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower-http.workspace = true

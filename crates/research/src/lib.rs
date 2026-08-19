@@ -11,6 +11,9 @@
 //! summaries as plain JSON, so it can be used by the CLI (and any other
 //! orchestrator) without pulling in the agent/kg/hypothesis crates.
 
+pub mod pipeline;
+pub use pipeline::{run_research, ResearchOptions, ResearchProgress};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -257,6 +260,100 @@ impl ProjectManifest {
             .with_context(|| format!("parse manifest {}", path.display()))?;
         manifest.dir = dir;
         Ok(manifest)
+    }
+
+    /// Render the audit timeline as a human-readable `run_report.md` next to
+    /// `project.json`: model/config attribution, per-stage table, artifact
+    /// inventory, and the full append-only event log (dsh: everything the
+    /// run did must be reconstructable from disk).
+    pub fn write_run_report(&self) -> Result<PathBuf> {
+        let mut md = String::new();
+        md.push_str("# Run Report\n\n");
+        md.push_str(&format!(
+            "- **Query**: {}\n- **Run ID**: {}\n- **Created**: {}\n- **Last update**: {}\n- **Project dir**: `{}`\n\n",
+            self.query,
+            self.id,
+            self.created_at.to_rfc3339(),
+            self.updated_at.to_rfc3339(),
+            self.dir.display(),
+        ));
+
+        md.push_str("## Stages\n\n| Stage | Status | Duration | Outputs |\n|---|---|---|---|\n");
+        for s in &self.stages {
+            let outputs = if s.output_paths.is_empty() {
+                "—".to_string()
+            } else {
+                s.output_paths
+                    .iter()
+                    .map(|p| format!("`{}`", p.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let status = match s.status {
+                StageStatus::Completed => "✅ completed",
+                StageStatus::Failed => "❌ failed",
+                StageStatus::Running => "🔄 running",
+                StageStatus::Skipped => "⏭ skipped",
+            };
+            md.push_str(&format!(
+                "| {} | {} | {:.1}s | {} |\n",
+                s.name, status, s.duration_secs, outputs
+            ));
+        }
+
+        if let Some(stats) = &self.kg_stats {
+            md.push_str(&format!("\n**KG stats**: `{stats}`\n"));
+        }
+
+        if !self.hypotheses.is_empty() {
+            md.push_str("\n## Hypotheses\n\n");
+            for h in &self.hypotheses {
+                let tag = if h.refined { "refined" } else { "ranked" };
+                md.push_str(&format!(
+                    "{}. **[{tag}]** {} (`{}`)\n",
+                    h.rank,
+                    h.statement.replace('\n', " "),
+                    h.id
+                ));
+            }
+        }
+        if let Some(report) = &self.debate_report {
+            md.push_str(&format!("\n**Debate report**: `{}`\n", report.display()));
+        }
+        if !self.validation_plans.is_empty() {
+            md.push_str("\n## Validation Plans\n\n");
+            for p in &self.validation_plans {
+                md.push_str(&format!("- `{}`\n", p.display()));
+            }
+        }
+        if !self.analyses.is_empty() {
+            md.push_str("\n## Data Analyses\n\n| Task | Backend | Success | Notebook | Provenance |\n|---|---|---|---|---|\n");
+            for a in &self.analyses {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n",
+                    a.task_id,
+                    if a.execution_backend.is_empty() { "—" } else { &a.execution_backend },
+                    if a.success { "✅" } else { "❌" },
+                    a.notebook_path.as_ref().map(|p| format!("`{}`", p.display())).unwrap_or_else(|| "—".into()),
+                    a.provenance_path.as_ref().map(|p| format!("`{}`", p.display())).unwrap_or_else(|| "—".into()),
+                ));
+            }
+        }
+
+        md.push_str("\n## Event Log (append-only)\n\n| Time | Kind | Message |\n|---|---|---|\n");
+        for e in &self.event_log {
+            md.push_str(&format!(
+                "| {} | {} | {} |\n",
+                e.timestamp.to_rfc3339(),
+                e.kind,
+                e.message.replace('|', "\\|").replace('\n', " ")
+            ));
+        }
+
+        let path = self.dir.join("run_report.md");
+        std::fs::write(&path, md)
+            .with_context(|| format!("write run report {}", path.display()))?;
+        Ok(path)
     }
 }
 

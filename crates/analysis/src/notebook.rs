@@ -61,12 +61,17 @@ pub fn execute_notebook(
         .unwrap_or_else(|| notebook_path.to_path_buf());
 
     let started = std::time::Instant::now();
+    let nbconvert_timeout = timeout_secs.max(1).to_string();
     let output = std::process::Command::new("jupyter")
         .args([
             "nbconvert",
             "--to",
             "notebook",
             "--execute",
+            // Per-cell timeout: a hanging cell (infinite loop, blocking IO)
+            // otherwise stalls the whole pipeline forever.
+            "--ExecutePreprocessor.timeout",
+            &nbconvert_timeout,
             "--output",
             &out.to_string_lossy(),
             &notebook_path.to_string_lossy(),
@@ -83,8 +88,6 @@ pub fn execute_notebook(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code().unwrap_or(-1);
-
-    let _ = timeout_secs; // honored by nbconvert's own cell timeout in future; reserved.
 
     Ok(NotebookResult {
         notebook_path: out,

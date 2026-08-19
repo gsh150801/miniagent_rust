@@ -860,19 +860,16 @@ impl Agent {
 
     /// Write the compressed context summary to disk.
     fn save_context_file(summary: &str) {
-        let dir = match std::path::PathBuf::from("./miniagent_context").canonicalize() {
-            Ok(d) => d,
-            Err(_) => {
-                let d = std::path::PathBuf::from("./miniagent_context");
-                if std::fs::create_dir_all(&d).is_err() {
-                    return;
-                }
-                d
-            }
-        };
+        // Anchored under the workspace root (was `./miniagent_context`
+        // relative to the process CWD, which scattered dump files whenever
+        // the binary was launched from another directory).
+        let dir = miniagent_core::paths::workspace_root().join(".miniagent_context");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
 
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = dir.join(format!("history_{ts}.md"));

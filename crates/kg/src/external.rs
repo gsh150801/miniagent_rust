@@ -298,6 +298,8 @@ pub fn merge_external(kg: &mut KnowledgeGraph, triples: &[ExternalTriple]) -> Me
             confidence: t.confidence,
             evidence: format!("external:{}", t.source),
             source_paper_id: None,
+            support_count: 1,
+            supporting_papers: vec![],
         });
         stats.edges_added += 1;
     }

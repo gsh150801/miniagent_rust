@@ -1587,7 +1587,7 @@ async fn test_full_pipeline_multi_loop() {
         config,
         3,  // 3 loops
         cancel,
-    ).await;
+        None, None).await;
 
     match result {
         Ok(state) => {
@@ -1625,7 +1625,7 @@ async fn test_full_loop_pipeline_real_api() {
         config,
         1,
         cancel,
-    ).await;
+        None, None).await;
 
     match result {
         Ok(state) => {
@@ -3417,7 +3417,7 @@ async fn test_real_long_running_research_pipeline() {
             config,
             20,  // max 20 loops
             cancel,
-        )
+            None, None)
     ).await;
 
     match result {

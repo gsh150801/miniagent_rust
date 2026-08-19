@@ -7,6 +7,8 @@ miniagent_audit/
 miniagent_debate/
 miniagent_workflow/
 miniagent_context/
+.miniagent_context/
+.miniagent-root
 .claude/
 *.py
 scripts/
@@ -16,4 +18,9 @@ scripts/
 .zcode/
 __pycache__/
 stdout.txt
+stdout*.txt
+stderr*.txt
+efetch_multi.txt
 models.json
+kg_store.json
+skills/*/examples/*/output/

@@ -65,6 +65,12 @@
       <div class="file-chips" id="skillChips"></div>
       <div class="input-row">
         <button class="btn-upload" onclick="document.getElementById('fileInput').click()" title="Upload file">&#128206;</button>
+        <select id="modeSelect" class="mode-select" title="选择工作流模式">
+          <option value="workflow">⚙️ Workflow</option>
+          <option value="loop">🔄 Loop</option>
+          <option value="debate">⚖️ Debate</option>
+          <option value="research">🔬 Research</option>
+        </select>
         <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.pdf,.csv,.json,.py,.rs,.js,.ts,.html,.css">
         <div class="input-wrap">
           <textarea id="input" rows="1" placeholder="Ask anything..." onkeydown="handleKey(event)"></textarea>
@@ -124,6 +130,26 @@
     </div>
     <div class="modal-body">
       <div id="modelList" class="model-list"></div>
+      <div class="debate-roles-head" onclick="toggleDebateRoles()">
+        <span>&#9878;&#65039; 辩论角色模型（正方 / 反方 / 裁判）</span>
+        <span id="debateRolesChevron">&#9660;</span>
+      </div>
+      <div class="debate-roles" id="debateRoles" style="display:none">
+        <p class="form-hint">辩论模式下每个角色可用不同模型；默认全部使用主模型。设置对 Web 辩论模式和 CLI（debate / research 管线）同时生效。</p>
+        <div class="form-row">
+          <label>&#128221; 正方 Proposer</label>
+          <select id="drProposer"></select>
+        </div>
+        <div class="form-row">
+          <label>&#9876;&#65039; 反方 Opponent</label>
+          <select id="drOpponent"></select>
+        </div>
+        <div class="form-row">
+          <label>&#9878;&#65039; 裁判 Judge</label>
+          <select id="drJudge"></select>
+        </div>
+        <button class="btn-model-add" onclick="saveDebateRoles()">保存辩论角色设置</button>
+      </div>
       <div class="model-form-head" onclick="toggleModelForm()">
         <span>+ 添加自定义模型（OpenAI / Anthropic 兼容端点）</span>
         <span id="modelFormChevron">&#9660;</span>

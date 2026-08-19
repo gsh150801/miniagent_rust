@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use miniagent_core::models::{ModelKind, ModelProfile};
+use miniagent_core::models::{DebateRole, ModelKind, ModelProfile, ModelRegistry};
+use miniagent_core::settings::AppConfig;
 
 use crate::deepseek::DeepSeekClient;
 use crate::minimax::MiniMaxClient;
@@ -71,6 +72,56 @@ pub fn build_provider_pair(
     let flash: Arc<dyn LlmProvider> = build_provider(profile, ProviderTier::Flash)?.into();
     let pro: Arc<dyn LlmProvider> = build_provider(profile, ProviderTier::Pro)?.into();
     Ok((flash, pro))
+}
+
+/// Build the provider serving a debate role from an already-resolved
+/// profile (caller resolves via [`ModelRegistry::role_profile`]). Debate
+/// calls are reasoning-heavy → Pro tier.
+pub fn resolve_role_provider_from(
+    profile: &ModelProfile,
+) -> Result<Box<dyn LlmProvider>, String> {
+    build_provider(profile, ProviderTier::Pro)
+}
+
+/// Build the provider serving a debate role. Resolution order:
+/// ⚙️-persisted selection (models.json) → `DEBATE_*_MODEL` env var → active
+/// main model. Debate calls are reasoning-heavy, so the Pro tier of the
+/// resolved profile is used.
+pub fn resolve_role_provider(
+    registry: &ModelRegistry,
+    role: DebateRole,
+) -> Result<Box<dyn LlmProvider>, String> {
+    let profile = registry.role_profile(role);
+    let provider = build_provider(profile, ProviderTier::Pro)?;
+    if profile.id != registry.active_id() {
+        tracing::info!(
+            role = role.key(),
+            profile = %profile.display_name,
+            model = profile.pro_model(),
+            "debate role routed to non-default profile"
+        );
+    }
+    Ok(provider)
+}
+
+/// Convenience: registry from `config` + all three debate-role providers in
+/// `(proposer, opponent, judge)` order.
+pub fn resolve_debate_providers(
+    config: &AppConfig,
+) -> Result<
+    (
+        Box<dyn LlmProvider>,
+        Box<dyn LlmProvider>,
+        Box<dyn LlmProvider>,
+    ),
+    String,
+> {
+    let registry = ModelRegistry::load(config);
+    Ok((
+        resolve_role_provider(&registry, DebateRole::Proposer)?,
+        resolve_role_provider(&registry, DebateRole::Opponent)?,
+        resolve_role_provider(&registry, DebateRole::Judge)?,
+    ))
 }
 
 #[cfg(test)]

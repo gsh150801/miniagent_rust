@@ -120,72 +120,28 @@ impl ToolExecutor {
             results.extend(read_results);
         }
 
-        // Parallel Mutating via working directory copy per tool
-        if !writes.is_empty() {
-            let worktree_dir = std::path::PathBuf::from(&ctx.working_dir).join(".worktrees");
-            let _ = std::fs::create_dir_all(&worktree_dir);
-
-            let write_futures: Vec<_> = writes
-                .iter()
-                .map(|call| {
-                    let name = call.name.clone();
-                    let input = call.input.clone();
-                    let id = call.id;
-                    let token = cancel.child_token();
-                    let base_dir = ctx.working_dir.clone();
-                    let wt_dir = worktree_dir.clone();
-                    let registry = self.registry.clone();
-
-                    async move {
-                        let worktree = wt_dir.join(format!("tool_{}", id.0));
-                        let _ = std::fs::create_dir_all(&worktree);
-                        let tool_ctx = ToolContext::new(
-                            worktree.to_string_lossy().to_string(),
-                            format!("{}_{}", base_dir, id.0),
-                        );
-                        match Self::execute_raw_via(&registry, &name, &input, &tool_ctx, token).await {
-                            Ok(out) => (id, out),
-                            Err(e) => (id, ToolOutput {
-                                content: format!("Error: {e}"),
-                                metadata: None,
-                            }),
-                        }
-                    }
-                })
-                .collect();
-
-            let write_results = futures_util::future::join_all(write_futures).await;
-            results.extend(write_results);
+        // Mutating tools run sequentially in the real working directory.
+        //
+        // They previously ran in per-call subdirectories under `.worktrees/`,
+        // which was broken three ways: the subdirectories were empty (a
+        // mutating tool could not read files it was supposed to edit), bash
+        // had no path fence (so `mkdir ../result/...` from the LLM escaped to
+        // `.worktrees/result/...` and artifacts silently landed outside the
+        // task's result directory), and nothing was ever merged back. Running
+        // them sequentially in `ctx.working_dir` keeps writes race-free and
+        // guarantees every artifact lands inside the task directory.
+        for call in &writes {
+            let result = self
+                .execute(&call.name, &call.input, ctx, cancel.child_token())
+                .await
+                .unwrap_or_else(|e| ToolOutput {
+                    content: format!("Error: {e}"),
+                    metadata: None,
+                });
+            results.push((call.id, result));
         }
 
         results
-    }
-
-    /// Execute a single tool call via registry reference.
-    async fn execute_raw_via(
-        registry: &ToolRegistry,
-        name: &str,
-        input: &serde_json::Value,
-        ctx: &ToolContext,
-        cancel: CancellationToken,
-    ) -> Result<ToolOutput, AgentError> {
-        let tool = match registry.get(name) {
-            Some(t) => t,
-            None => return Err(AgentError::ToolNotFound(name.to_string())),
-        };
-        let start = Instant::now();
-        let result = tool.execute(input.clone(), ctx, cancel).await;
-        let duration_ms = start.elapsed().as_millis() as u64;
-        match result {
-            Ok(mut output) => {
-                output.metadata = Some(crate::traits::ToolMetadata { duration_ms, is_error: false });
-                Ok(output)
-            }
-            Err(e) => Ok(ToolOutput {
-                content: format!("Error: {e}"),
-                metadata: Some(crate::traits::ToolMetadata { duration_ms, is_error: true }),
-            }),
-        }
     }
 
     fn is_readonly(&self, name: &str) -> bool {

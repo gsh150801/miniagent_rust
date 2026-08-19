@@ -16,9 +16,6 @@ use crate::settings::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Where custom profiles + active selection are persisted.
-pub const MODELS_FILE: &str = "models.json";
-
 /// Protocol family of a profile. Determines which client implementation
 /// serves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +109,63 @@ impl ModelProfile {
     }
 }
 
+/// Debate role. Each role can be served by a different model profile; all
+/// default to the active main model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DebateRole {
+    Proposer,
+    Opponent,
+    Judge,
+}
+
+impl DebateRole {
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::Proposer => "proposer",
+            Self::Opponent => "opponent",
+            Self::Judge => "judge",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Proposer => "正方 (Proposer)",
+            Self::Opponent => "反方 (Opponent)",
+            Self::Judge => "裁判 (Judge)",
+        }
+    }
+}
+
+/// Per-role profile selection (None = active main model). Persisted inside
+/// `models.json` so both the server UI and the CLI read the same choice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebateRoleSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<String>,
+}
+
+impl DebateRoleSelection {
+    pub fn get(&self, role: DebateRole) -> Option<&String> {
+        match role {
+            DebateRole::Proposer => self.proposer.as_ref(),
+            DebateRole::Opponent => self.opponent.as_ref(),
+            DebateRole::Judge => self.judge.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, role: DebateRole, id: Option<String>) {
+        match role {
+            DebateRole::Proposer => self.proposer = id,
+            DebateRole::Opponent => self.opponent = id,
+            DebateRole::Judge => self.judge = id,
+        }
+    }
+}
+
 /// Serializable state persisted to `models.json`.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct RegistryFile {
@@ -119,6 +173,10 @@ struct RegistryFile {
     active_id: Option<String>,
     #[serde(default)]
     custom: Vec<ModelProfile>,
+    /// Per-role debate model selection (server ⚙️ settings). Missing on
+    /// legacy files → all roles fall back to the env / active main model.
+    #[serde(default)]
+    debate: DebateRoleSelection,
 }
 
 /// Registry of all known profiles + the active selection.
@@ -127,6 +185,10 @@ pub struct ModelRegistry {
     builtins: Vec<ModelProfile>,
     custom: Vec<ModelProfile>,
     active_id: String,
+    /// Debate role selection persisted via the server UI (models.json).
+    debate: DebateRoleSelection,
+    /// Env-var defaults (`.env` DEBATE_*_MODEL); lower priority than `debate`.
+    env_debate: DebateRoleSelection,
     path: PathBuf,
 }
 
@@ -135,7 +197,7 @@ impl ModelRegistry {
     /// selection from `models.json` (if present).
     pub fn load(config: &AppConfig) -> Self {
         let builtins = Self::builtin_profiles(config);
-        let path = PathBuf::from(MODELS_FILE);
+        let path = crate::paths::models_file();
         let file: RegistryFile = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -159,10 +221,18 @@ impl ModelRegistry {
             })
             .unwrap_or(default_active);
 
+        let env_debate = DebateRoleSelection {
+            proposer: config.debate_proposer_model.clone(),
+            opponent: config.debate_opponent_model.clone(),
+            judge: config.debate_judge_model.clone(),
+        };
+
         Self {
             builtins,
             custom: file.custom,
             active_id,
+            debate: file.debate,
+            env_debate,
             path,
         }
     }
@@ -290,11 +360,57 @@ impl ModelRegistry {
         Ok(())
     }
 
+    /// Effective debate role selection: UI-persisted choice > env default.
+    pub fn debate_selection(&self) -> DebateRoleSelection {
+        DebateRoleSelection {
+            proposer: self
+                .debate
+                .proposer
+                .clone()
+                .or_else(|| self.env_debate.proposer.clone()),
+            opponent: self
+                .debate
+                .opponent
+                .clone()
+                .or_else(|| self.env_debate.opponent.clone()),
+            judge: self
+                .debate
+                .judge
+                .clone()
+                .or_else(|| self.env_debate.judge.clone()),
+        }
+    }
+
+    /// Resolve the profile serving a debate role: explicit selection (UI >
+    /// env), else the active main model. Unresolvable selections (deleted
+    /// profile) fall back to the main model rather than erroring.
+    pub fn role_profile(&self, role: DebateRole) -> &ModelProfile {
+        if let Some(id) = self.debate_selection().get(role)
+            && let Some(p) = self.get(id)
+        {
+            return p;
+        }
+        self.active()
+    }
+
+    /// Persist a per-role selection (from the server ⚙️ settings). `None`
+    /// clears the role back to the main model. Fails if the profile id is
+    /// unknown.
+    pub fn set_debate_role(&mut self, role: DebateRole, id: Option<String>) -> Result<(), String> {
+        if let Some(ref id) = id && self.get(id).is_none() {
+            return Err(format!("未找到模型配置: {id}"));
+        }
+        self.debate.set(role, id);
+        let _ = self.save();
+        Ok(())
+    }
+
     /// Persist custom profiles + active selection to `models.json`.
     fn save(&self) -> std::io::Result<()> {
         let file = RegistryFile {
             active_id: Some(self.active_id.clone()),
             custom: self.custom.clone(),
+            debate: self.debate.clone(),
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

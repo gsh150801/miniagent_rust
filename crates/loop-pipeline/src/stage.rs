@@ -2,14 +2,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use miniagent_agent::Agent;
 use miniagent_core::error::AgentError;
+use miniagent_core::models::ModelRegistry;
 use miniagent_core::settings::AppConfig;
 use miniagent_tool::approval::AutoApprove;
 use miniagent_tool::executor::ToolExecutor;
 use miniagent_tool::tools;
-use miniagent_provider::deepseek::{DeepSeekFlash, DeepSeekPro};
-use miniagent_provider::stepfun::StepFunFlash;
-use miniagent_provider::minimax::MiniMaxFlash;
-use miniagent_provider::traits::LlmProvider;
+use miniagent_provider::factory::{self, ProviderTier};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -50,30 +48,19 @@ impl StageContext {
 
     /// Build the shared Agent once — reused by all stages and all dispatched tasks.
     ///
-    /// Provider selection mirrors the CLI's `make_providers`: when
-    /// `config.is_stepfun()` we use StepFun (single model for every role),
-    /// otherwise we use DeepSeek Flash/Pro. Previously this hardcoded StepFun,
-    /// which silently broke the loop pipeline whenever `PROVIDER=deepseek`.
+    /// Provider construction goes through the runtime model registry +
+    /// [`factory::build_provider`] (single source of truth, DeepSeek-harness
+    /// lesson): the active `ModelProfile` — env built-ins or a custom
+    /// `models.json` entry — decides flash/pro, including OpenAI/Anthropic
+    /// compatible endpoints. The old per-provider if/else branches here
+    /// silently fell back to DeepSeek (or panicked) under custom profiles.
     fn build_agent(config: &AppConfig) -> Arc<Agent> {
-        let (flash, pro): (Box<dyn LlmProvider>, Box<dyn LlmProvider>) = if config.is_stepfun() {
-            let key = config
-                .require_stepfun_key()
-                .expect("STEPFUN_API_KEY required for loop pipeline");
-            // StepFun uses a single model for all roles; clone as "pro" for repair/judge stages.
-            let pro = StepFunFlash::new(key).with_base_url(config.stepfun_base_url.clone());
-            (Box::new(StepFunFlash::new(key)), Box::new(pro))
-        } else if config.is_minimax() {
-            let key = config
-                .require_minimax_key()
-                .expect("MINIMAX_API_KEY required for loop pipeline");
-            let pro = MiniMaxFlash::new(key).with_base_url(config.minimax_base_url.clone());
-            (Box::new(MiniMaxFlash::new(key)), Box::new(pro))
-        } else {
-            let key = config
-                .require_deepseek_key()
-                .expect("DEEPSEEK_API_KEY required for loop pipeline");
-            (Box::new(DeepSeekFlash::new(key)), Box::new(DeepSeekPro::new(key)))
-        };
+        let registry = ModelRegistry::load(config);
+        let profile = registry.active();
+        let flash = factory::build_provider(profile, ProviderTier::Flash)
+            .unwrap_or_else(|e| panic!("loop pipeline: active model profile unusable: {e}"));
+        let pro = factory::build_provider(profile, ProviderTier::Pro)
+            .unwrap_or_else(|e| panic!("loop pipeline: active model profile unusable: {e}"));
 
         let tool_registry = tools::defaults();
         let executor = ToolExecutor::new(tool_registry, Box::new(AutoApprove));
@@ -84,6 +71,16 @@ impl StageContext {
                 .with_tools(executor)
                 .with_config(config_arc),
         )
+    }
+
+    /// Anchor all tool execution to `dir` (the task's result directory).
+    ///
+    /// Dispatched agents run bash/write with this as their working directory,
+    /// so relative-path artifacts land inside the task dir; dispatch-stage
+    /// persistence and `outputs_still_exist` checks use the same base.
+    pub fn with_working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = dir.into();
+        self
     }
 
     pub fn with_max_loops(mut self, n: usize) -> Self {

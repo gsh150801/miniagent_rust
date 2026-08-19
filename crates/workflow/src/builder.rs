@@ -171,7 +171,7 @@ impl WorkflowBuilder {
             .collect();
 
         // Set input
-        let task_dir = self.task_dir.clone().unwrap_or_else(|| "./result/.workflow".into());
+        let task_dir = self.task_dir.clone().unwrap_or_else(crate::stages::default_workflow_dir);
         wf = wf.with_input(serde_json::json!({
             "prompt": prompt,
             "system": system,

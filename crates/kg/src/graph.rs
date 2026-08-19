@@ -1,12 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use crate::schema::{Entity, EntityId, Relation, RelationType};
 
+type EdgeKey = (EntityId, RelationType, EntityId);
+
 pub struct KnowledgeGraph {
     entities: HashMap<EntityId, Entity>,
     // Adjacency list: entity -> list of (relation, target, confidence)
     outgoing: HashMap<EntityId, Vec<(RelationType, EntityId, f64)>>,
     incoming: HashMap<EntityId, Vec<(RelationType, EntityId, f64)>>,
     relations: Vec<Relation>,
+    /// (head, relation, tail) → position in `relations`. Backs O(1) triple
+    /// aggregation: re-extracting a known triple increments support instead of
+    /// appending a duplicate edge.
+    edge_index: HashMap<EdgeKey, usize>,
 }
 
 impl KnowledgeGraph {
@@ -16,6 +22,7 @@ impl KnowledgeGraph {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             relations: Vec::new(),
+            edge_index: HashMap::new(),
         }
     }
 
@@ -23,7 +30,54 @@ impl KnowledgeGraph {
         self.entities.insert(entity.id, entity);
     }
 
+    /// Add a relation, or aggregate support if the triple already exists.
+    ///
+    /// The same `(head, relation, tail)` extracted from multiple papers must
+    /// not produce parallel duplicate edges: it increments `support_count`,
+    /// merges evidence and raises confidence via
+    /// [`Relation::confidence_from_support`]. An explicitly supplied higher
+    /// confidence (external KG scores) is kept.
     pub fn add_relation(&mut self, relation: Relation) {
+        let key = (relation.from_id, relation.relation_type.clone(), relation.to_id);
+        if let Some(&idx) = self.edge_index.get(&key) {
+            let existing = &mut self.relations[idx];
+            let support = match relation.source_paper_id {
+                Some(pid) => {
+                    if !existing.supporting_papers.contains(&pid) {
+                        existing.supporting_papers.push(pid);
+                    }
+                    existing.support_count.max(existing.supporting_papers.len())
+                }
+                // External merge without paper attribution: external.rs
+                // pre-deduplicates, so reaching here means a new source.
+                None => existing.support_count + 1,
+            };
+            existing.support_count = support;
+            let aggregated = Relation::confidence_from_support(support);
+            existing.confidence = existing.confidence.max(aggregated);
+            if !relation.evidence.is_empty()
+                && !existing.evidence.contains(&relation.evidence)
+                && existing.evidence.len() < 2000
+            {
+                existing.evidence.push_str(" | ");
+                existing.evidence.push_str(&relation.evidence);
+            }
+            let confidence = existing.confidence;
+            let (from, to, rt) = (existing.from_id, existing.to_id, existing.relation_type.clone());
+            self.update_adjacency_confidence(from, to, &rt, confidence);
+            return;
+        }
+
+        let mut relation = relation;
+        if relation.support_count == 0 {
+            relation.support_count = 1;
+        }
+        if let Some(pid) = relation.source_paper_id {
+            if !relation.supporting_papers.contains(&pid) {
+                relation.supporting_papers.push(pid);
+            }
+        }
+        self.edge_index.insert(key, self.relations.len());
         self.outgoing
             .entry(relation.from_id)
             .or_default()
@@ -33,6 +87,65 @@ impl KnowledgeGraph {
             .or_default()
             .push((relation.relation_type.clone(), relation.from_id, relation.confidence));
         self.relations.push(relation);
+    }
+
+    fn update_adjacency_confidence(
+        &mut self,
+        from: EntityId,
+        to: EntityId,
+        rel_type: &RelationType,
+        confidence: f64,
+    ) {
+        if let Some(edges) = self.outgoing.get_mut(&from) {
+            for (r, t, c) in edges.iter_mut() {
+                if r == rel_type && *t == to {
+                    *c = confidence;
+                }
+            }
+        }
+        if let Some(edges) = self.incoming.get_mut(&to) {
+            for (r, f, c) in edges.iter_mut() {
+                if r == rel_type && *f == from {
+                    *c = confidence;
+                }
+            }
+        }
+    }
+
+    /// Number of distinct supporting sources for a triple (0 if absent).
+    pub fn edge_support(&self, head: &EntityId, rel_type: &RelationType, tail: &EntityId) -> usize {
+        self.edge_index
+            .get(&(*head, rel_type.clone(), *tail))
+            .map(|&i| self.relations[i].support_count)
+            .unwrap_or(0)
+    }
+
+    /// Cross-source-safe merge for one triple: unlike [`add_relation`],
+    /// support is combined with `max` instead of `+` so merging the same
+    /// corpus twice (e.g. from the persistent store) cannot inflate the
+    /// count. New edges are inserted as-is.
+    pub fn merge_relation(&mut self, relation: Relation) {
+        let key = (relation.from_id, relation.relation_type.clone(), relation.to_id);
+        let Some(&idx) = self.edge_index.get(&key) else {
+            self.add_relation(relation);
+            return;
+        };
+        let existing = &mut self.relations[idx];
+        existing.support_count = existing.support_count.max(relation.support_count.max(1));
+        existing.confidence = existing
+            .confidence
+            .max(relation.confidence)
+            .max(Relation::confidence_from_support(existing.support_count));
+        if !relation.evidence.is_empty()
+            && !existing.evidence.contains(&relation.evidence)
+            && existing.evidence.len() < 2000
+        {
+            existing.evidence.push_str(" | ");
+            existing.evidence.push_str(&relation.evidence);
+        }
+        let confidence = existing.confidence;
+        let (from, to, rt) = (existing.from_id, existing.to_id, existing.relation_type.clone());
+        self.update_adjacency_confidence(from, to, &rt, confidence);
     }
 
     pub fn entity_count(&self) -> usize { self.entities.len() }

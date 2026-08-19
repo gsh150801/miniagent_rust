@@ -447,10 +447,11 @@ impl PipelineStage for DispatchStage {
                 let cancel = cancel.child_token();
                 let wave_ctx = wave_context.clone();
                 let max_tool_iters = ctx.config.loop_dispatch_max_iterations;
+                let working_dir = ctx.working_dir.clone();
 
                 handles.push(tokio::spawn(async move {
                     execute_single_task(
-                        task, agent, cancel, wave_ctx, max_tool_iters,
+                        task, agent, cancel, wave_ctx, max_tool_iters, working_dir,
                     ).await
                 }));
             }
@@ -594,9 +595,10 @@ impl PipelineStage for DispatchStage {
             task_id: None,
         });
 
-        // Persist all task outputs to disk under ./result/loop-pipeline/
-        // Each task gets its own subdirectory: {task_id}_{short_description}/
-        let result_dir = std::path::PathBuf::from("./result/loop-pipeline");
+        // Persist all task outputs to disk inside the run's result directory
+        // (the task dir on the server, ./result/loop-pipeline on the CLI).
+        // Each task gets its own subdirectory: tasks/{task_id}_{short_description}/
+        let result_dir = std::path::PathBuf::from(&ctx.working_dir).join("tasks");
         if let Err(e) = std::fs::create_dir_all(&result_dir) {
             tracing::error!(path = %result_dir.display(), error = %e, "failed to create dispatch result dir");
         }
@@ -665,7 +667,8 @@ impl PipelineStage for DispatchStage {
                 "preview": r.output.chars().take(500).collect::<String>(),
             })).collect::<Vec<_>>(),
         });
-        let summary_path = result_dir.join(format!("{}_summary.json", ts));
+        let summary_path = std::path::PathBuf::from(&ctx.working_dir)
+            .join(format!("dispatch_{}_summary.json", ts));
         if let Ok(json) = serde_json::to_string_pretty(&summary_data)
             && let Err(e) = std::fs::write(&summary_path, &json) {
                 tracing::error!(path = %summary_path.display(), error = %e, "failed to persist dispatch summary");
@@ -693,6 +696,7 @@ async fn execute_single_task(
     cancel: CancellationToken,
     wave_ctx: String,
     max_tool_iters: usize,
+    working_dir: String,
 ) -> TaskResult {
     let system = new_role_system_prompt(
         &task.assigned_role,
@@ -711,11 +715,14 @@ async fn execute_single_task(
          ## Task\n{description}\n\
          ## Expected Output\n{expected}\n\n\
          {tool_instructions}\n\
-         {env_info}",
+         {env_info}\n\
+         ## Output Location\n\
+         Write every file artifact into the working directory above (relative paths). \
+         Do NOT create `result/…` or `../…` paths — they end up outside this task's directory.",
         description = task.description,
         expected = task.expected_output,
         tool_instructions = tool_instruction_block(),
-        env_info = crate::prompts::env_info_block("."),
+        env_info = crate::prompts::env_info_block(&working_dir),
     );
 
     let mut history = vec![Message::user(&prompt)];
@@ -724,7 +731,8 @@ async fn execute_single_task(
     let mut context = RunContext::new(&system)
         .with_complexity(TaskComplexity::Moderate)
         .with_provider(ProviderChoice::Auto)
-        .with_allowed_tools(allowed);
+        .with_allowed_tools(allowed)
+        .with_working_dir(working_dir.clone());
     context.max_tool_iterations = max_tool_iters;
 
     let result = agent.run_with_loop(&mut history, &context, cancel).await;

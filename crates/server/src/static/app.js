@@ -51,11 +51,16 @@ function handleMsg(msg) {
       renderTaskList();
       break;
     case 'plan':
+      // Only apply plans for the currently selected task — switching to a
+      // historical task mid-run shouldn't repaint its panel with a new run.
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       currentPlan = { workflow: msg.workflow, stages: msg.stages };
       showPlan(msg.workflow, msg.stages);
       renderProgressView();
       break;
     case 'progress':
+      // Same task filter as plan: ignore progress for other tasks.
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       updateStagePill(msg.stage, msg.status);
       stageStatus[msg.stage] = msg.status;
       renderProgressView();
@@ -66,7 +71,7 @@ function handleMsg(msg) {
       break;
     case 'stage_output': showStageOutput(msg.stage, msg.summary); break;
     case 'stream': appendStream(msg.text); break;
-    case 'agent_event': handleAgentEvent(msg.event); break;
+    case 'agent_event': handleAgentEvent(msg); break;
     case 'complete':
       stopElapsed();
       stageStatus = {};
@@ -85,54 +90,15 @@ function handleMsg(msg) {
 // AgentEvent is serialized with #[serde(tag="type")] so msg.event.type is the
 // variant name in snake_case: tool_call_requested, tool_call_completed,
 // skill_invoked, subtask_started, subtask_completed, run_started, run_completed.
-function handleAgentEvent(ev) {
+//
+// The WS envelope `{type:"agent_event", event:{...}, task_id}` may carry a
+// task_id; if so, only apply events that match the currently selected task
+// so switching tasks doesn't bleed events across.
+function handleAgentEvent(envelope) {
+  const ev = envelope && envelope.event;
   if (!ev || !ev.type) return;
-  const ts = Date.now();
-  let entry = null;
-
-  switch (ev.type) {
-    case 'run_started':
-      activityStats.iterations++;
-      entry = { kind: 'run', status: 'started', ts, text: 'Agent loop started' };
-      break;
-    case 'run_completed':
-      entry = { kind: 'run', status: 'completed', ts, text: 'Agent loop completed',
-        detail: ev.stop_reason ? `stop: ${ev.stop_reason}` : '' };
-      break;
-    case 'tool_call_requested':
-      activityStats.tools++;
-      entry = { kind: 'tool_start', ts, tool: ev.tool_name || 'unknown',
-        input: summarizeInput(ev.input) };
-      break;
-    case 'tool_call_completed':
-      if (ev.is_error) activityStats.toolErrors++;
-      entry = { kind: 'tool_end', ts, tool: ev.tool_name || 'unknown',
-        ok: !ev.is_error, duration: ev.duration_ms || 0,
-        preview: (ev.output || '').slice(0, 120) };
-      break;
-    case 'skill_invoked':
-      activityStats.skills++;
-      entry = { kind: 'skill', ts, name: ev.skill_name || 'unknown', trigger: ev.trigger || '' };
-      break;
-    case 'subtask_started':
-      activityStats.subtasks++;
-      entry = { kind: 'subtask', status: 'started', ts, agent: ev.agent || '', step: ev.step || '' };
-      break;
-    case 'subtask_completed':
-      entry = { kind: 'subtask', status: 'completed', ts, agent: ev.agent || '', step: ev.step || '', ok: ev.ok };
-      break;
-    default:
-      return; // ignore unknown variants (budget_warning, checkpoint_saved, etc.)
-  }
-
-  if (entry) {
-    activityFeed.push(entry);
-    // Cap the feed to prevent unbounded growth during long runs.
-    if (activityFeed.length > 200) activityFeed = activityFeed.slice(-150);
-    // Update the right-panel activity section + stats (if visible).
-    renderActivityFeed();
-    renderProgressView();
-  }
+  if (envelope.task_id && currentTaskId && envelope.task_id !== currentTaskId) return;
+  ingestAgentEvent(ev, Date.now(), true);
 }
 
 // Summarize tool input for display — avoid dumping huge JSON.
@@ -489,7 +455,8 @@ function selectTask(id) {
   renderTaskList();
   document.getElementById('chatTitle').textContent = tasks[id]?.brief || id;
   document.getElementById('sidebar').classList.remove('open');
-  // Reset right-panel state for the new task
+  // Reset right-panel state for the new task BEFORE re-render so we don't
+  // briefly flash the previous task's plan/activity.
   fileTree = [];
   stageStatus = {};
   currentPlan = null;
@@ -499,6 +466,67 @@ function selectTask(id) {
   renderFilesView();
   if (ws && ws.readyState === 1)
     ws.send(JSON.stringify({ type: 'get_task', task_id: id }));
+}
+
+// Replay an event_log array (each entry: {ts, event: {...AgentEvent}}) into
+// the in-memory activity feed + stats so the right panel matches what the
+// backend actually emitted.
+function replayEventLog(eventLog) {
+  if (!Array.isArray(eventLog) || eventLog.length === 0) return;
+  for (const entry of eventLog) {
+    const ev = (entry && entry.event) || entry;
+    if (!ev || !ev.type) continue;
+    const ts = entry.ts ? Date.parse(entry.ts) || Date.now() : Date.now();
+    // Reuse the live handler logic, but suppress DOM re-render until the batch finishes.
+    ingestAgentEvent(ev, ts, false);
+  }
+  renderProgressView();
+}
+
+// Push one agent event into the local feed/stats WITHOUT re-rendering.
+// `reRender` toggles whether to call renderProgressView afterward.
+function ingestAgentEvent(ev, ts, reRender) {
+  if (!ev || !ev.type) return;
+  let entry = null;
+  switch (ev.type) {
+    case 'run_started':
+      activityStats.iterations++;
+      entry = { kind: 'run', status: 'started', ts, text: 'Agent loop started' };
+      break;
+    case 'run_completed':
+      entry = { kind: 'run', status: 'completed', ts, text: 'Agent loop completed',
+        detail: ev.stop_reason ? `stop: ${ev.stop_reason}` : '' };
+      break;
+    case 'tool_call_requested':
+      activityStats.tools++;
+      entry = { kind: 'tool_start', ts, tool: ev.tool_name || 'unknown',
+        input: summarizeInput(ev.input) };
+      break;
+    case 'tool_call_completed':
+      if (ev.is_error) activityStats.toolErrors++;
+      entry = { kind: 'tool_end', ts, tool: ev.tool_name || 'unknown',
+        ok: !ev.is_error, duration: ev.duration_ms || 0,
+        preview: (ev.output || '').slice(0, 120) };
+      break;
+    case 'skill_invoked':
+      activityStats.skills++;
+      entry = { kind: 'skill', ts, name: ev.skill_name || 'unknown', trigger: ev.trigger || '' };
+      break;
+    case 'subtask_started':
+      activityStats.subtasks++;
+      entry = { kind: 'subtask', status: 'started', ts, agent: ev.agent || '', step: ev.step || '' };
+      break;
+    case 'subtask_completed':
+      entry = { kind: 'subtask', status: 'completed', ts, agent: ev.agent || '', step: ev.step || '', ok: ev.ok };
+      break;
+    default:
+      return;
+  }
+  if (entry) {
+    activityFeed.push(entry);
+    if (activityFeed.length > 200) activityFeed = activityFeed.slice(-150);
+    if (reRender !== false) renderProgressView();
+  }
 }
 
 function renderHistory(msg) {
@@ -556,6 +584,12 @@ function renderHistory(msg) {
     renderFilesView();
   } else if (currentTaskId) {
     loadFileTree(currentTaskId);
+  }
+
+  // Restore activity feed + stats from the persisted event_log so the right
+  // panel matches what the backend actually executed for this task.
+  if (msg.event_log && msg.event_log.length > 0) {
+    replayEventLog(msg.event_log);
   }
 
   if (!msg.messages || msg.messages.length === 0) {
@@ -971,7 +1005,35 @@ function showStageOutput(stage, summary) {
 }
 
 // ── Input ──
-// 模式切换已移除（统一新流程：explore→ask→plan→dispatch→feedback）
+// 工作流模式选择下拉：workflow（默认，单 agent + 计划 + 反馈）/
+// loop（迭代 explore→plan→dispatch→evaluate→repair）/
+// debate（正方 vs 反方 → 裁判）
+let currentMode = 'workflow';
+const MODE_PLACEHOLDERS = {
+  workflow: 'Ask anything...',
+  loop: 'Loop pipeline: 迭代 explore→plan→dispatch→evaluate→repair',
+  debate: '辩论模式：输入议题，正方 vs 反方 → 裁判...',
+  research: '科研管线：输入疾病/研究问题，文献→知识图谱→致病机理假说→辩论→验证计划→数据分析 notebook',
+};
+
+function setMode(mode) {
+  if (!MODE_PLACEHOLDERS[mode]) mode = 'workflow';
+  currentMode = mode;
+  const sel = document.getElementById('modeSelect');
+  if (sel && sel.value !== mode) sel.value = mode;
+  const input = document.getElementById('input');
+  if (input) input.placeholder = MODE_PLACEHOLDERS[mode];
+}
+// Initialize once at script load (init section also calls this for safety).
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    const sel = document.getElementById('modeSelect');
+    if (sel) {
+      sel.addEventListener('change', (e) => setMode(e.target.value));
+      setMode(sel.value || 'workflow');
+    }
+  });
+}
 
 function sendMessage() {
   const input = document.getElementById('input');
@@ -982,8 +1044,10 @@ function sendMessage() {
   uploadedFiles = [];
   document.getElementById('fileChips').innerHTML = '';
   startStream();
-  // 统一流程：不再传 mode 字段，后端统一走 handle_run 新流程
   const payload = { type: 'run', prompt: text, files: fileIds };
+  // Always send the chosen mode so the server can route to the right driver.
+  // Unknown values fall through to the workflow default on the server.
+  payload.mode = currentMode;
   if (currentTaskId) payload.task_id = currentTaskId;
   if (selectedSkills.size > 0) payload.skills = [...selectedSkills];
   ws.send(JSON.stringify(payload));
@@ -1057,6 +1121,7 @@ function switchRightTab(tab) {
   document.getElementById('rpProgress').style.display = (tab === 'progress') ? '' : 'none';
   document.getElementById('rpFiles').style.display = (tab === 'files') ? '' : 'none';
   if (tab === 'files' && currentTaskId && fileTree.length === 0) loadFileTree(currentTaskId);
+  if (tab === 'progress') renderProgressView();
 }
 
 // ── Right panel: progress view ──
@@ -1211,8 +1276,9 @@ function renderActivityEntry(e, time) {
 }
 
 // Update the right panel when a new activity event arrives.
+// (renderProgressView is invoked directly by ingestAgentEvent / progress / plan
+// handlers; this wrapper is kept for any external callers.)
 function renderActivityFeed() {
-  if (activeRightTab !== 'progress') return;
   renderProgressView();
 }
 
@@ -1431,6 +1497,7 @@ async function onModelSelectChange(id) {
 
 function openModelModal() {
   renderModelList();
+  loadDebateRoles();
   document.getElementById('modelModal').style.display = 'flex';
 }
 function closeModelModal() {
@@ -1523,4 +1590,76 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
+}
+
+// ── 辩论角色模型设置（⚙️ 模型管理弹窗内）──
+let debateRolesState = { proposer: null, opponent: null, judge: null, activeId: null };
+
+function toggleDebateRoles() {
+  const el = document.getElementById('debateRoles');
+  const chev = document.getElementById('debateRolesChevron');
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : 'block';
+  chev.textContent = open ? '\u25BC' : '\u25B2';
+}
+
+async function loadDebateRoles() {
+  try {
+    const res = await fetch('/api/debate-models');
+    if (!res.ok) return;
+    const data = await res.json();
+    debateRolesState = {
+      proposer: data.proposer || null,
+      opponent: data.opponent || null,
+      judge: data.judge || null,
+      activeId: data.active_id || null,
+    };
+    renderDebateRoles();
+  } catch (e) { /* offline — leave dropdowns empty */ }
+}
+
+function renderDebateRoleSelect(sel, selected) {
+  sel.innerHTML = '';
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = '主模型（默认）';
+  sel.appendChild(def);
+  for (const m of modelState.models) {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = `${m.display_name} · ${m.model_name}`;
+    if (m.id === selected) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function renderDebateRoles() {
+  const p = document.getElementById('drProposer');
+  const o = document.getElementById('drOpponent');
+  const j = document.getElementById('drJudge');
+  if (!p || !o || !j) return;
+  renderDebateRoleSelect(p, debateRolesState.proposer);
+  renderDebateRoleSelect(o, debateRolesState.opponent);
+  renderDebateRoleSelect(j, debateRolesState.judge);
+}
+
+async function saveDebateRoles() {
+  const body = {
+    proposer: document.getElementById('drProposer').value || null,
+    opponent: document.getElementById('drOpponent').value || null,
+    judge: document.getElementById('drJudge').value || null,
+  };
+  try {
+    const res = await fetch('/api/debate-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '保存失败', true); return; }
+    showToast('辩论角色设置已保存', false, 'success');
+    await loadDebateRoles();
+  } catch (e) {
+    showToast('保存失败: ' + e.message, true);
+  }
 }

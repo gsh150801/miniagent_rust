@@ -35,7 +35,7 @@ async fn test_stepfun_loop_pipeline_simple() {
         config,
         3,
         cancel,
-    ).await;
+        None, None).await;
 
     assert!(result.is_ok(), "Pipeline should succeed: {:?}", result.err());
     let state = result.unwrap();
@@ -60,7 +60,7 @@ async fn test_stepfun_loop_pipeline_multi_loop() {
         config,
         3,
         cancel,
-    ).await;
+        None, None).await;
 
     assert!(result.is_ok(), "Pipeline should succeed: {:?}", result.err());
     let state = result.unwrap();

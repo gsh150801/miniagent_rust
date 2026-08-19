@@ -26,6 +26,9 @@ pub struct StageInput {
     pub input: serde_json::Value,
     pub previous_outputs: HashMap<NodeId, serde_json::Value>,
     pub cancel: CancellationToken,
+    /// Which [`DriverKind`] the driver is being invoked under. Lets a driver
+    /// branch behaviour or stamp its output without inspecting external state.
+    pub mode: &'static str,
 }
 
 impl StageInput {
@@ -39,7 +42,13 @@ impl StageInput {
             input,
             previous_outputs: HashMap::new(),
             cancel,
+            mode: "workflow",
         }
+    }
+
+    pub fn with_mode(mut self, mode: &'static str) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn with_previous(mut self, prev: HashMap<NodeId, serde_json::Value>) -> Self {
@@ -98,6 +107,13 @@ pub struct StageOutcome {
     pub data: serde_json::Value,
     pub summary: String,
     pub side_effects: Vec<SideEffect>,
+    /// Mode stamp the driver was running under (e.g. `"workflow"`, `"loop"`,
+    /// `"debate"`). Filled by each driver so the server can route the
+    /// outcome to the right post-processing path without re-deriving it.
+    /// Stored as `String` (not `&'static str`) so the outcome survives a
+    /// JSON round-trip without tying the lifetime to a static literal.
+    #[serde(default)]
+    pub mode: String,
 }
 
 impl StageOutcome {
@@ -106,7 +122,13 @@ impl StageOutcome {
             data,
             summary: summary.into(),
             side_effects: Vec::new(),
+            mode: "workflow".into(),
         }
+    }
+
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = mode.into();
+        self
     }
 
     pub fn with_side_effect(mut self, effect: SideEffect) -> Self {
@@ -287,6 +309,67 @@ where
     }
     Ok(outcome)
 }
+
+/// Three execution backends the server can dispatch to. Each variant maps 1:1
+/// onto a [`StageDriver`] impl: `Workflow` → `workflow::DagRunner`,
+/// `Loop` → `loop_pipeline::LoopRunner`, `Debate` → `planning::runners::DebateRunner`.
+///
+/// Lives in `miniagent_core` so the WebSocket layer, the driver factories, and
+/// any future CLI surfaces all share the same vocabulary. A new backend only
+/// needs to add a variant here and a matching arm in the server's `build_driver`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverKind {
+    /// LLM-decides DAG path: explore→ask→plan→dispatch→feedback, served by
+    /// `workflow::DagRunner` (this is the historical default and what the
+    /// server falls back to when no mode is specified).
+    Workflow,
+    /// Cyclic Explore→Plan→Dispatch→Evaluate→Repair path, served by
+    /// `loop_pipeline::LoopRunner`. Useful when the task may need several
+    /// iterations to converge.
+    Loop,
+    /// Proposer vs Opponent → Judge multi-round debate, served by
+    /// `planning::runners::DebateRunner`.
+    Debate,
+}
+
+impl DriverKind {
+    /// Stable lowercase identifier used on the wire (matches the
+    /// `payload.mode` value sent by the frontend).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DriverKind::Workflow => "workflow",
+            DriverKind::Loop => "loop",
+            DriverKind::Debate => "debate",
+        }
+    }
+
+    /// Parse the wire string, defaulting to `Workflow` for unknown / empty
+    /// values so old clients keep working.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "loop" | "loop_pipeline" | "loop-pipeline" => DriverKind::Loop,
+            "debate" => DriverKind::Debate,
+            // "workflow" + anything else falls through to the historical default
+            _ => DriverKind::Workflow,
+        }
+    }
+}
+
+impl Default for DriverKind {
+    fn default() -> Self {
+        DriverKind::Workflow
+    }
+}
+
+/// Coarse progress callback shared by all drivers. Mirrors the signature used
+/// by `Workflow::run_with_progress` so the server can wire a single
+/// `progress_fn: ProgressFn` regardless of which driver is running.
+///
+/// `name` is the stage identifier (e.g. `"explore"`, `"plan"`, `"dispatch"`).
+/// `status` is one of `"running"`, `"completed"`, `"failed"`. `data` carries
+/// optional JSON payload (stage summary, response preview, etc.).
+pub type ProgressFn = Box<dyn FnMut(&str, &str, Option<&serde_json::Value>) + Send + 'static>;
 
 #[cfg(test)]
 mod tests {

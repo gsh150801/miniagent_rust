@@ -83,7 +83,7 @@ Find EVERY weakness:
 
         let response = call_llm_with_tools(
             blackboard.agent(), &*self.provider, &[],
-            &system, &prompt, cancel,
+            &system, &prompt, &blackboard.work_dir_str(), cancel,
         ).await?;
         let parsed = self.parse_response(&response);
 

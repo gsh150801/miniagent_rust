@@ -259,7 +259,7 @@ impl Workflow {
         max_loops: usize,
         mut repair_handler: impl FnMut(&WorkflowState, &HashMap<StageId, StageOutput>, &str) -> ReplanRequest,
     ) -> Result<WorkflowResult, AgentError> {
-        let task_dir = self.task_dir.clone().unwrap_or_else(|| "./result/.workflow".into());
+        let task_dir = self.task_dir.clone().unwrap_or_else(crate::stages::default_workflow_dir);
 
         loop {
             if cancel.is_cancelled() {

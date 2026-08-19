@@ -56,12 +56,15 @@ pub fn strip_markdown_fences(s: &str) -> String {    let trimmed = s.trim();
 /// Attempt to fix truncated JSON by closing open strings, braces, and brackets.
 ///
 /// This prevents "EOF while parsing a string" errors from token-limit truncation.
+/// Closers are appended in reverse opening order (stack order): appending all
+/// `]` before all `}` produced `…]"hyp"]}}`-style output where an array closed
+/// inside an element object, which is exactly the `expected ',' or '}'`
+/// parse failure seen on long debate-refinement payloads.
 pub fn fix_truncated_json(s: &str) -> String {
     let mut fixed = s.to_string();
     let mut in_string = false;
     let mut escape_next = false;
-    let mut open_curly = 0i32;
-    let mut open_square = 0i32;
+    let mut open: Vec<char> = Vec::new();
 
     for ch in fixed.chars() {
         if escape_next {
@@ -80,23 +83,26 @@ pub fn fix_truncated_json(s: &str) -> String {
             continue;
         }
         match ch {
-            '{' => open_curly += 1,
-            '}' => open_curly -= 1,
-            '[' => open_square += 1,
-            ']' => open_square -= 1,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                open.pop();
+            }
             _ => {}
         }
     }
 
+    if escape_next {
+        // Truncated right after a backslash: neutralise it so the closing
+        // quote below isn't eaten as an escape.
+        fixed.push(' ');
+    }
     if in_string {
         fixed.push('"');
     }
 
-    for _ in 0..open_square.max(0) {
-        fixed.push(']');
-    }
-    for _ in 0..open_curly.max(0) {
-        fixed.push('}');
+    while let Some(closer) = open.pop() {
+        fixed.push(closer);
     }
 
     fixed

@@ -64,6 +64,10 @@ pub struct HypothesisVerdict {
     pub confidence_after: f64,
     /// Free-text notes on how the hypothesis could be improved.
     pub refinement_notes: String,
+    /// What the Opponent independently recommended (audit: disagreement with
+    /// the Judge's verdict is visible in the report). Absent on legacy data.
+    #[serde(default)]
+    pub opponent_recommendation: Option<Verdict>,
 }
 
 /// Cross-comparison across all hypotheses (Phase B).
@@ -103,29 +107,34 @@ pub struct DebateOutcome {
 // ───────────────────────────── debater ─────────────────────────────
 
 pub struct HypothesisDebater {
-    /// Primary reasoning provider (used for the per-hypothesis debate, the
-    /// cross-comparison judge, and refinement).
-    pro: Box<dyn LlmProvider>,
-    /// Optional cheaper provider used as the Opponent in Phase A. Falls back
-    /// to `pro` when unset.
-    opponent: Option<Box<dyn LlmProvider>>,
+    /// Proposer role: argues FOR the hypothesis (its own prompt + model).
+    proposer: Box<dyn LlmProvider>,
+    /// Opponent role: adversarial critique (its own prompt + model). A
+    /// separate prompt/model is what makes the critique adversarial instead
+    /// of the same call politely listing both sides.
+    opponent: Box<dyn LlmProvider>,
+    /// Judge role: per-hypothesis adjudication (Phase A), cross-comparison
+    /// (Phase B), and refinement (Phase C).
+    judge: Box<dyn LlmProvider>,
     /// Cap on how many hypotheses to send into refinement at once.
     max_refine: usize,
 }
 
 impl HypothesisDebater {
-    pub fn new(pro: Box<dyn LlmProvider>) -> Self {
+    /// Three debate roles, each with its own provider. Use the same provider
+    /// for all three when no role split is configured (defaults to the main
+    /// model).
+    pub fn new(
+        proposer: Box<dyn LlmProvider>,
+        opponent: Box<dyn LlmProvider>,
+        judge: Box<dyn LlmProvider>,
+    ) -> Self {
         Self {
-            pro,
-            opponent: None,
+            proposer,
+            opponent,
+            judge,
             max_refine: 6,
         }
-    }
-
-    /// Use a separate (e.g. cheaper / Flash) provider for the Opponent role.
-    pub fn with_opponent(mut self, opponent: Box<dyn LlmProvider>) -> Self {
-        self.opponent = Some(opponent);
-        self
     }
 
     /// Cap how many hypotheses are refined in one pass (default 6).
@@ -189,13 +198,51 @@ impl HypothesisDebater {
             });
         }
 
-        // Phase A: per-hypothesis debate (opponent provider, cheaper when set).
+        // Phase A: per-hypothesis debate. Hypotheses are independent — run
+        // them concurrently via `buffered` (same-task concurrency, no
+        // spawn/'static needed); each internally stays Proposer → Opponent →
+        // Judge sequential. Bounded at 3 so provider rate limits hold.
         let mut verdicts = Vec::with_capacity(hypotheses.len());
-        for h in hypotheses {
-            let v = self
-                .debate_one(h, kg, evidence.get(&h.id).map(|s| s.as_str()), cancel.clone())
-                .await?;
-            verdicts.push(v);
+        {
+            use futures_util::stream::{self, StreamExt};
+            // Owned captures per job (cloned hypothesis + evidence text):
+            // borrows with caller-derived lifetimes flowing through the
+            // generic stream combinator break the Send auto-trait once this
+            // whole future is spawned (server research mode).
+            let results: Vec<Result<HypothesisVerdict, AgentError>> = stream::iter(
+                hypotheses.iter().map(|h| (h.clone(), evidence.get(&h.id).cloned())),
+            )
+                .map(|(h, evidence_text)| {
+                    let cancel = cancel.clone();
+                    async move {
+                        self.debate_one(&h, kg, evidence_text.as_deref(), cancel).await
+                    }
+                })
+                .buffered(3)
+                .collect()
+                .await;
+            for (idx, r) in results.into_iter().enumerate() {
+                match r {
+                    Ok(v) => verdicts.push(v),
+                    Err(e) => {
+                        // One failed debate must not kill the rest — degrade
+                        // to a revise verdict with the error as the refinement
+                        // note so the audit shows why. `buffered` preserves
+                        // input order, so index alignment with `hypotheses`
+                        // holds.
+                        tracing::warn!(error = %e, "phase A debate failed for one hypothesis");
+                        verdicts.push(HypothesisVerdict {
+                            hypothesis_id: hypotheses[idx].id,
+                            verdict: Verdict::Revise,
+                            supporting_points: vec![],
+                            contradicting_points: vec![],
+                            confidence_after: 0.0,
+                            refinement_notes: format!("debate failed: {e}"),
+                            opponent_recommendation: None,
+                        });
+                    }
+                }
+            }
         }
 
         // Phase B: cross-comparison (judge = pro).
@@ -259,6 +306,10 @@ impl HypothesisDebater {
     }
 
     // ── Phase A ───────────────────────────────────────────────────
+    /// Three adversarial calls per hypothesis: Proposer argues FOR,
+    /// Opponent attacks, Judge weighs both sides and rules. Each role has
+    /// its own prompt — and its own model when configured — so the critique
+    /// is genuinely independent of the advocacy.
     async fn debate_one(
         &self,
         h: &Hypothesis,
@@ -266,7 +317,6 @@ impl HypothesisDebater {
         external_evidence: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<HypothesisVerdict, AgentError> {
-        let provider: &dyn LlmProvider = self.opponent.as_deref().unwrap_or(self.pro.as_ref());
         let ctx = render_hypothesis_context(h, kg);
         let evidence_block = external_evidence
             .filter(|s| !s.trim().is_empty())
@@ -277,65 +327,141 @@ impl HypothesisDebater {
             })
             .unwrap_or_default();
 
-        let prompt = format!(
-            r#"You are a rigorous biomedical debate panel. Argue BOTH sides of the hypothesis below using the broader published literature, then adjudicate.
+        // 1. Proposer — advocate.
+        let proposer_prompt = format!(
+            r#"You are the PROPOSER (正方) in a scientific debate. Argue IN FAVOUR of the hypothesis below using the published literature and the graph evidence. Be a strong but honest advocate: only claim support the evidence can carry.
 
 {ctx}
 {evidence_block}
 
-**Your task:**
-1. `supporting_points` — the 2-4 strongest pieces of evidence / reasoning that SUPPORT the hypothesis (cite the kind of literature, e.g. "GEO expression studies", "GWAS", "prior reviews").
-2. `contradicting_points` — the 2-4 strongest CONTRADICTIONS, counter-evidence, or alternative explanations that challenge it.
-3. `verdict` — `accept` (evidence holds), `revise` (plausible but has weaknesses to address), or `reject` (contradictions / no evidence are decisive).
-4. `confidence_after` — your confidence in `[0,1]` after weighing both sides.
-5. `refinement_notes` — concrete, specific suggestions for how to improve or qualify the hypothesis (empty string if `accept`).
+**Your task:** list the 2-4 strongest pieces of evidence or reasoning that SUPPORT the hypothesis (cite the kind of literature, e.g. "GEO expression studies", "GWAS", "prior reviews"), and your confidence as the proposer.
 
 Output ONLY valid JSON (no markdown fences):
 {{
   "supporting_points": ["..."],
+  "proposer_confidence": 0.0
+}}"#
+        );
+        let prop = complete_json_with_retry(
+            self.proposer.as_ref(),
+            "You are a rigorous scientific proposer. Output ONLY valid JSON.",
+            &proposer_prompt,
+            "proposer",
+            cancel.clone(),
+        )
+        .await?;
+        let supporting_points = str_array(&prop, "supporting_points");
+        let proposer_confidence = prop
+            .get("proposer_confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(h.confidence)
+            .clamp(0.0, 1.0);
+        let proposer_case = if supporting_points.is_empty() {
+            "(proposer offered no points)".to_string()
+        } else {
+            supporting_points
+                .iter()
+                .map(|s| format!("  - {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 2. Opponent — adversarial critique with its own prompt.
+        let opponent_prompt = format!(
+            r#"You are the OPPONENT (反方) in a scientific debate. Your role is adversarial critique. Find every flaw in the hypothesis below: missing causal links, over-generalization, confounders, contradicting literature, alternative explanations that fit the same evidence, and weaknesses in the graph evidence itself.
+
+{ctx}
+{evidence_block}
+
+**The proposer has already argued:**
+{proposer_case}
+
+**Your task:** attack. List the 2-4 strongest CONTRADICTIONS or alternative explanations, and state what you would recommend the panel do with this hypothesis.
+
+Output ONLY valid JSON (no markdown fences):
+{{
   "contradicting_points": ["..."],
+  "opponent_recommendation": "accept|revise|reject"
+}}"#
+        );
+        let opp = complete_json_with_retry(
+            self.opponent.as_ref(),
+            "You are the most rigorous scientific skeptic. Find every flaw. Output ONLY valid JSON.",
+            &opponent_prompt,
+            "opponent",
+            cancel.clone(),
+        )
+        .await?;
+        let contradicting_points = str_array(&opp, "contradicting_points");
+        let opponent_recommendation = opp
+            .get("opponent_recommendation")
+            .and_then(|v| v.as_str())
+            .map(Verdict::parse);
+        let opponent_case = if contradicting_points.is_empty() {
+            "(opponent offered no points)".to_string()
+        } else {
+            contradicting_points
+                .iter()
+                .map(|s| format!("  - {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 3. Judge — weigh both sides, rule, leave refinement notes.
+        let judge_prompt = format!(
+            r#"You are the JUDGE (裁判) of a scientific debate. Weigh the proposer's case against the opponent's critique and rule on the hypothesis.
+
+{ctx}
+{evidence_block}
+
+**Proposer's case:**
+{proposer_case}
+
+**Opponent's critique:**
+{opponent_case}
+
+**Your task:**
+1. `verdict` — `accept` (evidence holds), `revise` (plausible but has weaknesses to address), or `reject` (contradictions / no evidence are decisive).
+2. `confidence_after` — your confidence in `[0,1]` after weighing both sides.
+3. `refinement_notes` — concrete, specific suggestions for how to improve or qualify the hypothesis (empty string if `accept`).
+
+Output ONLY valid JSON (no markdown fences):
+{{
   "verdict": "accept|revise|reject",
   "confidence_after": 0.0,
   "refinement_notes": "..."
 }}"#
         );
-
-        let text = complete_json(provider, "You are a precise scientific debate engine. Output ONLY valid JSON.", &prompt, cancel.clone()).await?;
-        let repaired = json_util::extract_and_repair(&text);
-        // Same corrective retry as `compare`: one bad quote must not kill the
-        // whole debate pipeline.
-        let root: serde_json::Value = match serde_json::from_str(&repaired) {
-            Ok(v) => v,
-            Err(first_err) => {
-                tracing::warn!("debate verdict parse failed ({first_err}); retrying");
-                let retry_prompt = format!(
-                    "{prompt}\n\nYour previous output was NOT valid JSON ({first_err}). \
-                     Re-output the same content as STRICTLY valid JSON. Escape all quotes \
-                     inside strings; output ONLY the JSON object."
-                );
-                let text = complete_json(provider, "You are a precise scientific debate engine. Output ONLY valid JSON.", &retry_prompt, cancel).await?;
-                let repaired = json_util::extract_and_repair(&text);
-                serde_json::from_str(&repaired).map_err(|e| {
-                    AgentError::invalid_config(format!("debate verdict parse failed: {e}"))
-                })?
-            }
-        };
+        let verdict_json = complete_json_with_retry(
+            self.judge.as_ref(),
+            "You are an impartial scientific judge. Output ONLY valid JSON.",
+            &judge_prompt,
+            "judge verdict",
+            cancel,
+        )
+        .await?;
 
         Ok(HypothesisVerdict {
             hypothesis_id: h.id,
-            verdict: Verdict::parse(root.get("verdict").and_then(|v| v.as_str()).unwrap_or("revise")),
-            supporting_points: str_array(&root, "supporting_points"),
-            contradicting_points: str_array(&root, "contradicting_points"),
-            confidence_after: root
+            verdict: Verdict::parse(
+                verdict_json
+                    .get("verdict")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("revise"),
+            ),
+            supporting_points,
+            contradicting_points,
+            confidence_after: verdict_json
                 .get("confidence_after")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(h.confidence)
+                .unwrap_or(proposer_confidence)
                 .clamp(0.0, 1.0),
-            refinement_notes: root
+            refinement_notes: verdict_json
                 .get("refinement_notes")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            opponent_recommendation,
         })
     }
 
@@ -387,39 +513,14 @@ Output ONLY valid JSON (no markdown fences):
 }}"#
         );
 
-        let text = complete_json(
-            self.pro.as_ref(),
+        let root = complete_json_with_retry(
+            self.judge.as_ref(),
             "You are a precise scientific judge. Output ONLY valid JSON.",
             &prompt,
-            cancel.clone(),
+            "comparison",
+            cancel,
         )
         .await?;
-        let repaired = json_util::extract_and_repair(&text);
-        // Reasoning models occasionally emit slightly malformed JSON (stray
-        // quotes in `reason` strings). One corrective retry keeps a whole
-        // debate from being discarded over a single bad field.
-        let root: serde_json::Value = match serde_json::from_str(&repaired) {
-            Ok(v) => v,
-            Err(first_err) => {
-                tracing::warn!("debate comparison parse failed ({first_err}); retrying");
-                let retry_prompt = format!(
-                    "{prompt}\n\nYour previous output was NOT valid JSON ({first_err}). \
-                     Re-output the same content as STRICTLY valid JSON. Escape all quotes \
-                     inside strings; output ONLY the JSON object."
-                );
-                let text = complete_json(
-                    self.pro.as_ref(),
-                    "You are a precise scientific judge. Output ONLY valid JSON.",
-                    &retry_prompt,
-                    cancel,
-                )
-                .await?;
-                let repaired = json_util::extract_and_repair(&text);
-                serde_json::from_str(&repaired).map_err(|e| {
-                    AgentError::invalid_config(format!("debate comparison parse failed: {e}"))
-                })?
-            }
-        };
 
         let contradictions = root
             .get("contradictions_between")
@@ -501,16 +602,14 @@ Output ONLY valid JSON (no markdown fences):
 }}"#
         );
 
-        let text = complete_json(
-            self.pro.as_ref(),
+        let root = complete_json_with_retry(
+            self.judge.as_ref(),
             "You are a precise scientific reasoning engine. Output ONLY valid JSON.",
             &prompt,
+            "refinement",
             cancel,
         )
         .await?;
-        let repaired = json_util::extract_and_repair(&text);
-        let root: serde_json::Value = serde_json::from_str(&repaired)
-            .map_err(|e| AgentError::invalid_config(format!("debate refinement parse failed: {e}")))?;
 
         let arr = root
             .get("refined")
@@ -567,7 +666,10 @@ async fn complete_json(
         tools: vec![],
         config: miniagent_core::config::InferenceConfig {
             temperature: Some(0.2),
-            max_tokens: Some(3500),
+            // 3500 truncated multi-hypothesis refinements mid-object (parse
+            // failures at ~line 63); refinement payloads are long but the
+            // per-model cap is far higher.
+            max_tokens: Some(8000),
             ..Default::default()
         },
     };
@@ -581,6 +683,98 @@ async fn complete_json(
         })
         .collect::<Vec<_>>()
         .join(""))
+}
+
+/// Complete + parse JSON with one corrective retry: reasoning models
+/// occasionally emit slightly malformed JSON (stray quotes), and one bad
+/// field must not kill a whole debate phase.
+async fn complete_json_with_retry(
+    provider: &dyn LlmProvider,
+    system: &str,
+    prompt: &str,
+    what: &str,
+    cancel: CancellationToken,
+) -> Result<serde_json::Value, AgentError> {
+    let text = complete_json(provider, system, prompt, cancel.clone()).await?;
+    let repaired = json_util::extract_and_repair(&text);
+    match serde_json::from_str(&repaired) {
+        Ok(v) => Ok(v),
+        Err(first_err) => {
+            tracing::warn!("debate {what} parse failed ({first_err}); retrying");
+            let retry_prompt = format!(
+                "{prompt}\n\nYour previous output was NOT valid JSON ({first_err}). \
+                 Re-output the same content as STRICTLY valid JSON. Escape all quotes \
+                 inside strings; output ONLY the JSON object."
+            );
+            let text = complete_json(provider, system, &retry_prompt, cancel).await?;
+            let repaired = json_util::extract_and_repair(&text);
+            match serde_json::from_str(&repaired) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    // Truncation salvage: repeatedly drop the trailing
+                    // incomplete fragment and re-close. Refinement payloads
+                    // are per-item arrays, so a partial object beats losing
+                    // the whole debate phase.
+                    if let Some(v) = salvage_truncated(&text) {
+                        tracing::warn!("debate {what}: salvaged partial JSON after retry parse failed ({e})");
+                        Ok(v)
+                    } else {
+                        Err(AgentError::invalid_config(format!("debate {what} parse failed: {e}")))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Last index (byte) of a `,` or `}` that sits outside any string literal.
+/// Cutting there leaves a structurally prefix-complete JSON fragment.
+fn last_cut_index(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut last: Option<usize> = None;
+    for (idx, ch) in s.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && (ch == ',' || ch == '}') {
+            last = Some(idx);
+        }
+    }
+    last
+}
+
+/// Salvage a parseable JSON value from truncated model output: iteratively
+/// cut at the last structural `,`/`}`, re-close open brackets/strings
+/// (`fix_truncated_json`), and retry the parse. Returns the first prefix
+/// that parses, or `None` when even the empty prefix fails.
+fn salvage_truncated(text: &str) -> Option<serde_json::Value> {
+    let mut cur = json_util::extract_and_repair(text);
+    for _ in 0..16 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cur) {
+            return Some(v);
+        }
+        let cut = last_cut_index(&cur)?;
+        // Guarantee strict progress: the cut must shrink the fragment.
+        let mut next = cur[..cut].to_string();
+        while next.ends_with(',') {
+            next.pop();
+        }
+        if next.len() >= cur.len() {
+            return None;
+        }
+        cur = json_util::fix_truncated_json(&next);
+    }
+    serde_json::from_str::<serde_json::Value>(&cur).ok()
 }
 
 /// Render a readable, self-contained context block for a hypothesis (mirrors
@@ -708,6 +902,7 @@ pub fn persist_debate_report(
                 "supporting_points": v.supporting_points,
                 "contradicting_points": v.contradicting_points,
                 "refinement_notes": v.refinement_notes,
+                "opponent_recommendation": v.opponent_recommendation,
             })
         })
         .collect();
@@ -839,7 +1034,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_input_is_noop() {
-        let debater = HypothesisDebater::new(Box::new(SeqProvider::new(vec![])));
+        let debater = HypothesisDebater::new(
+            Box::new(SeqProvider::new(vec![])),
+            Box::new(SeqProvider::new(vec![])),
+            Box::new(SeqProvider::new(vec![])),
+        );
         let kg = KnowledgeGraph::new();
         let out = debater.debate_and_refine(&[], &kg, CancellationToken::new()).await.unwrap();
         assert!(out.refined.is_empty());
@@ -851,12 +1050,21 @@ mod tests {
     async fn rejects_dropped_from_refined_but_kept_in_audit() {
         let (kg, d, g) = kg_with("Alzheimer", "APOE");
         let h = hyp(uuid::Uuid::new_v4(), "APOE causes AD", 0.8, d, g);
-        // Phase A returns REJECT for the single hypothesis.
-        let resp = r#"{"supporting_points":[],"contradicting_points":["no causality"],"verdict":"reject","confidence_after":0.1,"refinement_notes":""}"#;
-        let debater = HypothesisDebater::new(Box::new(SeqProvider::new(vec![resp.into()])));
+        let prop = r#"{"supporting_points":[],"proposer_confidence":0.4}"#;
+        let opp = r#"{"contradicting_points":["no causality"],"opponent_recommendation":"reject"}"#;
+        let judge = r#"{"verdict":"reject","confidence_after":0.1,"refinement_notes":""}"#;
+        let debater = HypothesisDebater::new(
+            Box::new(SeqProvider::new(vec![prop.into()])),
+            Box::new(SeqProvider::new(vec![opp.into()])),
+            Box::new(SeqProvider::new(vec![judge.into()])),
+        );
         let out = debater.debate_and_refine(&[h], &kg, CancellationToken::new()).await.unwrap();
         assert_eq!(out.per_hypothesis.len(), 1);
         assert_eq!(out.per_hypothesis[0].verdict, Verdict::Reject);
+        // Opponent recommendation is recorded for audit even when the judge
+        // agrees.
+        assert_eq!(out.per_hypothesis[0].opponent_recommendation, Some(Verdict::Reject));
+        assert_eq!(out.per_hypothesis[0].contradicting_points, vec!["no causality".to_string()]);
         assert!(out.refined.is_empty(), "rejected hypothesis excluded from refined");
     }
 
@@ -865,12 +1073,19 @@ mod tests {
         let (kg, d, g) = kg_with("Alzheimer", "APOE");
         let id = uuid::Uuid::new_v4();
         let h = hyp(id, "APOE causes AD", 0.8, d, g);
-        let resp = r#"{"supporting_points":["gwas"],"contradicting_points":[],"verdict":"accept","confidence_after":0.92,"refinement_notes":""}"#;
-        let debater = HypothesisDebater::new(Box::new(SeqProvider::new(vec![resp.into()])));
+        let prop = r#"{"supporting_points":["gwas"],"proposer_confidence":0.9}"#;
+        let opp = r#"{"contradicting_points":[],"opponent_recommendation":"accept"}"#;
+        let judge = r#"{"verdict":"accept","confidence_after":0.92,"refinement_notes":""}"#;
+        let debater = HypothesisDebater::new(
+            Box::new(SeqProvider::new(vec![prop.into()])),
+            Box::new(SeqProvider::new(vec![opp.into()])),
+            Box::new(SeqProvider::new(vec![judge.into()])),
+        );
         let out = debater.debate_and_refine(&[h], &kg, CancellationToken::new()).await.unwrap();
         assert_eq!(out.refined.len(), 1);
         assert!((out.refined[0].confidence - 0.92).abs() < 1e-9);
         assert_eq!(out.per_hypothesis[0].verdict, Verdict::Accept);
+        assert_eq!(out.per_hypothesis[0].supporting_points, vec!["gwas".to_string()]);
     }
 
     #[tokio::test]
@@ -881,21 +1096,31 @@ mod tests {
         let id1 = h1.id;
         let id2 = h2.id;
 
-        // Phase A: h1 revise, h2 accept.
-        let a1 = r#"{"supporting_points":["gwas"],"contradicting_points":["tau"],"verdict":"revise","confidence_after":0.65,"refinement_notes":"qualify to early stage"}"#;
-        let a2 = r#"{"supporting_points":["pathology"],"contradicting_points":[],"verdict":"accept","confidence_after":0.7,"refinement_notes":""}"#;
-        // Phase B comparison.
+        // Proposer / Opponent / Judge each answer per hypothesis (2×), then
+        // the judge additionally handles comparison (Phase B) and refinement
+        // (Phase C).
+        let prop = SeqProvider::new(vec![
+            r#"{"supporting_points":["gwas"],"proposer_confidence":0.8}"#.into(),
+            r#"{"supporting_points":["pathology"],"proposer_confidence":0.7}"#.into(),
+        ]);
+        let opp = SeqProvider::new(vec![
+            r#"{"contradicting_points":["tau"],"opponent_recommendation":"revise"}"#.into(),
+            r#"{"contradicting_points":[],"opponent_recommendation":"accept"}"#.into(),
+        ]);
         let b = format!(
             r#"{{"contradictions_between":[{{"a":"{id1}","b":"{id2}","reason":"amyloid vs tau cascade"}}],"ranking_rationale":"both plausible","strongest_id":"{id1}","merge_suggestions":["test interaction"]}}"#,
         );
-        // Phase C refine h1.
         let c = format!(
             r#"{{"refined":[{{"id":"{id1}","statement":"APOE4 drives early amyloid","mechanism":"lipid","supporting_evidence":["gwas2"],"counter_evidence":["tau"],"confidence":0.78}}]}}"#,
         );
+        let judge = SeqProvider::new(vec![
+            r#"{"verdict":"revise","confidence_after":0.65,"refinement_notes":"qualify to early stage"}"#.into(),
+            r#"{"verdict":"accept","confidence_after":0.7,"refinement_notes":""}"#.into(),
+            b,
+            c,
+        ]);
 
-        let debater = HypothesisDebater::new(Box::new(SeqProvider::new(vec![
-            a1.into(), a2.into(), b, c,
-        ])));
+        let debater = HypothesisDebater::new(Box::new(prop), Box::new(opp), Box::new(judge));
         let out = debater.debate_and_refine(&[h1, h2], &kg, CancellationToken::new()).await.unwrap();
 
         assert_eq!(out.per_hypothesis.len(), 2);
@@ -916,11 +1141,21 @@ mod tests {
         let h1 = hyp(uuid::Uuid::new_v4(), "A", 0.7, d, g);
         let h2 = hyp(uuid::Uuid::new_v4(), "B", 0.6, d, g);
         let id1 = h1.id;
-        let a1 = r#"{"supporting_points":[],"contradicting_points":[],"verdict":"accept","confidence_after":0.7,"refinement_notes":""}"#;
-        let a2 = r#"{"supporting_points":[],"contradicting_points":[],"verdict":"accept","confidence_after":0.6,"refinement_notes":""}"#;
-        // Model says strongest_id = "H1" instead of a uuid.
-        let b = r#"{"contradictions_between":[],"ranking_rationale":"x","strongest_id":"H1","merge_suggestions":[]}"#;
-        let debater = HypothesisDebater::new(Box::new(SeqProvider::new(vec![a1.into(), a2.into(), b.into()])));
+        let prop = SeqProvider::new(vec![
+            r#"{"supporting_points":[],"proposer_confidence":0.7}"#.into(),
+            r#"{"supporting_points":[],"proposer_confidence":0.6}"#.into(),
+        ]);
+        let opp = SeqProvider::new(vec![
+            r#"{"contradicting_points":[],"opponent_recommendation":"accept"}"#.into(),
+            r#"{"contradicting_points":[],"opponent_recommendation":"accept"}"#.into(),
+        ]);
+        let judge = SeqProvider::new(vec![
+            r#"{"verdict":"accept","confidence_after":0.7,"refinement_notes":""}"#.into(),
+            r#"{"verdict":"accept","confidence_after":0.6,"refinement_notes":""}"#.into(),
+            // Model says strongest_id = "H1" instead of a uuid.
+            r#"{"contradictions_between":[],"ranking_rationale":"x","strongest_id":"H1","merge_suggestions":[]}"#.into(),
+        ]);
+        let debater = HypothesisDebater::new(Box::new(prop), Box::new(opp), Box::new(judge));
         let out = debater.debate_and_refine(&[h1, h2], &kg, CancellationToken::new()).await.unwrap();
         assert_eq!(out.comparison.strongest_id, Some(id1));
     }
@@ -937,6 +1172,7 @@ mod tests {
                 contradicting_points: vec![],
                 confidence_after: 0.9,
                 refinement_notes: "".into(),
+                opponent_recommendation: None,
             }],
             comparison: CrossComparison { strongest_id: Some(id), ..Default::default() },
             refined: vec![hyp(id, "APOE drives AD", 0.8, d, g)],
@@ -952,5 +1188,25 @@ mod tests {
         assert_eq!(v["refined"][0]["head"], "AD");
         assert_eq!(v["refined"][0]["tail"], "APOE");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn salvage_truncated_recovers_prefix_items() {
+        // Truncated mid-string in the 2nd item: the 1st item must survive
+        // (stack-ordered closers keep the 2nd object structurally valid too,
+        // just with fewer fields — per-item parsing skips bad ids anyway).
+        let truncated = r#"{"refined": [
+            {"id":"aaa-bbb","statement":"hypothesis one","mechanism":"m1","supporting_evidence":["e1"],"counter_evidence":[],"confidence":0.7},
+            {"id":"ccc-ddd","statement":"hyp"#;
+        let v = salvage_truncated(truncated).expect("should salvage");
+        let arr = v["refined"].as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr[0]["id"], "aaa-bbb");
+        assert_eq!(arr[0]["statement"], "hypothesis one");
+    }
+
+    #[test]
+    fn salvage_truncated_gives_up_on_garbage() {
+        assert!(salvage_truncated("no json here at all").is_none());
     }
 }

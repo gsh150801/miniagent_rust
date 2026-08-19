@@ -15,6 +15,9 @@ tokio-util.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+flate2 = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 async-trait.workspace = true

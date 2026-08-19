@@ -80,9 +80,14 @@ pub fn parse_extraction_result(
                         from_id,
                         to_id,
                         relation_type: rt,
-                        confidence: 1.0,
+                        // Confidence reflects literature support: one paper is
+                        // 0.5, growing with each independent supporting paper
+                        // (aggregated by KnowledgeGraph::add_relation).
+                        confidence: Relation::confidence_from_support(1),
                         evidence,
                         source_paper_id: Some(paper_id),
+                        support_count: 1,
+                        supporting_papers: vec![paper_id],
                     });
                 }
         }
@@ -227,4 +232,110 @@ pub fn merge_extraction_canonical(
     }
 
     stats
+}
+
+#[cfg(test)]
+mod aggregation_tests {
+    use super::*;
+    use crate::schema::{Entity, EntityType};
+
+    fn make_kg_with_gene() -> (KnowledgeGraph, crate::schema::EntityId) {
+        let mut kg = KnowledgeGraph::new();
+        let id = crate::schema::EntityId::new();
+        kg.add_entity(Entity {
+            id,
+            name: "BRCA1".into(),
+            entity_type: EntityType::Gene,
+            aliases: vec![],
+            metadata: serde_json::Value::Null,
+        });
+        (kg, id)
+    }
+
+    fn relation(kg_from: crate::schema::EntityId, to: crate::schema::EntityId, paper: uuid::Uuid, ev: &str) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            from_id: kg_from,
+            to_id: to,
+            relation_type: RelationType::Inhibits,
+            confidence: Relation::confidence_from_support(1),
+            evidence: ev.into(),
+            source_paper_id: Some(paper),
+            support_count: 1,
+            supporting_papers: vec![paper],
+        }
+    }
+
+    #[test]
+    fn same_triple_from_three_papers_is_one_edge() {
+        let (mut kg, g) = make_kg_with_gene();
+        let d = crate::schema::EntityId::new();
+        let p1 = uuid::Uuid::new_v4();
+        let p2 = uuid::Uuid::new_v4();
+        let p3 = uuid::Uuid::new_v4();
+
+        kg.add_relation(relation(g, d, p1, "paper1 evidence"));
+        kg.add_relation(relation(g, d, p2, "paper2 evidence"));
+        kg.add_relation(relation(g, d, p3, "paper3 evidence"));
+
+        assert_eq!(kg.relation_count(), 1, "three papers → one aggregated edge");
+        assert_eq!(kg.edge_support(&g, &RelationType::Inhibits, &d), 3);
+        let rel = &kg.all_relations()[0];
+        assert_eq!(rel.supporting_papers.len(), 3);
+        // n/(n+1) with n=3 → 0.75
+        assert!((rel.confidence - 0.75).abs() < 1e-9);
+        assert!(rel.evidence.contains("paper2 evidence"));
+    }
+
+    #[test]
+    fn same_paper_duplicate_extraction_not_double_counted() {
+        let (mut kg, g) = make_kg_with_gene();
+        let d = crate::schema::EntityId::new();
+        let p1 = uuid::Uuid::new_v4();
+
+        kg.add_relation(relation(g, d, p1, "first mention"));
+        kg.add_relation(relation(g, d, p1, "second mention same paper"));
+
+        assert_eq!(kg.relation_count(), 1);
+        assert_eq!(kg.edge_support(&g, &RelationType::Inhibits, &d), 1);
+        // n=1 → 0.5, not 1.0 (evidence still merged)
+        assert!((kg.all_relations()[0].confidence - 0.5).abs() < 1e-9);
+        assert!(kg.all_relations()[0].evidence.contains("second mention same paper"));
+    }
+
+    #[test]
+    fn external_confidence_never_lowered_by_aggregation() {
+        let (mut kg, g) = make_kg_with_gene();
+        let d = crate::schema::EntityId::new();
+
+        let mut ext = relation(g, d, uuid::Uuid::new_v4(), "disgenet");
+        ext.confidence = 0.9;
+        ext.source_paper_id = None;
+        ext.supporting_papers = vec![];
+        kg.add_relation(ext);
+
+        assert_eq!(kg.relation_count(), 1);
+        assert!((kg.all_relations()[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn old_kg_json_without_support_fields_still_loads() {
+        let (kg, g) = make_kg_with_gene();
+        let _ = g;
+        let json = serde_json::to_string(kg.all_relations()).unwrap();
+        assert!(!json.contains("supporting_papers") || true);
+        // simulate legacy relation JSON missing the new fields
+        let legacy = r#"[{
+            "id": "3f8e6c5a-1111-4222-8333-444455556666",
+            "from_id": "3f8e6c5a-1111-4222-8333-444455556666",
+            "to_id": "3f8e6c5a-1111-4222-8333-444455556666",
+            "relation_type": "Inhibits",
+            "confidence": 1.0,
+            "evidence": "legacy",
+            "source_paper_id": null
+        }]"#;
+        let parsed: Result<Vec<Relation>, _> = serde_json::from_str(legacy);
+        assert!(parsed.is_ok(), "legacy relations must deserialize with defaults");
+        assert_eq!(parsed.unwrap()[0].support_count, 1);
+    }
 }

@@ -6,13 +6,23 @@ use crate::stage::{StageContext, StageError, StageHandler, StageMetadata, StageO
 
 // ── File-based stage communication ───────────────────────────
 
-/// Legacy default (used when task_dir is not provided).
-pub const WORKFLOW_DIR: &str = "./result/.workflow";
+/// Default workflow dir when task_dir is not provided: anchored under the
+/// centralised result root (never a CWD-relative scatter).
+pub fn default_workflow_dir() -> String {
+    miniagent_core::paths::result_root()
+        .join(".workflow")
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Resolve the task-specific workflow directory.
-/// Reads `task_dir` from the input JSON; falls back to WORKFLOW_DIR.
+/// Reads `task_dir` from the input JSON; falls back to the anchored default.
 fn task_workflow_dir(ctx: &StageContext) -> std::path::PathBuf {
-    let base = ctx.input["task_dir"].as_str().unwrap_or(WORKFLOW_DIR);
+    let base = ctx
+        .input["task_dir"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_workflow_dir);
     let dir = std::path::PathBuf::from(base);
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -29,7 +39,11 @@ fn save_stage_output(ctx: &StageContext, filename: &str, data: &serde_json::Valu
 
 /// Read a stage's output from the task-specific workflow directory.
 fn load_stage_output(ctx: &StageContext, filename: &str) -> Option<serde_json::Value> {
-    let base = ctx.input["task_dir"].as_str().unwrap_or(WORKFLOW_DIR);
+    let base = ctx
+        .input["task_dir"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_workflow_dir);
     let path = std::path::PathBuf::from(base).join(filename);
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
@@ -155,7 +169,8 @@ impl StageHandler for AgentStage {
 
         let mut context = RunContext::new(augmented_system)
             .with_complexity(complexity)
-            .with_provider(provider);
+            .with_provider(provider)
+            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -419,7 +434,8 @@ impl StageHandler for ResearcherStage {
         let mut context = RunContext::new(augmented_system)
             .with_complexity(complexity)
             .with_provider(provider)
-            .with_allowed_tools(allowed);
+            .with_allowed_tools(allowed)
+            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -684,7 +700,8 @@ impl StageHandler for AnalystStage {
         let mut context = RunContext::new(system)
             .with_complexity(complexity)
             .with_provider(provider)
-            .with_allowed_tools(allowed);
+            .with_allowed_tools(allowed)
+            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -1280,7 +1297,8 @@ Do NOT just list the worker outputs — combine them meaningfully.
 
         let mut context = RunContext::new("You are an orchestrator that synthesizes worker outputs into a unified result.")
             .with_complexity(TaskComplexity::Complex)
-            .with_provider(ProviderChoice::Pro);
+            .with_provider(ProviderChoice::Pro)
+            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
 
         if let Some(mt) = self.max_tokens {
             context.max_tokens = Some(mt.min(393216));

@@ -87,6 +87,7 @@ impl StageDriver for PlanRunner {
             data,
             summary,
             side_effects,
+            mode: "workflow".to_string(),
         })
     }
 }

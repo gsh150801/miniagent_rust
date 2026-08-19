@@ -83,7 +83,7 @@ impl Default for GraphState {
             messages: Vec::new(), artifacts: HashMap::new(), step_outputs: HashMap::new(),
             budget: BudgetState { max_iterations: 50, tokens_used: 0 },
             iteration: 0, current_node: String::new(), finished: false,
-            work_dir: std::path::PathBuf::from("./miniagent_workspace"),
+            work_dir: miniagent_core::paths::result_root().join(".workspace"),
         }
     }
 }

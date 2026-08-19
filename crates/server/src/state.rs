@@ -63,7 +63,7 @@ impl AppState {
             memory: None,
             checkpoint_store: None,
             tasks: Arc::new(DashMap::new()),
-            task_dir: PathBuf::from("./result"),
+            task_dir: miniagent_core::paths::result_root(),
             config,
             models: Arc::new(std::sync::RwLock::new(models)),
             cancels: Arc::new(DashMap::new()),

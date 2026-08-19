@@ -124,7 +124,7 @@ impl Default for BudgetState {
 impl Default for Blackboard {
     fn default() -> Self {
         Self {
-            work_dir: PathBuf::from("./miniagent_workspace"),
+            work_dir: miniagent_core::paths::result_root().join(".workspace"),
             artifacts: HashMap::new(),
             budget: BudgetState::default(),
             iteration: 0, decisions: Vec::new(),
@@ -140,6 +140,13 @@ impl Blackboard {
         let dir = work_dir.into();
         std::fs::create_dir_all(&dir).ok();
         Self { work_dir: dir, ..Default::default() }
+    }
+
+    /// `work_dir` as an owned lossy string — convenient for passing into
+    /// [`call_llm_with_tools`] so role agents' tool calls (bash/write/edit)
+    /// execute inside the task's directory instead of the process CWD.
+    pub fn work_dir_str(&self) -> String {
+        self.work_dir.to_string_lossy().into_owned()
     }
 
     /// 注入共享 Agent（带完整工具执行循环）。注入后角色可通过 [`Self::agent`]
@@ -380,6 +387,7 @@ pub async fn call_llm_with_tools(
     allowed_tools: &[String],
     system: &str,
     prompt: &str,
+    work_dir: &str,
     cancel: CancellationToken,
 ) -> Result<String, AgentError> {
     if let Some(agent) = agent {
@@ -390,6 +398,11 @@ pub async fn call_llm_with_tools(
         // 非空 allowed_tools 才设过滤；空 slice 表示"全部工具"（保持 None）
         if !allowed_tools.is_empty() {
             ctx = ctx.with_allowed_tools(allowed_tools.to_vec());
+        }
+        // 把角色的 work_dir 锚定为 agent 工具执行的 cwd（bash/write/edit 的
+        // 相对路径全部落在任务目录内，而非进程 CWD —— dsh 的"写围栏"原则）。
+        if !work_dir.is_empty() {
+            ctx = ctx.with_working_dir(work_dir.to_string());
         }
         let delta = agent.run_with_loop(&mut history, &ctx, cancel).await?;
         // 取最终文本（工具循环产出的消息序列）
@@ -422,7 +435,11 @@ pub async fn call_llm_with_tools(
 /// Parse LLM JSON output robustly. Returns an error message instead of
 /// silently producing empty defaults.
 pub fn parse_llm_json(text: &str) -> Result<serde_json::Value, String> {
-    let json_str = text.trim()
+    // Reasoning models (MiniMax-M3, deepseek-reasoner) emit <think> blocks
+    // and markdown fences before the JSON — the shared repair util strips
+    // both and repairs truncation before we attempt any parse.
+    let cleaned = miniagent_core::json_util::extract_and_repair(text);
+    let json_str = cleaned.trim()
         .trim_start_matches("```json").trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
@@ -690,6 +707,7 @@ mod tests {
             &[],                         // 全部工具（不过滤）
             "You are a test assistant.",
             "Say hello.",
+            "",
             tokio_util::sync::CancellationToken::new(),
         ).await;
         assert!(result.is_ok(), "fallback path should succeed with MockProvider");

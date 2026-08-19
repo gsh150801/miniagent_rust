@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use miniagent_core::error::AgentError;
+use miniagent_core::orchestration::ProgressFn;
 use miniagent_core::settings::AppConfig;
 use tokio_util::sync::CancellationToken;
 
@@ -80,7 +81,7 @@ impl LoopPipeline {
     // ── P0 #7: Crash recovery via per-loop checkpoint ──────────────
 
     /// Deterministic checkpoint path derived from the task description slug.
-    fn checkpoint_path(current_task: &str) -> std::path::PathBuf {
+    fn checkpoint_path(base: &std::path::Path, current_task: &str) -> std::path::PathBuf {
         let slug: String = current_task
             .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
             .filter(|w| !w.is_empty())
@@ -89,14 +90,13 @@ impl LoopPipeline {
             .collect::<Vec<_>>()
             .join("_");
         let slug = if slug.is_empty() { "task" } else { slug.as_str() };
-        std::path::PathBuf::from("./result/loop-pipeline")
-            .join(format!("checkpoint_{}", slug))
+        base.join(format!("checkpoint_{}", slug))
             .join("_checkpoint.json")
     }
 
     /// Persist pipeline state so a crashed run can be resumed.
-    fn save_checkpoint(state: &crate::types::PipelineState) {
-        let path = Self::checkpoint_path(&state.current_task);
+    fn save_checkpoint(base: &std::path::Path, state: &crate::types::PipelineState) {
+        let path = Self::checkpoint_path(base, &state.current_task);
         if let Some(parent) = path.parent()
             && std::fs::create_dir_all(parent).is_err() {
                 return;
@@ -114,8 +114,8 @@ impl LoopPipeline {
     }
 
     /// Attempt to load a previous checkpoint for the given task.
-    fn load_checkpoint(current_task: &str) -> Option<crate::types::PipelineState> {
-        let path = Self::checkpoint_path(current_task);
+    fn load_checkpoint(base: &std::path::Path, current_task: &str) -> Option<crate::types::PipelineState> {
+        let path = Self::checkpoint_path(base, current_task);
         let data = std::fs::read_to_string(&path).ok()?;
         match serde_json::from_str::<crate::types::PipelineState>(&data) {
             Ok(state) => {
@@ -140,19 +140,53 @@ impl LoopPipeline {
     /// 4. Evaluate: assess completion, decide continue/stop
     /// 5. If failed tasks exist → Repair → back to Explore (next loop)
     /// 6. Repeat until all tasks complete or max loops reached
+    ///
+    /// `on_progress` is an optional coarse progress callback mirroring
+    /// `workflow::Workflow::run_with_progress`. The server passes one in to
+    /// bridge the loop pipeline into the same `ProgressMsg` channel used by
+    /// the workflow driver, so the right-side progress panel can render both
+    /// modes uniformly. Pass `None` for fire-and-forget CLI usage.
+    ///
+    /// `result_dir` anchors every artifact of the run: dispatched agents run
+    /// tools with it as working directory, dispatch persistence and the
+    /// per-loop checkpoint live under it. `None` falls back to
+    /// `./result/loop-pipeline` (CLI behaviour).
     pub async fn run(
         task: impl Into<String>,
         config: Arc<AppConfig>,
         max_loops: usize,
         cancel: CancellationToken,
+        mut on_progress: Option<ProgressFn>,
+        result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
+        // Stable lowercase stage names so the front-end `renderProgressView`
+        // matches loop-pipeline pills with workflow pills without special-casing.
+        let mut emit = |name: &str, status: &str, data: Option<&serde_json::Value>| {
+            if let Some(cb) = on_progress.as_mut() {
+                cb(name, status, data);
+            }
+        };
+
+        let result_base = result_dir
+            .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
+        if let Err(e) = std::fs::create_dir_all(&result_base) {
+            tracing::warn!(path = %result_base.display(), error = %e, "failed to create loop-pipeline result dir");
+        }
+        // Canonicalize when possible so agents' bash cwd and every relative
+        // artifact path resolve inside the task dir regardless of the
+        // process CWD the server was launched from.
+        let result_base = result_base
+            .canonicalize()
+            .unwrap_or(result_base);
+
         let mut ctx = StageContext::new(task, config)
-            .with_max_loops(max_loops);
+            .with_max_loops(max_loops)
+            .with_working_dir(result_base.to_string_lossy().to_string());
 
         // ── P0 #7: Attempt to resume from a previous checkpoint ──
         // If a checkpoint exists for this task, restore its state so a crashed
         // run continues from the last completed loop instead of restarting.
-        if let Some(resumed) = Self::load_checkpoint(&ctx.state.current_task) {
+        if let Some(resumed) = Self::load_checkpoint(&result_base, &ctx.state.current_task) {
             // Only resume if the previous run was genuinely in-progress (not completed).
             if !resumed.completed && resumed.loop_count > 0 {
                 let resumed_loops = resumed.loop_count;
@@ -180,8 +214,10 @@ impl LoopPipeline {
 
             if ctx.state.loop_count >= ctx.state.max_loops {
                 tracing::warn!("Max loops ({}) reached, finalizing", ctx.state.max_loops);
+                emit("evaluate", "running", None);
                 let output = Self::execute_isolated(&evaluate, &ctx, cancel.child_token()).await;
                 ctx.state = output.updated_state;
+                emit("evaluate", "completed", Some(&serde_json::json!({"summary": output.summary})));
                 break;
             }
 
@@ -190,60 +226,102 @@ impl LoopPipeline {
 
             // Phase 1: Explore (isolated — fallback to default exploration)
             tracing::info!("Explore phase");
+            emit("explore", "running", None);
             let output = Self::execute_isolated(&explore, &ctx, cancel.child_token()).await;
             ctx.state = output.updated_state;
+            let explore_summary = serde_json::json!({"summary": output.summary});
             ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
-                stage: "Explore".into(),
-                summary: serde_json::json!({"summary": output.summary}),
+                stage: "explore".into(),
+                summary: explore_summary.clone(),
             });
             ctx.collect_messages(output.new_messages);
+            emit("explore", "completed", Some(&explore_summary));
             tracing::info!("Explore done: {}", output.summary);
 
-            // Phase 2: Plan (isolated — fallback to single-task plan downstream)
+            // Phase 2: PLAN (isolated — fallback to single-task plan downstream)
             tracing::info!("Plan phase");
+            emit("plan", "running", None);
             let output = Self::execute_isolated(&plan, &ctx, cancel.child_token()).await;
             ctx.state = output.updated_state;
+            // Ship the freshly decomposed task list with the stage-completed
+            // event so the server can render the plan pill strip *before*
+            // dispatch starts (workflow-mode parity) instead of after the run.
+            let plan_tasks = ctx.state.plan.as_ref().map(|p| {
+                serde_json::Value::Array(p.tasks.iter().map(|t| serde_json::json!({
+                    "id": t.id,
+                    "handler": t.assigned_role,
+                    "tier": t.difficulty,
+                    "description": t.description,
+                    "sub_tasks": t.depends_on,
+                })).collect())
+            }).unwrap_or(serde_json::Value::Null);
+            let plan_summary = serde_json::json!({
+                "summary": output.summary,
+                "plan_tasks": plan_tasks,
+            });
             ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
-                stage: "Plan".into(),
-                summary: serde_json::json!({"summary": output.summary}),
+                stage: "plan".into(),
+                summary: plan_summary.clone(),
             });
             ctx.collect_messages(output.new_messages);
+            emit("plan", "completed", Some(&plan_summary));
             tracing::info!("Plan done: {}", output.summary);
 
             // Phase 3: Dispatch (critical — load-bearing, retry then abort)
             tracing::info!("Dispatch phase");
-            let output = Self::execute_critical(&dispatch, &ctx, cancel.child_token()).await?;
+            emit("dispatch", "running", None);
+            let output = match Self::execute_critical(&dispatch, &ctx, cancel.child_token()).await {
+                Ok(o) => o,
+                Err(e) => {
+                    emit("dispatch", "failed", Some(&serde_json::json!({"error": e.to_string()})));
+                    return Err(e);
+                }
+            };
             ctx.state = output.updated_state;
+            let dispatch_summary = serde_json::json!({"summary": output.summary});
             ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
-                stage: "Dispatch".into(),
-                summary: serde_json::json!({"summary": output.summary}),
+                stage: "dispatch".into(),
+                summary: dispatch_summary.clone(),
             });
             ctx.collect_messages(output.new_messages);
+            emit("dispatch", "completed", Some(&dispatch_summary));
             tracing::info!("Dispatch done: {}", output.summary);
 
             // Phase 4: Repair (isolated — advisory, pipeline continues without it)
             let failed_count = ctx.state.task_results.iter().filter(|r| !r.success).count();
             if failed_count > 0 {
                 tracing::info!("Repair phase ({} failed tasks)", failed_count);
+                emit("repair", "running", None);
                 let output = Self::execute_isolated(&repair, &ctx, cancel.child_token()).await;
                 ctx.state = output.updated_state;
+                let repair_summary = serde_json::json!({"summary": output.summary});
                 ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
-                    stage: "Repair".into(),
-                    summary: serde_json::json!({"summary": output.summary}),
+                    stage: "repair".into(),
+                    summary: repair_summary.clone(),
                 });
                 ctx.collect_messages(output.new_messages);
+                emit("repair", "completed", Some(&repair_summary));
                 tracing::info!("Repair done: {}", output.summary);
             }
 
             // Phase 5: Evaluate (critical — drives loop control, retry then abort)
             tracing::info!("Evaluate phase");
-            let output = Self::execute_critical(&evaluate, &ctx, cancel.child_token()).await?;
+            emit("evaluate", "running", None);
+            let output = match Self::execute_critical(&evaluate, &ctx, cancel.child_token()).await {
+                Ok(o) => o,
+                Err(e) => {
+                    emit("evaluate", "failed", Some(&serde_json::json!({"error": e.to_string()})));
+                    return Err(e);
+                }
+            };
             ctx.state = output.updated_state;
+            let eval_summary = serde_json::json!({"summary": output.summary});
             ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
-                stage: "Evaluate".into(),
-                summary: serde_json::json!({"summary": output.summary}),
+                stage: "evaluate".into(),
+                summary: eval_summary.clone(),
             });
             ctx.collect_messages(output.new_messages);
+            emit("evaluate", "completed", Some(&eval_summary));
             tracing::info!("Evaluate done: {}", output.summary);
 
             let progress = ctx.state.evaluations.last()
@@ -308,12 +386,12 @@ impl LoopPipeline {
 
             // ── P0 #7: Persist state at end of each loop for crash recovery.
             // If the process dies before the next loop, we can resume from here.
-            Self::save_checkpoint(&ctx.state);
+            Self::save_checkpoint(&result_base, &ctx.state);
         }
 
         // Pipeline finished successfully — clean up the checkpoint so the next
         // run with the same task starts fresh instead of resuming a stale state.
-        let cp_path = Self::checkpoint_path(&ctx.state.current_task);
+        let cp_path = Self::checkpoint_path(&result_base, &ctx.state.current_task);
         if cp_path.exists() {
             let _ = std::fs::remove_file(&cp_path);
             tracing::debug!("Checkpoint cleaned up: {:?}", cp_path);

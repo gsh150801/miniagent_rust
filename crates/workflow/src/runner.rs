@@ -8,20 +8,39 @@
 use crate::engine::Workflow;
 use crate::stage::{StageContext, StageMetadata, StageOutput};
 use miniagent_core::orchestration::{
-    OrchestrationError, StageDriver, StageInput, StageOutcome,
+    OrchestrationError, ProgressFn, StageDriver, StageInput, StageOutcome,
 };
 use miniagent_core::types::StageId;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Adapter wrapping a [`Workflow`] (DAG runner) so it implements
 /// [`StageDriver`] and can be substituted for the loop-pipeline runner.
 pub struct DagRunner {
     workflow: Workflow,
+    /// Optional progress callback the server wires into the WebSocket bridge.
+    /// Wrapped in `Arc<Mutex<Option<_>>>` so:
+    /// 1. `DagRunner` itself satisfies `StageDriver: Send + Sync` (a bare
+    ///    `Box<dyn FnMut + Send>` is not Sync).
+    /// 2. We can `.take()` the inner closure out per call (it needs `FnMut`)
+    ///    while still letting the wrapper survive across runs.
+    on_progress: Option<Arc<Mutex<Option<ProgressFn>>>>,
 }
 
 impl DagRunner {
     pub fn new(workflow: Workflow) -> Self {
-        Self { workflow }
+        Self {
+            workflow,
+            on_progress: None,
+        }
+    }
+
+    /// Builder-style attach for the server-side progress bridge. Wraps the
+    /// callback in `Arc<Mutex<Option<_>>>` so successive `StageDriver::run`
+    /// calls (e.g. retries) all share the same callback instance.
+    pub fn with_progress(mut self, on_progress: ProgressFn) -> Self {
+        self.on_progress = Some(Arc::new(Mutex::new(Some(on_progress))));
+        self
     }
 
     /// Borrow the underlying workflow for callers that still need the rich
@@ -42,9 +61,17 @@ impl StageDriver for DagRunner {
     }
 
     async fn run(&self, input: StageInput) -> Result<StageOutcome, OrchestrationError> {
-        // `?` invokes the canonical `From<AgentError> for OrchestrationError`
-        // defined in `miniagent_core::orchestration` (round 32 hoist).
-        let result = self.workflow.run(None, input.cancel).await?;
+        // Bridge the workflow runner's coarse progress callback into the
+        // unified interface. We can't move the closure into `run_with_progress`
+        // because it owns `self.on_progress`; we build a fresh per-call
+        // adapter that locks the Arc'd mutex to dispatch.
+        let cancel = input.cancel.clone();
+        let on_progress = self.take_progress_fn();
+        let result = if let Some(cb) = on_progress {
+            self.workflow.run_with_progress(None, cancel, cb).await?
+        } else {
+            self.workflow.run(None, cancel).await?
+        };
 
         // Collect per-stage outputs into a JSON map (the unified `data` shape)
         // and emit a single digest derived from per-stage metadata.
@@ -68,7 +95,31 @@ impl StageDriver for DagRunner {
             format!("DAG completed: {}", summaries.join(", "))
         };
 
-        Ok(StageOutcome::ok(data, summary))
+        Ok(StageOutcome::ok(data, summary).with_mode("workflow".to_string()))
+    }
+}
+
+impl DagRunner {
+    /// Pull the optional progress callback out of the `Arc<Mutex>` slot and
+    /// wrap it in the `Box<dyn FnMut>` shape `Workflow::run_with_progress`
+    /// expects. Returns `None` when no callback is attached so the
+    /// no-progress branch stays allocation-free.
+    ///
+    /// We lock per-call to satisfy the `FnMut` signature: `Workflow`'s
+    /// progress fn is called many times in sequence and each call needs
+    /// `&mut`, but the callback itself is shared via `Arc<Mutex<_>>` so the
+    /// underlying channel sender can outlive any individual driver run.
+    fn take_progress_fn(
+        &self,
+    ) -> Option<Box<dyn FnMut(&str, &str, Option<&serde_json::Value>) + Send + 'static>> {
+        let slot = self.on_progress.as_ref()?.clone();
+        Some(Box::new(move |name, status, data| {
+            if let Ok(mut guard) = slot.lock() {
+                if let Some(cb) = guard.as_mut() {
+                    cb(name, status, data);
+                }
+            }
+        }))
     }
 }
 

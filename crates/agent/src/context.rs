@@ -62,6 +62,17 @@ impl RunContext {
         self.allowed_tools = Some(names);
         self
     }
+
+    /// Anchor tool execution (bash cwd, relative file writes) to `dir`.
+    ///
+    /// Callers that own a task result directory (server loop-pipeline, research
+    /// pipeline) should pass it here so every artifact a tool produces lands
+    /// inside the task directory instead of scattering relative to the
+    /// process CWD.
+    pub fn with_working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = dir.into();
+        self
+    }
 }
 
 impl Default for RunContext {

@@ -104,7 +104,7 @@ Output JSON:
 
         let response = call_llm_with_tools(
             blackboard.agent(), &*self.provider, &[],
-            &system, &prompt, cancel,
+            &system, &prompt, &blackboard.work_dir_str(), cancel,
         ).await?;
         let raw_parsed = match parse_llm_json(&response) {
             Ok(v) => v,

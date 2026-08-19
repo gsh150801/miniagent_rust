@@ -76,6 +76,29 @@ pub struct Relation {
     pub confidence: f64,
     pub evidence: String,
     pub source_paper_id: Option<uuid::Uuid>,
+    /// Number of distinct sources (papers / external files) supporting this
+    /// triple. Aggregated on merge — the same triple extracted from N papers
+    /// is ONE edge with `support_count = N`, not N identical edges.
+    #[serde(default = "default_support_count")]
+    pub support_count: usize,
+    /// Papers backing this triple (for exact dedup when one paper repeats a
+    /// triple in the same extraction). Empty for external merges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supporting_papers: Vec<uuid::Uuid>,
+}
+
+fn default_support_count() -> usize {
+    1
+}
+
+impl Relation {
+    /// Confidence from accumulated support: `n / (n + 1)` — one paper is 0.5,
+    /// two are 0.67, three 0.75, saturating towards 1.0. Never lowers an
+    /// externally supplied confidence (e.g. a DisGeNET score).
+    pub fn confidence_from_support(support_count: usize) -> f64 {
+        let n = support_count.max(1) as f64;
+        n / (n + 1.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

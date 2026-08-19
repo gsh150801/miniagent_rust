@@ -30,6 +30,14 @@ pub struct AppConfig {
     pub minimax_base_url: String,
     pub minimax_model_name: Option<String>,
 
+    // ── 辩论角色模型 ─────────────────────────────────────────────
+    /// Per-role model profile IDs for the debate (Proposer / Opponent /
+    /// Judge). Empty = the active main model. Values reference profiles in
+    /// `models.json` (e.g. "builtin-deepseek", "custom-ab12cd34").
+    pub debate_proposer_model: Option<String>,
+    pub debate_opponent_model: Option<String>,
+    pub debate_judge_model: Option<String>,
+
     // ── Search backends ───────────────────────────────────────────
     pub bocha_api_key: Option<ApiKey>,
     pub tavily_api_key: Option<ApiKey>,
@@ -108,6 +116,10 @@ impl AppConfig {
             minimax_base_url: Self::var("MINIMAX_BASE_URL")
                 .unwrap_or_else(|| "https://api.minimaxi.com/v1".into()),
             minimax_model_name: Self::var("MINIMAX_MODEL_NAME"),
+
+            debate_proposer_model: Self::var("DEBATE_PROPOSER_MODEL"),
+            debate_opponent_model: Self::var("DEBATE_OPPONENT_MODEL"),
+            debate_judge_model: Self::var("DEBATE_JUDGE_MODEL"),
 
             bocha_api_key: ApiKey::from_env("BOCHA_API_KEY"),
             tavily_api_key: ApiKey::from_env("TAVILY_API_KEY"),

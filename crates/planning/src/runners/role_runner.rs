@@ -93,6 +93,7 @@ impl StageDriver for SingleRoleRunner {
             data,
             summary,
             side_effects,
+            mode: "workflow".to_string(),
         })
     }
 }

@@ -328,6 +328,8 @@ mod tests {
             confidence: 0.9,
             evidence: "test".into(),
             source_paper_id: None,
+            support_count: 1,
+            supporting_papers: vec![],
         };
         kg.add_relation(rel(g1, d1));
         kg.add_relation(rel(g1, d2));

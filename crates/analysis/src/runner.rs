@@ -22,7 +22,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::provenance::{
-    current_git_commit, fnv1a_hex, preview, record_dir_shallow, record_file, FileRecord,
+    current_git_commit, preview, record_dir_shallow, record_file, sha256_hex, FileRecord,
     ProvenanceRecord,
 };
 
@@ -129,7 +129,7 @@ impl AnalysisRunner {
             .await?;
         std::fs::write(&script_path, &script)
             .map_err(|e| AgentError::Checkpoint(format!("write script: {e}")))?;
-        let script_hash = fnv1a_hex(script.as_bytes());
+        let script_hash = sha256_hex(script.as_bytes());
 
         // Always build a Jupyter notebook from the generated script + task
         // metadata, so the analysis is viewable/re-runnable as a .ipynb.
@@ -138,6 +138,7 @@ impl AnalysisRunner {
 
         // In dry-run mode we stop here: deliver script + notebook + plan, no execution.
         if dry_run {
+            let no_conda: Option<String> = None;
             let provenance = self.finalize_provenance(
                 task,
                 hypothesis_ref,
@@ -151,6 +152,7 @@ impl AnalysisRunner {
                 None,
                 "",
                 "",
+                &no_conda,
                 false,
                 Some(&notebook_path),
                 false,
@@ -198,7 +200,7 @@ impl AnalysisRunner {
                 let provenance = self.finalize_provenance(
                     task, hypothesis_ref, &script_path, script_hash, &local_data_path,
                     &task_dir, opts, started_at, instant.elapsed(), None, "", &stderr,
-                    conda_used, Some(&notebook_path), false, ExecutionBackend::Python,
+                    &conda_bin, conda_used, Some(&notebook_path), false, ExecutionBackend::Python,
                 );
                 let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
                 return Ok(AnalysisResult {
@@ -221,8 +223,8 @@ impl AnalysisRunner {
         let output_files = collect_outputs(&task_dir, &script_path, &notebook_path);
         let provenance = self.finalize_provenance(
             task, hypothesis_ref, &script_path, script_hash, &local_data_path, &task_dir,
-            opts, started_at, instant.elapsed(), exit_code, &stdout, &stderr, conda_used,
-            Some(&notebook_path), notebook_executed, backend,
+            opts, started_at, instant.elapsed(), exit_code, &stdout, &stderr, &conda_bin,
+            conda_used, Some(&notebook_path), notebook_executed, backend,
         );
         let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
 
@@ -257,10 +259,16 @@ impl AnalysisRunner {
         working_dir: &Path,
         cancel: &CancellationToken,
     ) -> Result<ExecOutcome, AgentError> {
-        // Try Jupyter first.
+        // Try Jupyter first. Overall wall-clock guard: the per-cell
+        // nbconvert timeout handles hanging cells, but nbconvert itself can
+        // stall (kernel startup, lock files) — 15 min is the hard ceiling.
         if crate::notebook::jupyter_available() {
-            match crate::notebook::execute_notebook(notebook, Some(notebook), 600) {
-                Ok(nb) if nb.exit_code == 0 => {
+            let nb_path = notebook.to_path_buf();
+            let nb_exec = tokio::task::spawn_blocking(move || {
+                crate::notebook::execute_notebook(&nb_path, Some(&nb_path), 600)
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(900), nb_exec).await {
+                Ok(Ok(Ok(nb))) if nb.exit_code == 0 => {
                     return Ok(ExecOutcome {
                         stdout: nb.stdout,
                         stderr: nb.stderr,
@@ -269,7 +277,7 @@ impl AnalysisRunner {
                         backend: ExecutionBackend::Jupyter,
                     });
                 }
-                Ok(nb) => {
+                Ok(Ok(Ok(nb))) => {
                     // Notebook execution failed — fall back to the script so we
                     // still capture a concrete error / partial outputs.
                     tracing::warn!(
@@ -278,8 +286,14 @@ impl AnalysisRunner {
                         nb.exit_code
                     );
                 }
-                Err(e) => {
+                Ok(Ok(Err(e))) => {
                     tracing::warn!("jupyter unavailable ({e}); falling back to script execution");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("nbconvert task panicked: {e}; falling back to script");
+                }
+                Err(_) => {
+                    tracing::warn!("nbconvert exceeded 15 min wall clock; falling back to script");
                 }
             }
         }
@@ -379,7 +393,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
         };
 
         let resp = self.provider.complete(&request, cancel.clone()).await?;
-        let text = resp
+        let mut text = resp
             .content
             .iter()
             .filter_map(|b| match b {
@@ -388,6 +402,38 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             })
             .collect::<Vec<_>>()
             .join("");
+
+        // Reasoning models can exhaust the token budget on chain-of-thought
+        // and return empty code — observed live: the empty script built a
+        // notebook that "succeeded" with zero output. One retry with a
+        // doubled budget recovers it (same pattern as validation plans).
+        let script = json_util::strip_markdown_fences(&json_util::strip_reasoning_tags(&text))
+            .trim()
+            .to_string();
+        let text = if script.is_empty() {
+            tracing::warn!("script generation empty ({}), retrying with larger budget", task.id);
+            let retry = CompletionRequest {
+                system: request.system.clone(),
+                messages: request.messages.clone(),
+                tools: vec![],
+                config: miniagent_core::config::InferenceConfig {
+                    temperature: Some(0.1),
+                    max_tokens: Some(16_384),
+                    ..Default::default()
+                },
+            };
+            let resp = self.provider.complete(&retry, cancel.clone()).await?;
+            resp.content
+                .iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        } else {
+            text
+        };
 
         // Strip reasoning tags + markdown fences if the model added them
         // despite instructions (reasoning models emit <think> inline).
@@ -409,6 +455,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
         exit_code: Option<i32>,
         stdout: &str,
         stderr: &str,
+        conda_bin: &Option<String>,
         conda_used: bool,
         notebook_path: Option<&Path>,
         notebook_executed: bool,
@@ -442,14 +489,14 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             }),
             conda_env: opts.conda_env.clone(),
             conda_used,
-            package_versions: vec![],
+            package_versions: capture_package_versions(conda_bin.as_deref(), &opts.conda_env, conda_used),
             seed: opts.seed,
             git_commit: current_git_commit(task_dir),
             started_at,
             duration: chrono::Duration::from_std(elapsed).unwrap_or_default(),
             exit_code,
-            stdout_hash: fnv1a_hex(stdout.as_bytes()),
-            stderr_hash: fnv1a_hex(stderr.as_bytes()),
+            stdout_hash: sha256_hex(stdout.as_bytes()),
+            stderr_hash: sha256_hex(stderr.as_bytes()),
             stdout_preview: preview(stdout.as_bytes(), 2000),
             stderr_preview: preview(stderr.as_bytes(), 2000),
             notebook_path: notebook_path.map(|p| p.to_path_buf()),
@@ -482,6 +529,35 @@ struct ExecOutput {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
+}
+
+/// Snapshot the interpreter's package versions for provenance. Runs
+/// `<python> -m pip freeze` in the env that actually executed the script
+/// (conda env when used, else system python). Best-effort: empty on any
+/// failure (no pip / offline), never blocks the analysis.
+fn capture_package_versions(conda_bin: Option<&str>, env: &str, conda_used: bool) -> Vec<String> {
+    let mut cmd = if conda_used {
+        let Some(bin) = conda_bin else {
+            return vec![];
+        };
+        let mut c = std::process::Command::new(bin);
+        c.args(["run", "-n", env, "python", "-m", "pip", "freeze"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("python3");
+        c.args(["-m", "pip", "freeze"]);
+        c
+    };
+    let Ok(out) = cmd.output() else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(200)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Resolved execution outcome from `execute_analysis`.

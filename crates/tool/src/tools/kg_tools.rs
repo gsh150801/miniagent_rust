@@ -472,6 +472,8 @@ impl Tool for KgAddTool {
                     confidence,
                     evidence,
                     source_paper_id: None,
+                    support_count: 1,
+                    supporting_papers: vec![],
                 });
                 added_relations += 1;
             }
@@ -600,7 +602,8 @@ impl Tool for HypothesisSuggestTool {
                 let generator = HypothesisGenerator::new()
                     .with_provider(Box::new(ArcProvider { inner: provider.clone() }));
                 match generator.generate(c, &kg, cancel.clone()).await {
-                    Ok(h) => hypotheses.push(h),
+                    Ok(Some(h)) => hypotheses.push(h),
+                    Ok(None) => {} // evaluator marked implausible — skip
                     Err(e) => {
                         tracing::warn!(
                             error = %e,

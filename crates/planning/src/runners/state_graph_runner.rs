@@ -138,6 +138,7 @@ impl StageDriver for StateGraphRunner {
             data,
             summary,
             side_effects,
+            mode: "workflow".to_string(),
         })
     }
 }

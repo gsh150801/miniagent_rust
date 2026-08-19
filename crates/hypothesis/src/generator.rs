@@ -52,13 +52,17 @@ impl HypothesisGenerator {
         self
     }
 
-    /// Generate a hypothesis from a KG candidate
+    /// Generate a hypothesis from a KG candidate.
+    ///
+    /// Returns `Ok(None)` when the evaluator marks the candidate as
+    /// `plausible: false` — an implausible candidate must not become a
+    /// hypothesis just because the JSON parsed.
     pub async fn generate(
         &self,
         candidate: &HypothesisCandidate,
         kg: &KnowledgeGraph,
         cancel: CancellationToken,
-    ) -> Result<Hypothesis, AgentError> {
+    ) -> Result<Option<Hypothesis>, AgentError> {
         let head = kg.get_entity(&candidate.head);
         let tail = kg.get_entity(&candidate.tail);
 
@@ -174,7 +178,7 @@ Output as JSON:
         &self,
         text: &str,
         candidate: &HypothesisCandidate,
-    ) -> Result<Hypothesis, AgentError> {
+    ) -> Result<Option<Hypothesis>, AgentError> {
         // extract_and_repair strips <think> blocks + fences and repairs
         // truncated JSON; parse failures propagate as errors instead of
         // silently producing a hypothesis with an empty statement.
@@ -186,7 +190,17 @@ Output as JSON:
             ))
         })?;
 
-        Ok(Hypothesis {
+        // The evaluator's own plausibility gate: an explicit `false` drops
+        // the candidate. Missing field means "not assessed" — keep it.
+        if parsed["plausible"].as_bool() == Some(false) {
+            tracing::info!(
+                candidate = %candidate.head.0,
+                "candidate marked implausible by evaluator; skipping"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(Hypothesis {
             id: uuid::Uuid::new_v4(),
             statement: parsed["statement"].as_str().unwrap_or("").to_string(),
             mechanism: parsed["mechanism"].as_str().map(|s| s.to_string()),
@@ -222,7 +236,7 @@ Output as JSON:
                 feasibility: exp.get("feasibility").and_then(|v| v.as_f64()).unwrap_or(0.5),
             }),
             source_candidate: candidate.clone(),
-        })
+        }))
     }
 
     /// Generate a structured validation plan for a hypothesis.
@@ -553,6 +567,54 @@ fn as_string_array_val(v: &serde_json::Value, key: &str) -> Vec<String> {
 impl Default for HypothesisGenerator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod plausible_tests {
+    use super::*;
+    use miniagent_kg::link_prediction::{HypothesisCandidate, HypothesisEvidence, HypothesisNovelty as KgNovelty};
+    use miniagent_kg::schema::{EntityId, RelationType};
+
+    fn candidate() -> HypothesisCandidate {
+        HypothesisCandidate {
+            head: EntityId::new(),
+            relation: RelationType::Regulates,
+            tail: EntityId::new(),
+            score: 0.7,
+            evidence: HypothesisEvidence {
+                kge_score: 0.7,
+                path_score: 0.5,
+                give_score: 0.4,
+                supporting_paths: vec![],
+                novelty: KgNovelty::Novel,
+            },
+        }
+    }
+
+    fn parse(text: &str) -> Result<Option<Hypothesis>, AgentError> {
+        HypothesisGenerator::new().parse_hypothesis_response(text, &candidate())
+    }
+
+    #[test]
+    fn explicit_implausible_is_filtered() {
+        let h = parse(r#"{"plausible": false, "statement": "X causes Y"}"#).unwrap();
+        assert!(h.is_none(), "plausible:false must not become a hypothesis");
+    }
+
+    #[test]
+    fn explicit_plausible_passes() {
+        let h = parse(r#"{"plausible": true, "statement": "X causes Y", "confidence": 0.8}""#)
+            .unwrap()
+            .expect("plausible:true → Some");
+        assert_eq!(h.statement, "X causes Y");
+        assert!((h.confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_plausible_field_keeps_hypothesis() {
+        let h = parse(r#"{"statement": "X causes Y"}"#).unwrap();
+        assert!(h.is_some(), "missing plausible field means not assessed");
     }
 }
 

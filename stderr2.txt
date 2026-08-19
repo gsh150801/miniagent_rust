@@ -1,8 +1,0 @@
-   🔍 Probing search backend health...
-   🔍 Health check: 3/4 backends healthy
-      ✅ serper (1396ms)
-      ✅ tavily (744ms)
-      ❌ bocha (200ms): HTTP 404 Not Found
-      ✅ pubmed (932ms)
-   ──
-Server error: 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。 (os error 10048)

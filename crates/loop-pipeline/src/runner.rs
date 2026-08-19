@@ -8,9 +8,9 @@
 use crate::pipeline::LoopPipeline;
 use crate::types::PipelineState;
 use miniagent_core::orchestration::{
-    OrchestrationError, StageDriver, StageInput, StageOutcome,
+    OrchestrationError, ProgressFn, StageDriver, StageInput, StageOutcome,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use miniagent_core::settings::AppConfig;
 #[cfg(test)]
@@ -21,11 +21,36 @@ use tokio_util::sync::CancellationToken;
 pub struct LoopRunner {
     config: Arc<AppConfig>,
     max_loops: usize,
+    /// Optional progress callback the server wires into the WebSocket bridge.
+    /// Wrapped in `Arc<Mutex<_>>` so the `LoopRunner` itself can satisfy
+    /// `StageDriver: Send + Sync` (a bare `Box<dyn FnMut + Send>` is not Sync).
+    /// `None` = silent (CLI / tests).
+    on_progress: Option<Arc<Mutex<Option<ProgressFn>>>>,
+    /// Anchor directory for all run artifacts (task dir on the server).
+    /// `None` = `./result/loop-pipeline` default.
+    result_dir: Option<std::path::PathBuf>,
 }
 
 impl LoopRunner {
     pub fn new(config: Arc<AppConfig>, max_loops: usize) -> Self {
-        Self { config, max_loops }
+        Self {
+            config,
+            max_loops,
+            on_progress: None,
+            result_dir: None,
+        }
+    }
+
+    /// Builder-style attach for the server-side progress bridge.
+    pub fn with_progress(mut self, on_progress: ProgressFn) -> Self {
+        self.on_progress = Some(Arc::new(Mutex::new(Some(on_progress))));
+        self
+    }
+
+    /// Anchor all artifacts (dispatch outputs, checkpoints) to `dir`.
+    pub fn with_result_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.result_dir = Some(dir.into());
+        self
     }
 
     pub fn with_default_loops(config: Arc<AppConfig>) -> Self {
@@ -58,12 +83,29 @@ impl StageDriver for LoopRunner {
         let cancel = input.cancel.clone();
         let config = self.config.clone();
         let max_loops = self.max_loops;
+        let result_dir = self.result_dir.clone();
+        // Take the callback out of the Arc<Mutex> so we can move it into the
+        // pipeline (the pipeline only needs it for one run; we hand ownership
+        // back via the Arc on the next call). Mutex<Option<ProgressFn>> avoids
+        // the "lock guard across .await" footgun while still satisfying
+        // `StageDriver: Sync` for the storage slot.
+        let on_progress: Option<ProgressFn> = if let Some(slot) = self.on_progress.as_ref() {
+            let mut guard = slot.lock().ok().ok_or_else(|| {
+                OrchestrationError::Stage("progress callback lock poisoned".into())
+            })?;
+            // mem::take replaces the inner Option with None without colliding
+            // with `Box::take` (which doesn't exist but resolves through the
+            // `Iterator` trait, causing E0599).
+            std::mem::take(&mut *guard)
+        } else {
+            None
+        };
 
         // `?` invokes the canonical `From<AgentError> for OrchestrationError`
         // defined in `miniagent_core::orchestration` (round 32 hoist).
-        let state = LoopPipeline::run(task, config, max_loops, cancel).await?;
+        let state = LoopPipeline::run(task, config, max_loops, cancel, on_progress, result_dir).await?;
 
-        Ok(state_to_outcome(&state))
+        Ok(state_to_outcome(&state).with_mode("loop".to_string()))
     }
 }
 

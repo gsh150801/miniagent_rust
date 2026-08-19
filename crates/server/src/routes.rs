@@ -67,6 +67,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/models", get(models_handler).post(add_model_handler))
         .route("/api/models/{id}", axum::routing::put(update_model_handler).delete(delete_model_handler))
         .route("/api/models/{id}/activate", post(activate_model_handler))
+        // Debate role model selection (⚙️ settings)
+        .route("/api/debate-models", get(debate_models_handler).post(set_debate_models_handler))
         .with_state(state)
 }
 
@@ -662,9 +664,27 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
                     let state2 = state.clone();
                     let sink2 = Arc::clone(&sink);
+                    let mode = req.mode.clone();
+                    let files2 = req.files.clone();
                     let handle = tokio::spawn(async move {
-                        // 统一新流程：explore→ask→plan→dispatch→feedback（不再区分 workflow/loop）
-                        let _ = handle_run(&sink2, &state2, req.prompt, req.files, task_id).await;
+                        match mode.as_str() {
+                            "debate" => {
+                                // 辩论模式：正方 vs 反方 → 裁判（角色模型来自 ⚙️ 设置）
+                                let _ = handle_debate_run(&sink2, &state2, req.prompt, task_id).await;
+                            }
+                            "loop" | "loop_pipeline" | "loop-pipeline" => {
+                                // Loop pipeline: 迭代 Explore→Plan→Dispatch→Evaluate→Repair
+                                let _ = handle_run_loop(&sink2, &state2, req.prompt, task_id).await;
+                            }
+                            "research" => {
+                                // Research pipeline: 文献→KG→致病机理假说→辩论→验证计划→数据分析 notebook
+                                let _ = handle_research_run(&sink2, &state2, req.prompt, task_id).await;
+                            }
+                            _ => {
+                                // 默认：单智能体 ReAct + 计划 + 反馈（workflow 路径）
+                                let _ = handle_run(&sink2, &state2, req.prompt, files2, task_id).await;
+                            }
+                        }
                     });
                     running = Some(handle);
                 }
@@ -699,6 +719,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                             "plan": task.plan,
                             "stage_outputs": task.stage_outputs.clone(),
                             "file_tree": file_tree,
+                            "event_log": task.event_log.clone(),
                         });
                         if !task.messages.is_empty() {
                             response["messages"] = serde_json::json!(task.messages);
@@ -754,7 +775,10 @@ struct WsRequest {
 }
 
 /// Loop pipeline: iterative Explore->Plan->Dispatch->Evaluate->Repair cycles.
-#[allow(dead_code)]
+///
+/// Wired in via [`DriverKind::Loop`]. Emits the same `progress` /
+/// `agent_event` envelope as the workflow path so the front-end progress
+/// panel renders both modes uniformly.
 async fn handle_run_loop(
     socket: &Arc<Mutex<WsSink>>,
     state: &AppState,
@@ -765,8 +789,12 @@ async fn handle_run_loop(
         eprintln!("FATAL: {e}");
         std::process::exit(1);
     });
-    let _agent_arc = state.agent.clone();
+    let agent_arc = state.agent.clone();
 
+    // Task creation goes through the same `create_new_task` helper as the
+    // workflow mode: 8-char id + sanitized brief under `state.task_dir`, so
+    // all modes share one `result/{id}_{brief}` naming scheme and the
+    // restart-restore scan picks loop tasks up too.
     let (task_id, task_brief, task_dir, _task_workflow_dir) =
         if let Some(ref existing_id) = existing_task_id {
             if let Some(ref task) = state.tasks.get(existing_id) {
@@ -776,50 +804,10 @@ async fn handle_run_loop(
                 let _ = std::fs::create_dir_all(&wf_dir);
                 (existing_id.clone(), brief, dir.clone(), wf_dir)
             } else {
-                let uuid_str = Uuid::new_v4().to_string();
-                let brief = prompt.chars().take(32).collect::<String>();
-                let task_dir = PathBuf::from(format!("./result/{}_{}", uuid_str, brief.replace("/", "_")));
-                let _ = std::fs::create_dir_all(&task_dir);
-                let wf_dir = task_dir.join(".workflow");
-                let _ = std::fs::create_dir_all(&wf_dir);
-                state.tasks.insert(uuid_str.clone(), TaskInfo {
-                    id: uuid_str.clone(),
-                    brief: brief.clone(),
-                    prompt: prompt.clone(),
-                    status: "running".into(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    result_dir: task_dir.clone(),
-                    files: vec![],
-                    response: String::new(),
-                    messages: vec![serde_json::json!({"role": "user", "content": prompt.clone()})],
-                    plan: None,
-                    stage_outputs: Vec::new(),
-            event_log: Vec::new(),
-                });
-                (uuid_str, brief, task_dir, wf_dir)
+                create_new_task(state, &prompt)
             }
         } else {
-            let uuid_str = Uuid::new_v4().to_string();
-            let brief = prompt.chars().take(32).collect::<String>();
-            let task_dir = PathBuf::from(format!("./result/{}_{}", uuid_str, brief.replace("/", "_")));
-            let _ = std::fs::create_dir_all(&task_dir);
-            let wf_dir = task_dir.join(".workflow");
-            let _ = std::fs::create_dir_all(&wf_dir);
-            state.tasks.insert(uuid_str.clone(), TaskInfo {
-                id: uuid_str.clone(),
-                brief: brief.clone(),
-                prompt: prompt.clone(),
-                status: "running".into(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                result_dir: task_dir.clone(),
-                files: vec![],
-                response: String::new(),
-                messages: vec![serde_json::json!({"role": "user", "content": prompt.clone()})],
-                plan: None,
-                stage_outputs: Vec::new(),
-            event_log: Vec::new(),
-            });
-            (uuid_str, brief, task_dir, wf_dir)
+            create_new_task(state, &prompt)
         };
 
     let _ = ws_send(socket, serde_json::json!({
@@ -836,19 +824,73 @@ async fn handle_run_loop(
     state.cancels.insert(task_id.clone(), cancel.clone());
     let max_loops = state.config.loop_max_loops;
 
+    // ── Progress + AgentEvent bridges (mirror handle_run's pattern) ──
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ProgressMsg>(32);
+    let (agent_event_tx, mut agent_event_rx) =
+        tokio::sync::broadcast::channel::<miniagent_core::event::AgentEvent>(64);
+    let agent_tx_for_fwd = progress_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(ev) = agent_event_rx.recv().await {
+            if agent_tx_for_fwd.send(ProgressMsg::AgentEvent(ev)).await.is_err() { break; }
+        }
+    });
+    agent_arc.set_event_sender(agent_event_tx).await;
+
+    // Build a ProgressFn closure that ships per-stage events into the
+    // progress channel. The closure is `FnMut` and only touches local
+    // variables, so it can be moved into LoopPipeline::run.
+    let progress_tx_for_cb = progress_tx.clone();
+    let on_progress: miniagent_core::orchestration::ProgressFn = Box::new(move |name, status, data| {
+        let payload = ProgressMsg::Stage {
+            name: name.to_string(),
+            status: status.to_string(),
+            data: data.cloned(),
+        };
+        let _ = progress_tx_for_cb.try_send(payload);
+    });
+
+    // Drain the channel while the pipeline runs in a separate task.
+    let drain_socket = Arc::clone(socket);
+    let drain_state = state.clone();
+    let drain_task_id = task_id.clone();
+    let drain_task_dir = task_dir.clone();
+    let drain_task_brief = task_brief.clone();
+    let drain_handle = tokio::spawn(async move {
+        drain_progress_channel(
+            drain_socket,
+            drain_state,
+            drain_task_id,
+            drain_task_brief,
+            drain_task_dir,
+            &mut progress_rx,
+        )
+        .await;
+    });
+
+    // Anchor every pipeline artifact (dispatch outputs, checkpoints, tool
+    // writes) inside the task's result directory.
     let result = miniagent_loop_pipeline::LoopPipeline::run(
         prompt.clone(),
         state.config.clone(),
         max_loops,
         cancel.clone(),
+        Some(on_progress),
+        Some(task_dir.clone()),
     ).await;
 
     state.cancels.remove(&task_id);
+    // Drop the sender so the drain task exits when the channel empties.
+    drop(progress_tx);
+    let _ = drain_handle.await;
 
     match result {
         Ok(pipeline_state) => {
-            // Send plan if available
-            if let Some(ref plan) = pipeline_state.plan {
+            // The plan is normally shipped by `drain_progress_channel` the
+            // moment the plan stage completes (data.plan_tasks). This is the
+            // fallback for degraded runs where the plan event never fired.
+            if let Some(ref plan) = pipeline_state.plan
+                && let Some(mut task) = state.tasks.get_mut(&task_id)
+                && task.plan.is_none() {
                 let stages: Vec<serde_json::Value> = plan.tasks.iter().map(|t| {
                     serde_json::json!({
                         "name": t.id,
@@ -859,19 +901,16 @@ async fn handle_run_loop(
                         "tools": serde_json::json!([]),
                     })
                 }).collect();
-                let _ = ws_send(socket, serde_json::json!({
-                    "type": "plan",
+                let plan_json = serde_json::json!({
                     "workflow": "loop_pipeline",
                     "stages": stages,
-                })).await;
-            }
-
-            // Send stage outputs
-            for stage_output in &pipeline_state.stage_outputs {
+                });
+                task.plan = Some(plan_json.clone());
                 let _ = ws_send(socket, serde_json::json!({
-                    "type": "stage_output",
-                    "stage": stage_output.stage,
-                    "summary": stage_output.summary,
+                    "type": "plan",
+                    "task_id": task_id,
+                    "workflow": "loop_pipeline",
+                    "stages": stages,
                 })).await;
             }
 
@@ -883,13 +922,345 @@ async fn handle_run_loop(
                 "text": response_text.clone(),
             })).await;
 
+            // Loop artifacts live directly under task_dir (tasks/, dispatch
+            // summaries, checkpoints) — pass task_dir as the workflow dir so
+            // finalize_task's recursive collector lists them all.
             finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["loop_pipeline".to_string()], response_text).await;
         }
         Err(e) => {
+            if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                task.status = "failed".into();
+            }
             let _ = ws_send(socket, serde_json::json!({
                 "type": "error",
                 "message": format!("Loop pipeline failed: {e}"),
             })).await;
+        }
+    }
+}
+
+/// Research pipeline mode: the full goals-1-4 pipeline (literature → KG →
+/// link prediction → pathogenesis hypotheses → evidence debate → validation
+/// plans → executable notebook analysis), driven by the exact same
+/// `miniagent_research::run_research` code path the CLI uses. All artifacts
+/// (papers.json, kg.json, hypotheses, debate report, plans, analysis/
+/// notebooks, project.json audit manifest) land inside the task's
+/// `result/{id}_{brief}` directory.
+async fn handle_research_run(
+    socket: &Arc<Mutex<WsSink>>,
+    state: &AppState,
+    prompt: String,
+    existing_task_id: Option<String>,
+) {
+    use miniagent_research::{ResearchOptions, ResearchProgress};
+
+    if let Err(e) = state.config.require_active_key() {
+        let _ = ws_send(socket, serde_json::json!({
+            "type": "error", "message": format!("FATAL: {e}"),
+        })).await;
+        return;
+    }
+
+    let (task_id, task_brief, task_dir, _task_workflow_dir) =
+        if let Some(ref existing_id) = existing_task_id
+            && let Some(ref task) = state.tasks.get(existing_id)
+        {
+            (existing_id.clone(), task.brief.clone(), task.result_dir.clone(), task.result_dir.clone())
+        } else {
+            create_new_task(state, &prompt)
+        };
+    if let Some(mut t) = state.tasks.get_mut(&task_id) {
+        t.status = "running".into();
+    }
+
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "task_started", "task_id": &task_id,
+    })).await;
+
+    let cancel = CancellationToken::new();
+    state.cancels.insert(task_id.clone(), cancel.clone());
+
+    // Fixed 7-phase plan — the pipeline emits matching stage keys.
+    let plan_stages: Vec<serde_json::Value> = vec![
+        serde_json::json!({ "name": "literature", "handler": "research",
+            "description": "文献检索：查询翻译 → PubMed 检索 → 摘要获取 → 相关性过滤",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "kg_build", "handler": "research",
+            "description": "知识图谱：实体/关系抽取 + canonical 合并",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "link_prediction", "handler": "research",
+            "description": "链接预测：TransE 嵌入 + 疾病锚定候选外推",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "hypotheses", "handler": "research",
+            "description": "致病机理假说生成（候选验证 + 机制解释）与排序",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "debate", "handler": "research",
+            "description": "假说辩论：证据-矛盾交锋（外部文献证据注入）+ 精炼",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "validation_plans", "handler": "research",
+            "description": "验证计划：数据分析任务（GEO 数据集落地）+ 湿实验方案",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "analysis", "handler": "research",
+            "description": "端到端数据分析：GEO 下载 → 可复现 .ipynb 执行 + 溯源记录",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
+    ];
+    if let Some(mut task) = state.tasks.get_mut(&task_id) {
+        task.plan = Some(serde_json::json!({
+            "workflow": "research",
+            "stages": plan_stages,
+        }));
+    }
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "plan",
+        "task_id": &task_id,
+        "workflow": "research",
+        "stages": plan_stages,
+    })).await;
+
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "status",
+        "message": format!("Starting research pipeline (artifacts → {}): {}", task_dir.display(), task_brief),
+    })).await;
+
+    // Web-mode defaults: the full goals-1-4 experience — debate + validation
+    // plans + notebook analysis are all on.
+    let opts = ResearchOptions {
+        max_papers: 10,
+        validate: true,
+        analyze: true,
+        debate: true,
+        ..Default::default()
+    };
+
+    // Progress bridge: pipeline phase callbacks → WS progress envelopes +
+    // stage_outputs persistence. Cloned Arcs keep the closure 'static.
+    let sink_cb = Arc::clone(socket);
+    let state_cb = state.clone();
+    let task_id_cb = task_id.clone();
+    let main_rt = tokio::runtime::Handle::current();
+    let on_progress: ResearchProgress = Arc::new(move |stage: &str, status: &str| {
+        let payload = serde_json::json!({
+            "type": "progress",
+            "stage": stage,
+            "status": status,
+            "task_id": task_id_cb,
+        });
+        let socket = Arc::clone(&sink_cb);
+        let state = state_cb.clone();
+        let stage = stage.to_string();
+        let status = status.to_string();
+        let task_id_key = task_id_cb.clone();
+        // Spawn via the captured server-runtime handle: the callback runs on
+        // the pipeline's dedicated thread, `Handle::current` there would fail.
+        main_rt.spawn(async move {
+            let _ = ws_send(&socket, payload).await;
+            if status == "completed"
+                && let Some(mut task) = state.tasks.get_mut(&*task_id_key) {
+                task.stage_outputs.push(serde_json::json!({
+                    "stage": stage,
+                    "summary": { "response_preview": format!("{stage} phase completed") },
+                }));
+            }
+        });
+    });
+
+    // Run the pipeline on a dedicated blocking thread driving its own
+    // current-thread runtime: the root future of `block_on` needs no `Send`
+    // (rustc's higher-ranked Send check rejects parts of the pipeline chain),
+    // thread panics surface through the JoinHandle, and the outer timeout
+    // bounds a stalled run.
+    let run_prompt = prompt.clone();
+    let run_dir = task_dir.clone();
+    let run_opts = opts.clone();
+    let run_config = state.config.clone();
+    let run_cb = on_progress.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let join = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let summary = rt.block_on(miniagent_research::run_research(
+            run_prompt, run_dir, run_opts, run_config, Some(run_cb),
+        ));
+        let _ = tx.send(summary);
+        Ok::<(), String>(())
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3600), join).await;
+
+    state.cancels.remove(&task_id);
+
+    let summary = match result {
+        Ok(Ok(Ok(()))) => match rx.await {
+            Ok(summary) => summary,
+            Err(_) => String::new(),
+        },
+        Ok(Ok(Err(e))) => {
+            // runtime build failure inside the thread
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error", "task_id": &task_id, "message": format!("research runtime error: {e}"),
+            })).await;
+            if let Some(mut t) = state.tasks.get_mut(&task_id) {
+                t.status = "failed".into();
+            }
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "complete", "task_id": &task_id, "status": "failed", "files": [],
+            })).await;
+            return;
+        }
+        Ok(Err(panic)) => {
+            let msg = format!("research pipeline thread failed: {panic}");
+            tracing::error!(task_id = %task_id, "{msg}");
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error", "task_id": &task_id, "message": msg,
+            })).await;
+            if let Some(mut t) = state.tasks.get_mut(&task_id) {
+                t.status = "failed".into();
+            }
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "complete", "task_id": &task_id, "status": "failed", "files": [],
+            })).await;
+            return;
+        }
+        Err(_) => {
+            let msg = "research pipeline timed out (60 min)".to_string();
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error", "task_id": &task_id, "message": msg,
+            })).await;
+            if let Some(mut t) = state.tasks.get_mut(&task_id) {
+                t.status = "failed".into();
+            }
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "complete", "task_id": &task_id, "status": "failed", "files": [],
+            })).await;
+            return;
+        }
+    };
+
+    if summary.trim().is_empty() {
+        // Stage-validation gates abort with an empty summary — surface it.
+        if let Some(mut t) = state.tasks.get_mut(&task_id) {
+            t.status = "failed".into();
+        }
+        let _ = ws_send(socket, serde_json::json!({
+            "type": "error", "task_id": &task_id,
+            "message": "research pipeline aborted (stage validation failed — see server logs / project.json event log)",
+        })).await;
+        let _ = ws_send(socket, serde_json::json!({
+            "type": "complete", "task_id": &task_id, "status": "failed", "files": [],
+        })).await;
+        return;
+    }
+
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "stream",
+        "text": summary.clone(),
+    })).await;
+
+    // Artifacts live directly under task_dir — pass it as the workflow dir so
+    // finalize_task's recursive collector lists hypotheses/plans/analysis.
+    finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["research".to_string()], summary).await;
+}
+
+/// Drain `ProgressMsg` items into WebSocket envelopes and persist
+/// `agent_event`s into `task.event_log`. Mirrors the loop body of
+/// `run_with_progress` but is driver-agnostic so the loop-pipeline can reuse
+/// it without depending on `Workflow::run_with_progress`.
+async fn drain_progress_channel(
+    socket: Arc<Mutex<WsSink>>,
+    state: AppState,
+    task_id: String,
+    _task_brief: String,
+    task_dir: PathBuf,
+    progress_rx: &mut tokio::sync::mpsc::Receiver<ProgressMsg>,
+) {
+    while let Some(msg) = progress_rx.recv().await {
+        match msg {
+            ProgressMsg::Stage { name, status, data } => {
+                // Early plan shipping: the loop pipeline attaches the freshly
+                // decomposed task list to the plan stage's completed event, so
+                // the frontend renders the pill strip before dispatch starts
+                // (workflow-mode parity) and the plan survives restarts via
+                // metadata.json.
+                if name == "plan" && status == "completed"
+                    && let Some(ref d) = data
+                    && let Some(tasks) = d.get("plan_tasks").and_then(|v| v.as_array())
+                    && !tasks.is_empty() {
+                    let stages: Vec<serde_json::Value> = tasks.iter().map(|t| {
+                        serde_json::json!({
+                            "name": t.get("id").cloned().unwrap_or(serde_json::json!("task")),
+                            "handler": t.get("handler").cloned().unwrap_or(serde_json::json!("executor")),
+                            "tier": t.get("tier").cloned().unwrap_or(serde_json::json!("medium")),
+                            "description": t.get("description").cloned().unwrap_or(serde_json::json!("")),
+                            "sub_tasks": t.get("sub_tasks").cloned().unwrap_or(serde_json::json!([])),
+                            "tools": serde_json::json!([]),
+                        })
+                    }).collect();
+                    if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                        task.plan = Some(serde_json::json!({
+                            "workflow": "loop_pipeline",
+                            "stages": stages,
+                        }));
+                    }
+                    let _ = ws_send(&socket, serde_json::json!({
+                        "type": "plan",
+                        "task_id": task_id,
+                        "workflow": "loop_pipeline",
+                        "stages": stages,
+                    })).await;
+                }
+                let _ = ws_send(&socket, serde_json::json!({
+                    "type": "progress",
+                    "stage": name,
+                    "status": status,
+                    "task_id": task_id,
+                    "data": data,
+                })).await;
+                if status == "completed"
+                    && let Some(ref d) = data
+                {
+                    let summary = serde_json::json!({
+                        "response_preview": d.get("summary").and_then(|v| v.as_str()).unwrap_or("").chars().take(200).collect::<String>(),
+                        "tokens_in": 0, "tokens_out": 0,
+                        "tool_count": 0, "tool_entries": [],
+                    });
+                    if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                        task.stage_outputs.push(serde_json::json!({
+                            "stage": name,
+                            "summary": summary,
+                        }));
+                    }
+                }
+            }
+            ProgressMsg::AgentEvent(event) => {
+                let event_json = serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}));
+                let traced = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": event_json,
+                });
+                if let Some(mut task) = state.tasks.get_mut(&task_id) {
+                    task.event_log.push(traced.clone());
+                }
+                // Append-only audit trail on disk (goal: traceability). The
+                // in-memory event_log is lost on restart; the JSONL survives.
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(task_dir.join("event_log.jsonl"))
+                {
+                    let _ = writeln!(f, "{traced}");
+                }
+                let _ = ws_send(&socket, serde_json::json!({
+                    "type": "agent_event",
+                    "task_id": task_id,
+                    "event": event_json,
+                })).await;
+            }
+            ProgressMsg::Done(_) => {
+                // Loop pipeline doesn't push Done; reserved for workflow parity.
+                break;
+            }
         }
     }
 }
@@ -1005,6 +1376,181 @@ async fn ask_user(
             String::new()
         }
     }
+}
+
+/// 辩论模式：Proposer vs Opponent → Judge（DebateRunner），角色模型按 ⚙️
+/// 设置路由（默认全部主模型）。结果按轮次渲染为 Markdown。
+async fn handle_debate_run(
+    socket: &Arc<Mutex<WsSink>>,
+    state: &AppState,
+    prompt: String,
+    existing_task_id: Option<String>,
+) {
+    use miniagent_core::models::DebateRole;
+    use miniagent_core::orchestration::{StageInput, StageDriver as _};
+    use miniagent_planning::runners::{DebateRunner, DebateRound};
+
+    // Resolve role providers once per debate: ⚙️ selection > env > main model.
+    let (prop_profile, opp_profile, judge_profile) = {
+        let reg = state.models.read().unwrap();
+        (
+            reg.role_profile(DebateRole::Proposer).clone(),
+            reg.role_profile(DebateRole::Opponent).clone(),
+            reg.role_profile(DebateRole::Judge).clone(),
+        )
+    };
+    let (proposer, opponent, judge) =
+        match (
+            miniagent_provider::factory::resolve_role_provider_from(&prop_profile),
+            miniagent_provider::factory::resolve_role_provider_from(&opp_profile),
+            miniagent_provider::factory::resolve_role_provider_from(&judge_profile),
+        ) {
+            (Ok(p), Ok(o), Ok(j)) => (p, o, j),
+            (r1, r2, r3) => {
+                let e = r1.err().or(r2.err()).or(r3.err()).unwrap_or_default();
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "error",
+                    "message": format!("辩论角色模型不可用: {e}"),
+                })).await;
+                return;
+            }
+        };
+
+    let (task_id, task_brief, _task_dir, task_workflow_dir) =
+        if let Some(ref existing_id) = existing_task_id
+            && let Some(ref task) = state.tasks.get(existing_id)
+        {
+            // Follow-up rounds reuse the task's result dir but keep artifacts
+            // under `.workflow` — same layout as a fresh task (previously the
+            // first round wrote into `.workflow/` and follow-ups dumped
+            // proposer/judge files straight into the result dir root).
+            let wf_dir = task.result_dir.join(".workflow");
+            let _ = std::fs::create_dir_all(&wf_dir);
+            (existing_id.clone(), task.brief.clone(), task.result_dir.clone(), wf_dir)
+        } else {
+            create_new_task(state, &prompt)
+        };
+    if let Some(mut t) = state.tasks.get_mut(&task_id) {
+        t.status = "running".into();
+    }
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "task_started", "task_id": &task_id,
+    })).await;
+
+    let cancel = CancellationToken::new();
+    state.cancels.insert(task_id.clone(), cancel.clone());
+
+    // Plan pills for the progress panel (workflow/loop modes emit one too, so
+    // the debate mode no longer renders an empty "No workflow yet" panel).
+    {
+        let plan_stages = vec![
+            serde_json::json!({
+                "name": "proposer", "handler": "debate",
+                "description": "正方：构建论证（提出/修改假说）",
+                "sub_tasks": [], "tools": serde_json::json!([]),
+            }),
+            serde_json::json!({
+                "name": "opponent", "handler": "debate",
+                "description": "反方：证据-矛盾反驳与交叉检验",
+                "sub_tasks": [], "tools": serde_json::json!([]),
+            }),
+            serde_json::json!({
+                "name": "judge", "handler": "debate",
+                "description": "裁判：ACCEPT / REJECT / REVISE 裁决",
+                "sub_tasks": [], "tools": serde_json::json!([]),
+            }),
+        ];
+        if let Some(mut task) = state.tasks.get_mut(&task_id) {
+            task.plan = Some(serde_json::json!({
+                "workflow": "debate",
+                "stages": plan_stages,
+            }));
+        }
+        let _ = ws_send(socket, serde_json::json!({
+            "type": "plan",
+            "task_id": &task_id,
+            "workflow": "debate",
+            "stages": plan_stages,
+        })).await;
+    }
+
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "progress", "stage": "debate", "status": "running", "task_id": &task_id,
+        "detail": format!(
+            "正方: {} | 反方: {} | 裁判: {}",
+            prop_profile.display_name, opp_profile.display_name, judge_profile.display_name
+        ),
+    })).await;
+
+    let runner = DebateRunner::new(proposer, opponent, judge, task_workflow_dir.clone())
+        .with_max_revise_rounds(2);
+    let input = StageInput::new("debate", serde_json::json!(prompt), cancel.clone());
+    // Overall guard: role HTTP calls have no per-call timeout, so a stalled
+    // connection would hang the debate forever. 10 minutes covers a full
+    // 3-round debate on a slow reasoning model.
+    let outcome = match tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        runner.run(input),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            state.cancels.remove(&task_id);
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error", "task_id": &task_id,
+                "message": "辩论超时（10 分钟）— 可能是模型端点无响应，请重试或切换角色模型",
+            })).await;
+            if let Some(mut t) = state.tasks.get_mut(&task_id) {
+                t.status = "failed".into();
+            }
+            return;
+        }
+    };
+    state.cancels.remove(&task_id);
+
+    let response_text = match outcome {
+        Ok(out) => {
+            let mut md = String::new();
+            if let Ok(rounds) = serde_json::from_value::<Vec<DebateRound>>(out.data.clone()) {
+                for r in &rounds {
+                    md.push_str(&format!(
+                        "\n## 第 {} 轮（裁决：{}）\n\n### 📝 正方 Proposer\n{}\n\n### ⚔️ 反方 Opponent\n{}\n\n### ⚖️ 裁判 Judge\n{}\n\n---\n",
+                        r.round, r.verdict, r.proposer.content, r.opponent.content, r.judge.content
+                    ));
+                }
+            }
+            if md.is_empty() {
+                md = out.summary;
+            } else {
+                md.push_str(&format!("\n{}\n", out.summary));
+            }
+            md
+        }
+        Err(e) => {
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "error", "task_id": &task_id,
+                "message": format!("辩论失败: {e}"),
+            })).await;
+            if let Some(mut t) = state.tasks.get_mut(&task_id) {
+                t.status = "failed".into();
+            }
+            return;
+        }
+    };
+
+    // Stream the rendered transcript so the chat pane shows it live.
+    for chunk in response_text.as_bytes().chunks(2048) {
+        let text = String::from_utf8_lossy(chunk).to_string();
+        let _ = ws_send(socket, serde_json::json!({
+            "type": "stream", "task_id": &task_id, "text": text,
+        })).await;
+    }
+
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "progress", "stage": "debate", "status": "done", "task_id": &task_id,
+    })).await;
+    finalize_task(socket, state, &task_id, &task_brief, &_task_dir, &task_workflow_dir, &[], response_text).await;
 }
 
 async fn handle_run(
@@ -1213,6 +1759,7 @@ async fn handle_run(
     });
     let _ = ws_send(socket, serde_json::json!({
         "type": "plan",
+        "task_id": task_id,
         "workflow": spec.task_type,
         "stages": plan_data["stages"],
     }))
@@ -1471,6 +2018,7 @@ async fn run_with_progress(
                     "type": "progress",
                     "stage": name,
                     "status": status,
+                    "task_id": task_id,
                 })).await;
                 // Send detailed stage output when stage completes
                 if status == "completed"
@@ -1503,6 +2051,7 @@ async fn run_with_progress(
                 }
                 let _ = ws_send(socket, serde_json::json!({
                     "type": "agent_event",
+                    "task_id": task_id,
                     "event": event_json,
                 })).await;
             }
@@ -1604,6 +2153,7 @@ async fn run_multi_stage_with_streaming(
                     "type": "progress",
                     "stage": name,
                     "status": status,
+                    "task_id": task_id,
                 })).await;
                 // Send detailed stage output when stage completes
                 if status == "completed"
@@ -1636,6 +2186,7 @@ async fn run_multi_stage_with_streaming(
                 }
                 let _ = ws_send(socket, serde_json::json!({
                     "type": "agent_event",
+                    "task_id": task_id,
                     "event": event_json,
                 })).await;
             }
@@ -1844,20 +2395,34 @@ async fn finalize_task(
     // List workflow artifacts as paths relative to task_dir (the task's result_dir).
     // Previously these were flattened to bare filenames, which 404'd under the old
     // single-segment download route; the new catch-all route supports nested paths.
-    if let Ok(entries) = std::fs::read_dir(task_workflow_dir) {
+    // The walk is recursive (bounded) so loop-pipeline `tasks/…` and research
+    // `analysis/…` subdirectory artifacts are listed too.
+    fn collect_artifacts(dir: &StdPath, task_dir: &StdPath, depth: usize, out: &mut Vec<String>) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && (name.ends_with(".md") || name.ends_with(".json")) {
-                    let rel = entry
-                        .path()
-                        .strip_prefix(task_dir)
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| name.to_string());
-                    result_files.push(rel);
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "event_log.jsonl" {
+                continue;
+            }
+            if ft.is_dir() {
+                collect_artifacts(&path, task_dir, depth + 1, out);
+            } else if name.ends_with(".md") || name.ends_with(".json") || name.ends_with(".ipynb") {
+                if let Ok(rel) = path.strip_prefix(task_dir) {
+                    out.push(rel.to_string_lossy().to_string());
                 }
+            }
         }
     }
+    let mut artifact_files = Vec::new();
+    collect_artifacts(task_workflow_dir, task_dir, 0, &mut artifact_files);
+    result_files.extend(artifact_files);
 
     // Update task
     if let Some(mut task) = state.tasks.get_mut(task_id) {
@@ -2254,7 +2819,12 @@ fn create_new_task(state: &AppState, prompt: &str) -> (String, String, std::path
     let task_dir_name = format!("{}_{}", task_id, task_brief);
     let task_dir = state.task_dir.join(&task_dir_name);
     let task_workflow_dir = task_dir.join(".workflow");
-    let _ = std::fs::create_dir_all(&task_workflow_dir);
+    // Fail loudly when the run's result directory cannot exist: continuing
+    // would scatter artifacts relative to the process CWD (the exact class
+    // of bug this centralised anchoring exists to prevent).
+    if let Err(e) = std::fs::create_dir_all(&task_workflow_dir) {
+        tracing::error!(path = %task_workflow_dir.display(), error = %e, "failed to create task result dir");
+    }
     // Clean shared workflow dir to prevent cross-task contamination
     let shared_wf = state.task_dir.join(".workflow");
     let _ = std::fs::remove_dir_all(&shared_wf);
@@ -2280,17 +2850,7 @@ fn create_new_task(state: &AppState, prompt: &str) -> (String, String, std::path
 }
 
 fn sanitize_task_brief(prompt: &str) -> String {
-    let brief: String = prompt
-        .chars()
-        .take(30)
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let brief = brief.trim_end_matches('_');
-    if brief.is_empty() {
-        "task".into()
-    } else {
-        brief.into()
-    }
+    miniagent_core::paths::sanitize_task_brief(prompt)
 }
 
 // ── Model registry API（运行时 LLM 管理：列表/添加/修改/删除/切换）──
@@ -2479,4 +3039,56 @@ async fn activate_model_handler(State(state): State<AppState>, Path(id): Path<St
             (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response()
         }
     }
+}
+
+// ── Debate role models API（⚙️ 辩论角色模型设置）──
+
+/// Effective per-role selection: UI-persisted choice > DEBATE_*_MODEL env >
+/// active main model. `null` per role means "主模型".
+async fn debate_models_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let reg = state.models.read().unwrap();
+    let sel = reg.debate_selection();
+    Json(serde_json::json!({
+        "proposer": sel.proposer,
+        "opponent": sel.opponent,
+        "judge": sel.judge,
+        "active_id": reg.active_id(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetDebateModelsRequest {
+    /// Profile id or null (clear → main model).
+    #[serde(default)]
+    proposer: Option<String>,
+    #[serde(default)]
+    opponent: Option<String>,
+    #[serde(default)]
+    judge: Option<String>,
+}
+
+async fn set_debate_models_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SetDebateModelsRequest>,
+) -> Response {
+    use miniagent_core::models::DebateRole;
+    let mut reg = state.models.write().unwrap();
+    for (role, id) in [
+        (DebateRole::Proposer, req.proposer),
+        (DebateRole::Opponent, req.opponent),
+        (DebateRole::Judge, req.judge),
+    ] {
+        // Treat "" the same as null (HTML forms like sending empty strings).
+        let id = id.filter(|s| !s.trim().is_empty());
+        if let Err(e) = reg.set_debate_role(role, id) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+        }
+    }
+    let sel = reg.debate_selection();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "proposer": sel.proposer,
+        "opponent": sel.opponent,
+        "judge": sel.judge,
+    }))).into_response()
 }
