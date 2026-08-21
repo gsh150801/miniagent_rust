@@ -320,12 +320,10 @@ async fn main() {
             println!("📁 project dir: {}", dir.display());
             let summary = miniagent_research::run_research(query.clone(), dir.clone(), opts, config.clone(), None).await;
             println!("{summary}");
-            // Write {brief}.md so the server's restart-restore scan treats the
-            // run as a completed task (same convention as web tasks).
-            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-                let brief = name.split_once('_').map(|(_, b)| b).unwrap_or(name);
-                let _ = std::fs::write(dir.join(format!("{brief}.md")), &summary);
-            }
+            // The research pipeline writes `<brief>.md` (user-facing report)
+            // and `<brief>.md` is what the server's restart-restore scan
+            // uses to detect completion. No additional write is needed here;
+            // writing `summary` again would overwrite the rich user report.
         }
         Commands::LiteratureReview {
             query,

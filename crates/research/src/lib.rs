@@ -250,6 +250,299 @@ impl ProjectManifest {
         Ok(final_path)
     }
 
+    /// Render the user-facing final report at `<dir>/<brief>.md`.
+    ///
+    /// Unlike `run_report.md` (the *audit* timeline for engineers), this is
+    /// the report a researcher / clinician opens first: research question,
+    /// literature coverage, KG overview, refined hypotheses with mechanism
+    /// and evidence, debate verdict, validation plans summary, and the
+    /// status of each data-analysis task. It reuses whatever is on disk
+    /// (KG, hypotheses, debate, plans, analyses) so it stays correct after
+    /// resume / partial runs.
+    pub fn write_user_report(&self, brief: &str) -> Result<PathBuf> {
+        let path = self.dir.join(format!("{brief}.md"));
+        let mut md = String::new();
+
+        // ── Header ─────────────────────────────────────────────
+        md.push_str(&format!(
+            "# {} 致病机理研究 · 最终报告\n\n",
+            self.query.trim()
+        ));
+        md.push_str(&format!(
+            "- **运行 ID**: `{}`  \n- **生成时间**: {}  \n- **项目目录**: `{}`\n\n",
+            self.id,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            self.dir.display(),
+        ));
+
+        // ── Executive summary ──────────────────────────────────
+        let kg_stats = self.kg_stats.clone().unwrap_or_else(|| serde_json::json!({}));
+        let n_entities = kg_stats.get("entities").and_then(|v| v.as_u64()).unwrap_or(0);
+        let n_relations = kg_stats.get("relations").and_then(|v| v.as_u64()).unwrap_or(0);
+        let n_refined = self.hypotheses.iter().filter(|h| h.refined).count();
+        let n_plans = self.validation_plans.len();
+        let n_analyses = self.analyses.len();
+        md.push_str("## 执行摘要\n\n");
+        md.push_str(&format!(
+            "本报告综合了文献检索、知识图谱构建、致病机理假说生成与精炼、跨文献证据辩论、以及可执行验证计划与端到端数据分析的完整结果。"
+        ));
+        md.push_str(&format!(
+            "共纳入 **{n_entities}** 个知识图谱实体、**{n_relations}** 条关系，"
+        ));
+        md.push_str(&format!(
+            "最终产出 **{n_refined}** 条精炼假说、**{n_plans}** 套验证计划与 **{n_analyses}** 项数据分析交付。\n\n",
+        ));
+
+        // ── 1. Research question ────────────────────────────────
+        md.push_str(&format!("## 1. 研究问题\n\n{}\n\n", self.query.trim()));
+
+        // ── 2. Literature coverage (if papers.json exists) ─────
+        let papers_path = self.dir.join("papers.json");
+        if let Ok(text) = std::fs::read_to_string(&papers_path) {
+            if let Ok(papers) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                md.push_str(&format!("## 2. 文献概览（{} 篇）\n\n", papers.len()));
+                md.push_str("| PMID | 标题 |\n|---|---|\n");
+                for p in papers.iter().take(50) {
+                    let pmid = p.get("pmid").and_then(|v| v.as_str()).unwrap_or("?");
+                    let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let title_short = if title.chars().count() > 120 {
+                        let cut: String = title.chars().take(120).collect();
+                        format!("{cut}…")
+                    } else {
+                        title.to_string()
+                    };
+                    md.push_str(&format!("| [{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/) | {title_short} |\n"));
+                }
+                if papers.len() > 50 {
+                    md.push_str(&format!("\n> 其余 {} 篇见 `papers.json`。\n", papers.len() - 50));
+                }
+                md.push('\n');
+            }
+        }
+
+        // ── 3. Knowledge graph overview ────────────────────────
+        md.push_str("## 3. 知识图谱概要\n\n");
+        if let Ok(text) = std::fs::read_to_string(self.dir.join("kg.json")) {
+            if let Ok(kg) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(entities) = kg.get("entities").and_then(|v| v.as_array()) {
+                    md.push_str(&format!("**{}** 个实体，按类型分布：\n\n", entities.len()));
+                    let mut by_type: std::collections::BTreeMap<String, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    for e in entities {
+                        let t = e.get("entity_type").and_then(|v| v.as_str()).unwrap_or("Other").to_string();
+                        let n = e.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                        by_type.entry(t).or_default().push(n);
+                    }
+                    for (t, names) in &by_type {
+                        let shown = if names.len() > 8 {
+                            format!("{}（+{} 更多）", names.iter().take(8).cloned().collect::<Vec<_>>().join("、"), names.len() - 8)
+                        } else {
+                            names.join("、")
+                        };
+                        md.push_str(&format!("- **{}**（{}）：{}\n", t, names.len(), shown));
+                    }
+                    md.push('\n');
+                }
+                if let Some(relations) = kg.get("relations").and_then(|v| v.as_array()) {
+                    md.push_str(&format!("**{}** 条关系（详见 `kg.json`）。\n\n", relations.len()));
+                }
+            }
+        }
+
+        // ── 4. Refined hypotheses ──────────────────────────────
+        md.push_str("## 4. 致病机理假说（精炼后）\n\n");
+        // Try refined set first; fall back to ranked.
+        let refined_path = self.dir.join("hypotheses_refined_full.json");
+        let refined_src = std::fs::read_to_string(&refined_path)
+            .or_else(|_| std::fs::read_to_string(self.dir.join("hypotheses_full.json")))
+            .ok();
+        let full_hyps: Vec<serde_json::Value> = refined_src
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        // Map refined list (uuid) → full hyp body for statement/mechanism
+        let full_by_id: std::collections::HashMap<String, &serde_json::Value> = full_hyps
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|s| s.as_str()).map(|id| (id.to_string(), v)))
+            .collect();
+        let hyp_ids: Vec<String> = self.hypotheses.iter().map(|h| h.id.to_string()).collect();
+        if !hyp_ids.is_empty() {
+            md.push_str("| # | 假说 ID | 核心陈述 |\n|---|---|---|\n");
+            for (idx, id) in hyp_ids.iter().enumerate() {
+                let body = full_by_id.get(id);
+                let stmt = body
+                    .and_then(|v| v.get("statement").and_then(|s| s.as_str()))
+                    .unwrap_or("(未找到完整陈述)");
+                let stmt_short = if stmt.chars().count() > 80 {
+                    let cut: String = stmt.chars().take(80).collect();
+                    format!("{cut}…")
+                } else {
+                    stmt.to_string()
+                };
+                let badge = if self.hypotheses[idx].refined { "✨ 精炼" } else { "候选" };
+                md.push_str(&format!("| {} | {} · {} | {} |\n", idx + 1, &id[..8.min(id.len())], badge, stmt_short));
+            }
+            md.push('\n');
+
+            // Detail blocks for the top 3 refined.
+            md.push_str("### 4.1 核心假说详述（按优先级 Top 3）\n\n");
+            for (idx, id) in hyp_ids.iter().take(3).enumerate() {
+                if let Some(body) = full_by_id.get(id) {
+                    let stmt = body.get("statement").and_then(|s| s.as_str()).unwrap_or("");
+                    let mechanism = body.get("mechanism").and_then(|s| s.as_str()).unwrap_or("");
+                    let novelty = body.get("novelty").and_then(|s| s.as_str()).unwrap_or("");
+                    let confidence = body.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let evidence = body.get("supporting_evidence").and_then(|v| v.as_array());
+                    md.push_str(&format!(
+                        "#### 假说 #{}：{}\n\n**新颖度**：{}  ·  **置信度**：{:.2}\n\n**陈述**：{}\n\n",
+                        idx + 1,
+                        body.get("name").and_then(|s| s.as_str()).unwrap_or(""),
+                        novelty,
+                        confidence,
+                        stmt,
+                    ));
+                    if !mechanism.is_empty() {
+                        md.push_str(&format!("**机制说明**：\n\n{}\n\n", mechanism));
+                    }
+                    if let Some(ev) = evidence {
+                        if !ev.is_empty() {
+                            md.push_str("**支持证据**：\n\n");
+                            for e in ev.iter().take(5) {
+                                if let Some(s) = e.as_str() {
+                                    md.push_str(&format!("- {}\n", s));
+                                }
+                            }
+                            md.push('\n');
+                        }
+                    }
+                }
+            }
+        } else {
+            md.push_str("（未生成假说；详见 `project.json` 的失败事件。）\n\n");
+        }
+
+        // ── 5. Debate verdict ──────────────────────────────────
+        let debate_path = self.dir.join("debate_report.json");
+        if let Ok(text) = std::fs::read_to_string(&debate_path) {
+            if let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) {
+                md.push_str("## 5. 假说辩论与裁决\n\n");
+                if let Some(rounds) = report.get("rounds").and_then(|v| v.as_array()) {
+                    md.push_str(&format!("共进行 **{}** 轮交叉质询。\n\n", rounds.len()));
+                }
+                if let Some(per) = report.get("per_hypothesis").and_then(|v| v.as_array()) {
+                    md.push_str("| 假说 | 裁决 | 置信度 |\n|---|---|---|\n");
+                    for ph in per {
+                        let id = ph.get("hypothesis_id").and_then(|s| s.as_str()).unwrap_or("?");
+                        let verdict = ph.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
+                        let conf = ph.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let id_short = if id.len() >= 8 { &id[..8] } else { id };
+                        md.push_str(&format!("| {} | `{}` | {:.2} |\n", id_short, verdict, conf));
+                    }
+                    md.push('\n');
+                }
+                if let Some(strongest) = report.get("strongest_hypothesis").and_then(|s| s.as_str()) {
+                    md.push_str(&format!("**最强假说**：`{}`\n\n", &strongest[..8.min(strongest.len())]));
+                }
+                if let Some(summary) = report.get("summary").and_then(|s| s.as_str()) {
+                    if !summary.is_empty() {
+                        md.push_str(&format!("**裁判总结**：{}\n\n", summary));
+                    }
+                }
+            }
+        }
+
+        // ── 6. Validation plans ────────────────────────────────
+        if !self.validation_plans.is_empty() {
+            md.push_str("## 6. 验证计划\n\n");
+            for (i, p) in self.validation_plans.iter().enumerate() {
+                let plan: serde_json::Value = std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let plan_file = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let rationale = plan.get("rationale").and_then(|s| s.as_str()).unwrap_or("");
+                let tasks = plan.get("data_analysis_tasks").and_then(|v| v.as_array());
+                let protocols = plan.get("wet_lab_protocols").and_then(|v| v.as_array());
+                md.push_str(&format!(
+                    "### 计划 {}：`{}`\n\n",
+                    i + 1,
+                    plan_file,
+                ));
+                if !rationale.is_empty() {
+                    md.push_str(&format!("**设计理由**：{}\n\n", rationale));
+                }
+                if let Some(t) = tasks {
+                    md.push_str(&format!("**数据分析任务**（{} 项）：\n\n", t.len()));
+                    md.push_str("| ID | 数据集 | 目标 |\n|---|---|---|\n");
+                    for task in t {
+                        let id = task.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+                        let acc = task.get("dataset_accession").and_then(|s| s.as_str()).unwrap_or("(本地)");
+                        let obj = task.get("objective").and_then(|s| s.as_str()).unwrap_or("");
+                        let obj_short = if obj.chars().count() > 90 {
+                            let cut: String = obj.chars().take(90).collect();
+                            format!("{cut}…")
+                        } else {
+                            obj.to_string()
+                        };
+                        md.push_str(&format!("| {} | `{}` | {} |\n", id, acc, obj_short));
+                    }
+                    md.push('\n');
+                }
+                if let Some(p) = protocols {
+                    md.push_str(&format!("**湿实验方案**（{} 项）：\n\n", p.len()));
+                    for proto in p {
+                        let id = proto.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+                        let obj = proto.get("objective").and_then(|s| s.as_str()).unwrap_or("");
+                        let obj_short = if obj.chars().count() > 100 {
+                            let cut: String = obj.chars().take(100).collect();
+                            format!("{cut}…")
+                        } else {
+                            obj.to_string()
+                        };
+                        md.push_str(&format!("- **{}**：{}\n", id, obj_short));
+                    }
+                    md.push('\n');
+                }
+            }
+        }
+
+        // ── 7. Data analysis delivery ──────────────────────────
+        if !self.analyses.is_empty() {
+            md.push_str("## 7. 数据分析交付\n\n");
+            md.push_str("| 任务 | 数据集 | 后端 | 状态 | Notebook | 溯源 |\n|---|---|---|---|---|---|\n");
+            for a in &self.analyses {
+                let nb = a.notebook_path.as_ref().map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or("?")).unwrap_or("—");
+                let pv = a.provenance_path.as_ref().map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or("?")).unwrap_or("—");
+                let status = if a.success { "✅ 成功" } else { "❌ 失败" };
+                md.push_str(&format!(
+                    "| {} | `{}` | {} | {} | `{}` | `{}` |\n",
+                    a.task_id,
+                    a.task_id, // dataset often encoded in task id by runner; keep generic
+                    a.execution_backend,
+                    status,
+                    nb,
+                    pv,
+                ));
+            }
+            md.push('\n');
+            md.push_str("每个 `analysis.ipynb` 都包含对应 plan 的全部计算步骤与注释；可在 Jupyter 中重放。\n\n");
+        }
+
+        // ── 8. Audit pointers ─────────────────────────────────
+        md.push_str("## 8. 审计与复现\n\n");
+        md.push_str("- `project.json` — 全流水线阶段状态与 append-only 事件日志（机器可读）\n");
+        md.push_str("- `run_report.md` — 阶段时长表与事件时间线（运维可读）\n");
+        md.push_str("- `kg.json` — 完整知识图谱（节点 + 关系）\n");
+        md.push_str("- `debate_report.json` — 辩论每轮的论据 / 反驳 / 裁决\n");
+        md.push_str("- `plans/validation_plan_*.json` — 验证计划全文（含变量定义与统计方法）\n\n");
+        md.push_str("---\n\n");
+        md.push_str("*本报告由 miniagent research 流水线自动生成，所有数据可在项目目录内复现与重跑。*\n");
+
+        std::fs::write(&path, md)
+            .with_context(|| format!("write user report {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Load a manifest from a directory containing `project.json`.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();

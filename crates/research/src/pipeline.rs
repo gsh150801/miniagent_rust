@@ -1424,6 +1424,20 @@ pub async fn run_research(
         }
         Err(e) => println!("⚠️  failed to write run report: {e}"),
     }
+    // User-facing final report (面向用户的最终报告): a markdown file at the
+    // project root, named `{brief}.md`, covering the research question,
+    // literature overview, KG summary, refined hypotheses, debate verdict,
+    // validation plans, and analysis delivery status. Researchers / clinicians
+    // open this file first; `run_report.md` is the engineering timeline.
+    let user_brief = miniagent_core::paths::sanitize_task_brief(&query);
+    match manifest.write_user_report(&user_brief) {
+        Ok(path) => {
+            println!("📁 final report: {}", path.display());
+            manifest.log_event("user_report_written", path.display().to_string());
+            let _ = manifest.save();
+        }
+        Err(e) => println!("⚠️  failed to write user report: {e}"),
+    }
 
     phase_end(&on_progress, &mut prev_phase);
     let plans_note = if validate {

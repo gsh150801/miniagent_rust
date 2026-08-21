@@ -932,7 +932,7 @@ async fn handle_run_loop(
             // Loop artifacts live directly under task_dir (tasks/, dispatch
             // summaries, checkpoints) — pass task_dir as the workflow dir so
             // finalize_task's recursive collector lists them all.
-            finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["loop_pipeline".to_string()], response_text).await;
+            finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["loop_pipeline".to_string()], response_text, "loop").await;
         }
         Err(e) => {
             if let Some(mut task) = state.tasks.get_mut(&task_id) {
@@ -1166,7 +1166,7 @@ async fn handle_research_run(
 
     // Artifacts live directly under task_dir — pass it as the workflow dir so
     // finalize_task's recursive collector lists hypotheses/plans/analysis.
-    finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["research".to_string()], summary).await;
+    finalize_task(socket, state, &task_id, &task_brief, &task_dir, &task_dir, &["research".to_string()], summary, "research").await;
 }
 
 /// Drain `ProgressMsg` items into WebSocket envelopes and persist
@@ -1557,7 +1557,7 @@ async fn handle_debate_run(
     let _ = ws_send(socket, serde_json::json!({
         "type": "progress", "stage": "debate", "status": "done", "task_id": &task_id,
     })).await;
-    finalize_task(socket, state, &task_id, &task_brief, &_task_dir, &task_workflow_dir, &[], response_text).await;
+    finalize_task(socket, state, &task_id, &task_brief, &_task_dir, &task_workflow_dir, &[], response_text, "debate").await;
 }
 
 async fn handle_run(
@@ -2082,7 +2082,7 @@ async fn run_with_progress(
                 })).await;
             }
 
-            finalize_task(socket, state, task_id, task_brief, task_dir, task_workflow_dir, &stage_names, response_text).await;
+            finalize_task(socket, state, task_id, task_brief, task_dir, task_workflow_dir, &stage_names, response_text, "workflow").await;
         }
         Err(e) => {
             for name in &stage_names {
@@ -2235,7 +2235,7 @@ async fn run_multi_stage_with_streaming(
             let final_text = if !response_text.is_empty() { response_text }
                 else { collect_response_text(&_result.stage_outputs, task_workflow_dir) };
 
-            finalize_task(socket, state, task_id, task_brief, task_dir, task_workflow_dir, &stage_names, final_text).await;
+            finalize_task(socket, state, task_id, task_brief, task_dir, task_workflow_dir, &stage_names, final_text, "workflow").await;
         }
         Err(e) => {
             for name in &stage_names {
@@ -2385,18 +2385,52 @@ async fn finalize_task(
     task_brief: &str,
     task_dir: &StdPath,
     task_workflow_dir: &StdPath,
-    _stage_names: &[String],
+    stage_names: &[String],
     response_text: String,
+    mode: &str,
 ) {
-    // Save result file with content-based name: {brief}.md
+    // Save the user-facing final report at `<task_dir>/<brief>.md`.
+    // For workflow / loop / debate modes the AI's streamed response IS the
+    // report (with a brief cover header). For research mode the research
+    // pipeline writes its own (richer) `<brief>.md` first; we don't
+    // overwrite it here.
     let output_filename = format!("{}.md", task_brief);
+    let output_path = task_dir.join(&output_filename);
+    let is_research = mode == "research";
     let mut result_files = vec![];
-    if !response_text.is_empty() {
-        let output_path = task_dir.join(&output_filename);
-        if std::fs::write(&output_path, &response_text).is_ok() {
-            // Store path relative to task_dir so the catch-all download route can fetch it.
+    if !response_text.is_empty() && !is_research {
+        // Brief cover + AI body. Keeps the file self-contained even if the
+        // user opens it before the in-app chat history.
+        let stages_line = if stage_names.is_empty() {
+            String::new()
+        } else {
+            format!("\n**执行阶段**: {}\n", stage_names.join(" → "))
+        };
+        let cover = format!(
+            "# {brief} · 最终报告\n\n\
+             - **任务 ID**: `{task_id}`\n\
+             - **生成时间**: {ts}\n\
+             - **结果目录**: `{dir}`\n{stages_line}\n\
+             ---\n\n",
+            brief = task_brief,
+            task_id = task_id,
+            ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            dir = task_dir.display(),
+            stages_line = stages_line,
+        );
+        let composed = format!("{cover}{body}", cover = cover, body = response_text);
+        if std::fs::write(&output_path, &composed).is_ok() {
             result_files.push(output_filename.clone());
         }
+    } else if !is_research {
+        // No AI response — at least leave a stub so the directory clearly
+        // shows the task was finalized.
+        let stub = format!(
+            "# {brief}\n\n（任务已结束，未生成 AI 回复文本；详见 `metadata.json` 与右侧 Progress / Files 面板。）\n",
+            brief = task_brief,
+        );
+        let _ = std::fs::write(&output_path, &stub);
+        result_files.push(output_filename.clone());
     }
 
     // List workflow artifacts as paths relative to task_dir (the task's result_dir).
@@ -2450,7 +2484,7 @@ async fn finalize_task(
         if let Ok(json_str) = serde_json::to_string_pretty(&metadata)
             && let Err(e) = std::fs::write(task_dir.join("metadata.json"), json_str) {
                 tracing::error!(task_id = %task_id, error = %e, "failed to persist metadata.json — task history may be lost on restart");
-            }
+        }
     }
 
     // Send completion

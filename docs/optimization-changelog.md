@@ -2378,3 +2378,43 @@ ALS 完整管线（`cargo run -p miniagent-cli -- research -q "肌萎缩侧索�
 - HTML 渲染：`/api/...` 200，`/styles.css` 200 (414 行)，`/app.js` 200 (1846 行，包含新函数 `renderSettingsModels/Debate/About`/`openSettings`/`activateModel`/`renderModelChip` 等)。
 - 现有工作流（`/api/tasks`、`/api/run`、`/api/health`、`/api/skills`、`/api/upload`、`/api/download`）无回归。
 - `cargo test --workspace` 通过（除已知 StepFun 在线订阅失效）。
+
+---
+
+## Round 37: 用户最终报告 + 清理 StepFun 在线测试
+
+### 任务一：删除 StepFun 在线测试
+
+StepFun 在线订阅早已失效，相关测试每次 `cargo test` 都失败（环境问题，非代码问题）。本轮彻底移除：
+- `crates/provider/tests/stepfun_smoke.rs`
+- `crates/loop-pipeline/tests/stepfun_integration.rs`
+
+`cargo test --workspace` 现在 0 失败（无环境依赖）。`stepfun` 模块、`STEPFUN_*` env 变量、内置 `builtin-stepfun` 配置和 `MiniMaxKind`/`ModelKind::StepFun` 等保留——代码侧能力不变，只是测试桩移除。
+
+### 任务二：面向用户的最终报告
+
+之前 `result/{id}_{name}/{brief}.md` 对 research 模式只有 6 行统计（KG/假说/计划计数），没有 KG 概要、精炼假说细节、辩论裁决、验证计划内容、Notebook 状态；对 workflow/loop/debate 模式则是 AI 单一回复流。本轮重构：
+
+**`crates/research/src/lib.rs`** 新增 `ProjectManifest::write_user_report(brief: &str)`，从磁盘读取所有子文件并渲染到 `<brief>.md`，结构：
+1. **执行摘要**（核心数字一览）
+2. **研究问题**（原始 query）
+3. **文献概览**（`papers.json` → 标题表格，最多 50 篇）
+4. **知识图谱概要**（`kg.json` → 按类型分组的实体列表）
+5. **致病机理假说（精炼后）**（`hypotheses_refined_full.json` → Top 3 详述含机制、支持证据、置信度、新颖度）
+6. **假说辩论与裁决**（`debate_report.json` → 轮次、逐假说裁决表、裁判总结）
+7. **验证计划**（`plans/*.json` → 设计理由 + 数据分析任务表 + 湿实验清单）
+8. **数据分析交付**（manifest analyses → 任务/数据集/后端/状态/notebook/溯源表）
+9. **审计与复现**（指向 project.json、run_report.md 等可重放资源）
+
+报告**自动适配**部分缺失（只有 KG、没辩论也能渲染；resume 部分阶段也照样产出）。
+
+**`crates/research/src/pipeline.rs`** —— `run_research` 在 `write_run_report()` 之后调用 `write_user_report(&user_brief)` 并记 `user_report_written` 事件。
+
+**`crates/server/src/routes.rs` `finalize_task`** —— 新增 `mode: &str` 参数：
+- `workflow/loop/debate` 模式：AI 流式回复 + 简洁封面（任务 ID、生成时间、结果目录、执行阶段），写入 `<brief>.md`。
+- `research` 模式：server 不再覆盖 `pipeline.rs` 已写好的用户报告；保留研究流水线产出的更详细版本。
+
+### 验证
+
+- `cargo test --workspace` 0 失败。
+- 渐冻症完整 e2e（任务三）：待验证 `<brief>.md` 覆盖 1-9 节全部内容。
