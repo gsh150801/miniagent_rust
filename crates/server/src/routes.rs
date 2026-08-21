@@ -69,6 +69,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/models/{id}/activate", post(activate_model_handler))
         // Debate role model selection (⚙️ settings)
         .route("/api/debate-models", get(debate_models_handler).post(set_debate_models_handler))
+        // Unified settings snapshots: /api/kinds enumerates every supported
+        // provider family (icon + label), /api/settings/active returns the
+        // currently-active model + debate role snapshot in one round-trip so
+        // the frontend header dropdown and the settings page can hydrate
+        // from a single response.
+        .route("/api/kinds", get(kinds_handler))
+        .route("/api/settings/active", get(settings_active_handler))
         .with_state(state)
 }
 
@@ -2862,9 +2869,16 @@ struct ModelProfileView {
     display_name: String,
     kind: String,
     kind_label: String,
+    /// Short emoji glyph for the family (e.g. 🐳 / ⚡). Single source of
+    /// truth — the frontend never hardcodes family icons.
+    kind_icon: String,
     base_url: String,
     model_name: String,
     pro_model_name: Option<String>,
+    /// "flash" | "pro" tier labels the backend suggests for tier badges. The
+    /// frontend may render its own but never invents tier strings.
+    flash_model_name: String,
+    pro_model_name_effective: String,
     api_key_masked: String,
     has_key: bool,
     builtin: bool,
@@ -2877,9 +2891,12 @@ impl From<&ModelProfile> for ModelProfileView {
             display_name: p.display_name.clone(),
             kind: serde_json::to_string(&p.kind).unwrap_or_default().trim_matches('"').to_string(),
             kind_label: p.kind.label().to_string(),
+            kind_icon: p.kind.icon().to_string(),
             base_url: p.base_url.clone(),
             model_name: p.model_name.clone(),
             pro_model_name: p.pro_model_name.clone(),
+            flash_model_name: p.model_name.clone(),
+            pro_model_name_effective: p.pro_model().to_string(),
             api_key_masked: p.masked_key(),
             has_key: p.resolve_key().is_some(),
             builtin: p.builtin,
@@ -3091,4 +3108,87 @@ async fn set_debate_models_handler(
         "opponent": sel.opponent,
         "judge": sel.judge,
     }))).into_response()
+}
+
+// ── Unified settings snapshots ──────────────────────────────────
+//
+// The settings page + header dropdown hydrate from `/api/settings/active`
+// in a single round-trip. `/api/kinds` enumerates every supported
+// provider family so the frontend never hardcodes enum values (single
+// source of truth lives in `ModelKind`).
+
+#[derive(Debug, Serialize)]
+struct KindView {
+    /// Stable slug (matches `ModelKind::slug()` — `deepseek`, `stepfun`, …).
+    slug: String,
+    /// Human-readable label (matches `ModelKind::label()`).
+    label: String,
+    /// Short glyph for inline rendering.
+    icon: String,
+    /// Default base URL applied by the server when a custom profile of
+    /// this family is added with `base_url=""`. The UI surfaces it as a
+    /// placeholder so users can pick the right provider without docs.
+    default_base_url: String,
+}
+
+async fn kinds_handler() -> impl IntoResponse {
+    use miniagent_core::models::ModelKind;
+    let defaults: [(&str, &str); 5] = [
+        ("deepseek", "https://api.deepseek.com"),
+        ("stepfun", "https://api.stepfun.com/step_plan/v1"),
+        ("minimax", "https://api.minimaxi.com/v1"),
+        ("openai_compatible", ""),
+        ("anthropic_compatible", ""),
+    ];
+    let kinds: Vec<KindView> = ModelKind::all()
+        .iter()
+        .map(|k| {
+            let slug = k.slug();
+            let default_base_url = defaults
+                .iter()
+                .find(|(s, _)| *s == slug)
+                .map(|(_, u)| u.to_string())
+                .unwrap_or_default();
+            KindView {
+                slug: slug.to_string(),
+                label: k.label().to_string(),
+                icon: k.icon().to_string(),
+                default_base_url,
+            }
+        })
+        .collect();
+    Json(serde_json::json!({ "kinds": kinds }))
+}
+
+/// Single round-trip snapshot: the active profile (as ModelProfileView),
+/// the resolved per-role debate selection, and the kind enum list.
+async fn settings_active_handler(State(state): State<AppState>) -> impl IntoResponse {
+    use miniagent_core::models::ModelKind;
+    let reg = state.models.read().unwrap();
+    let active = reg.active().clone();
+    let active_view = ModelProfileView::from(&active);
+    let sel = reg.debate_selection();
+    let kinds: Vec<KindView> = ModelKind::all()
+        .iter()
+        .map(|k| KindView {
+            slug: k.slug().to_string(),
+            label: k.label().to_string(),
+            icon: k.icon().to_string(),
+            default_base_url: match k {
+                ModelKind::DeepSeek => "https://api.deepseek.com".into(),
+                ModelKind::StepFun => "https://api.stepfun.com/step_plan/v1".into(),
+                ModelKind::MiniMax => "https://api.minimaxi.com/v1".into(),
+                _ => String::new(),
+            },
+        })
+        .collect();
+    Json(serde_json::json!({
+        "active": active_view,
+        "debate": {
+            "proposer": sel.proposer,
+            "opponent": sel.opponent,
+            "judge": sel.judge,
+        },
+        "kinds": kinds,
+    }))
 }

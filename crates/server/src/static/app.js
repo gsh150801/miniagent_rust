@@ -28,7 +28,7 @@ function connect() {
   setConnState('connecting');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
-  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); loadModels(); };
+  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); loadSettings(); };
   ws.onmessage = (e) => {
     try { handleMsg(JSON.parse(e.data)); }
     catch(err) { handleMsg({ type: 'stream', text: e.data }); }
@@ -40,7 +40,9 @@ function connect() {
 function setConnState(s) {
   wsConnected = (s === 'connected');
   const bar = document.getElementById('connBar');
-  if (bar) bar.className = 'conn-bar ' + (s === 'connected' ? '' : s);
+  if (bar) bar.className = 'conn-bar ' + (s === 'connected' ? 'connected' : 'disconnected');
+  const txt = document.getElementById('connText');
+  if (txt) txt.textContent = s === 'connected' ? '已连接' : (s === 'connecting' ? '连接中...' : '已断开');
 }
 
 function handleMsg(msg) {
@@ -1016,6 +1018,13 @@ const MODE_PLACEHOLDERS = {
   research: '科研管线：输入疾病/研究问题，文献→知识图谱→致病机理假说→辩论→验证计划→数据分析 notebook',
 };
 
+const MODE_LABELS = {
+  workflow: '⚙ Workflow',
+  loop: '🔄 Loop',
+  debate: '⚖ Debate',
+  research: '🔬 Research',
+};
+
 function setMode(mode) {
   if (!MODE_PLACEHOLDERS[mode]) mode = 'workflow';
   currentMode = mode;
@@ -1023,6 +1032,8 @@ function setMode(mode) {
   if (sel && sel.value !== mode) sel.value = mode;
   const input = document.getElementById('input');
   if (input) input.placeholder = MODE_PLACEHOLDERS[mode];
+  const pill = document.getElementById('modePill');
+  if (pill) pill.textContent = MODE_LABELS[mode] || mode;
 }
 // Initialize once at script load (init section also calls this for safety).
 if (typeof document !== 'undefined') {
@@ -1426,6 +1437,7 @@ function csvToTable(text, sep) {
 // ── Helpers ──
 function scrollBottom() { const el = document.getElementById('messages'); el.scrollTop = el.scrollHeight; }
 function escHtml(s) { const d = document.createElement('div'); d.textContent = (s == null ? '' : s); return d.innerHTML; }
+const esc = escHtml;
 function showToast(msg, isError, cls) {
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -1448,120 +1460,230 @@ renderProgressView();
 renderFilesView();
 connect();
 
-// ── Model registry（运行时 LLM 添加 / 选择）──
-let modelState = { activeId: null, models: [] };
+// ── Model registry（运行时 LLM 管理：统一设置中心） ───────────
+//
+// Single source of truth in the frontend: `settingsStore`. Re-hydrated from
+// `/api/settings/active` (one round-trip) and `/api/kinds`. The header
+// model chip and the settings drawer both render from this store, so the
+// two surfaces never drift.
+//
+// Legacy references (openModelModal / renderModelSelect / etc.) have been
+// replaced by `openSettings(tab)` + `renderModelChip`.
 
-async function loadModels() {
+let settingsStore = {
+  activeId: null,
+  active: null,        // ModelProfileView
+  models: [],          // ModelProfileView[]
+  kinds: [],           // KindView[]  (slug/label/icon/default_base_url)
+  debate: { proposer: null, opponent: null, judge: null },
+  settingsTab: 'models',
+};
+
+async function loadSettings() {
   try {
-    const res = await fetch('/api/models');
-    if (!res.ok) return;
-    const data = await res.json();
-    modelState = { activeId: data.active_id, models: data.models || [] };
-    renderModelSelect();
-  } catch (e) { /* server offline — selector stays empty */ }
+    const [active, models, kinds, debate] = await Promise.all([
+      fetch('/api/settings/active').then(r => r.ok ? r.json() : null),
+      fetch('/api/models').then(r => r.ok ? r.json() : null),
+      fetch('/api/kinds').then(r => r.ok ? r.json() : null),
+      fetch('/api/debate-models').then(r => r.ok ? r.json() : null),
+    ]);
+    settingsStore.active = active?.active ?? null;
+    settingsStore.activeId = active?.active?.id ?? models?.active_id ?? null;
+    settingsStore.models = models?.models ?? [];
+    settingsStore.kinds = (active?.kinds) ?? (kinds?.kinds) ?? [];
+    settingsStore.debate = {
+      proposer: debate?.proposer ?? active?.debate?.proposer ?? null,
+      opponent: debate?.opponent ?? active?.debate?.opponent ?? null,
+      judge:    debate?.judge    ?? active?.debate?.judge    ?? null,
+    };
+    renderModelChip();
+    if (document.getElementById('settingsOverlay')?.classList.contains('active')) {
+      renderSettingsTab();
+    }
+  } catch (e) { /* offline — chip stays at placeholder */ }
 }
 
-function renderModelSelect() {
-  const sel = document.getElementById('modelSelect');
-  if (!sel) return;
-  const prev = modelState.activeId;
-  sel.innerHTML = '';
-  for (const m of modelState.models) {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = `${m.display_name} · ${m.model_name}`;
-    if (m.id === modelState.activeId) opt.selected = true;
-    sel.appendChild(opt);
+function renderModelChip() {
+  const icon = document.getElementById('modelChipIcon');
+  const name = document.getElementById('modelChipName');
+  const summary = document.getElementById('modelSummary');
+  const m = settingsStore.active || settingsStore.models.find(x => x.id === settingsStore.activeId);
+  if (!m) {
+    if (icon) icon.textContent = '🤖';
+    if (name) name.textContent = '未选择模型';
+    if (summary) summary.textContent = '';
+    return;
   }
-  if (prev !== modelState.activeId) loadModelsIfNeeded();
+  if (icon) icon.textContent = m.kind_icon || '🤖';
+  if (name) name.textContent = m.display_name;
+  if (summary) summary.textContent = `${m.flash_model_name || m.model_name}${m.pro_model_name_effective && m.pro_model_name_effective !== m.flash_model_name ? ' · Pro ' + m.pro_model_name_effective : ''}`;
 }
 
-function loadModelsIfNeeded() { /* hook for future lazy refresh */ }
-
-async function onModelSelectChange(id) {
-  if (!id || id === modelState.activeId) return;
+async function activateModel(id) {
+  if (!id || id === settingsStore.activeId) return;
   try {
     const res = await fetch(`/api/models/${encodeURIComponent(id)}/activate`, { method: 'POST' });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      showToast(data.error || '切换模型失败', true);
-      await loadModels();
-      return;
-    }
-    modelState.activeId = id;
-    showToast('已切换模型: ' + (modelState.models.find(m => m.id === id)?.display_name || id), false, 'success');
-  } catch (e) {
-    showToast('切换模型失败: ' + e.message, true);
-  }
+    if (!res.ok) { showToast(data.error || '切换失败', true); return; }
+    showToast(`已切换到 ${settingsStore.models.find(m => m.id === id)?.display_name || id}`, false, 'success');
+    await loadSettings();
+    if (document.getElementById('settingsOverlay')?.classList.contains('active')) renderSettingsTab();
+  } catch (e) { showToast('切换失败: ' + e.message, true); }
 }
 
-function openModelModal() {
-  renderModelList();
-  loadDebateRoles();
-  document.getElementById('modelModal').style.display = 'flex';
+function openSettings(tab) {
+  const overlay = document.getElementById('settingsOverlay');
+  if (!overlay) return;
+  if (tab && ['models','debate','about'].includes(tab)) settingsStore.settingsTab = tab;
+  overlay.classList.add('active');
+  for (const t of document.querySelectorAll('.settings-tab')) {
+    t.classList.toggle('active', t.dataset.tab === settingsStore.settingsTab);
+  }
+  renderSettingsTab();
+  // Hydrate fresh data so changes from other surfaces appear.
+  loadSettings();
 }
-function closeModelModal() {
-  document.getElementById('modelModal').style.display = 'none';
+function closeSettings() {
+  document.getElementById('settingsOverlay')?.classList.remove('active');
 }
-function toggleModelForm() {
-  const form = document.getElementById('modelForm');
-  const chev = document.getElementById('modelFormChevron');
-  const open = form.style.display !== 'none';
-  form.style.display = open ? 'none' : 'block';
-  chev.textContent = open ? '\u25BC' : '\u25B2';
+function switchSettingsTab(tab) {
+  settingsStore.settingsTab = tab;
+  for (const t of document.querySelectorAll('.settings-tab')) {
+    t.classList.toggle('active', t.dataset.tab === tab);
+  }
+  renderSettingsTab();
 }
 
-function renderModelList() {
-  const wrap = document.getElementById('modelList');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  for (const m of modelState.models) {
-    const row = document.createElement('div');
-    row.className = 'model-row' + (m.id === modelState.activeId ? ' active' : '');
-    const info = document.createElement('div');
-    info.className = 'model-row-info';
-    info.innerHTML = `
-      <div class="model-row-name">${esc(m.display_name)}${m.id === modelState.activeId ? ' <span class="model-badge">使用中</span>' : ''}</div>
-      <div class="model-row-meta">${esc(m.kind_label)} · ${esc(m.model_name)}${m.pro_model_name ? ' / ' + esc(m.pro_model_name) : ''} · ${esc(m.base_url)}</div>
-      <div class="model-row-key">key: ${esc(m.api_key_masked)}</div>`;
-    const ops = document.createElement('div');
-    ops.className = 'model-row-ops';
-    if (m.id !== modelState.activeId) {
-      const use = document.createElement('button');
-      use.textContent = '使用';
-      use.className = 'btn-model-use';
-      use.onclick = () => onModelSelectChange(m.id).then(loadModels).then(renderModelList);
-      ops.appendChild(use);
-    }
-    if (!m.builtin) {
-      const del = document.createElement('button');
-      del.textContent = '删除';
-      del.className = 'btn-model-del';
-      del.onclick = async () => {
-        if (!confirm(`删除模型配置 "${m.display_name}"？`)) return;
-        const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: 'DELETE' });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) { showToast(data.error || '删除失败', true); return; }
-        await loadModels();
-        renderModelList();
-      };
-      ops.appendChild(del);
-    }
-    row.appendChild(info);
-    row.appendChild(ops);
-    wrap.appendChild(row);
-  }
+function renderSettingsTab() {
+  const body = document.getElementById('settingsBody');
+  if (!body) return;
+  if (settingsStore.settingsTab === 'models') renderSettingsModels(body);
+  else if (settingsStore.settingsTab === 'debate') renderSettingsDebate(body);
+  else renderSettingsAbout(body);
+}
+
+// ── Settings · Models tab ───────────────────────────────────
+function renderSettingsModels(body) {
+  const builtin = settingsStore.models.filter(m => m.builtin);
+  const custom = settingsStore.models.filter(m => !m.builtin);
+  const activeModel = settingsStore.active || settingsStore.models.find(m => m.id === settingsStore.activeId);
+  const kindsHtml = settingsStore.kinds.map(k =>
+    `<option value="${esc(k.slug)}" data-default-base="${esc(k.default_base_url)}">${esc(k.icon)} ${esc(k.label)}</option>`
+  ).join('');
+
+  body.innerHTML = `
+    <div class="settings-section">
+      <h4>当前模型 <span class="hsp-hint">点击其它卡片即可切换</span></h4>
+      ${activeModel ? renderModelCard(activeModel, true) : emptyModels()}
+    </div>
+
+    <div class="settings-section">
+      <h4>内置模型 <span class="hsp-hint">${builtin.length}</span></h4>
+      ${builtin.length ? builtin.map(m => renderModelCard(m, m.id === settingsStore.activeId)).join('') : emptyModels()}
+    </div>
+
+    <div class="settings-section">
+      <h4>自定义模型 <span class="hsp-hint">${custom.length}</span></h4>
+      ${custom.length ? custom.map(m => renderModelCard(m, m.id === settingsStore.activeId)).join('') :
+        '<div class="empty-state"><div class="es-icon">🪄</div>未添加自定义模型。<br>支持任意 OpenAI / Anthropic 兼容端点。</div>'}
+    </div>
+
+    <hr class="divider">
+
+    <div class="settings-section">
+      <h4>添加自定义模型</h4>
+      <div class="form-grid">
+        <div class="form-row span2">
+          <label>显示名称</label>
+          <input id="mfName" type="text" placeholder="例如：SiliconFlow GLM-4.7">
+        </div>
+        <div class="form-row">
+          <label>类型</label>
+          <select id="mfKind">${kindsHtml}</select>
+        </div>
+        <div class="form-row">
+          <label>Base URL <small id="mfKindHint"></small></label>
+          <input id="mfBaseUrl" type="text" placeholder="留空使用类型默认值">
+        </div>
+        <div class="form-row">
+          <label>Flash 模型名</label>
+          <input id="mfModel" type="text" placeholder="例如：glm-4.7">
+        </div>
+        <div class="form-row">
+          <label>Pro 模型名 <small>（可选）</small></label>
+          <input id="mfProModel" type="text" placeholder="留空则与 Flash 相同">
+        </div>
+        <div class="form-row span2">
+          <label>API Key</label>
+          <input id="mfKey" type="password" placeholder="key 写入服务端 models.json（已 gitignore）">
+        </div>
+      </div>
+      <p class="form-hint">切换类型会清空 Base URL 输入框，可填入或留空使用默认值。</p>
+      <div class="btn-row">
+        <button class="btn-action" onclick="resetModelForm()">重置</button>
+        <button class="btn-action primary" onclick="addModel()">添加模型</button>
+      </div>
+    </div>
+  `;
+  wireModelForm();
+}
+
+function emptyModels() {
+  return '<div class="empty-state"><div class="es-icon">🤖</div>暂无可用模型</div>';
+}
+
+function renderModelCard(m, isActive) {
+  const tier = (m.flash_model_name && m.pro_model_name_effective && m.flash_model_name !== m.pro_model_name_effective)
+    ? `<div class="cm-row"><span class="cm-key">Flash</span><span>${esc(m.flash_model_name)}</span></div>
+       <div class="cm-row"><span class="cm-key">Pro</span><span>${esc(m.pro_model_name_effective)}</span></div>`
+    : `<div class="cm-row"><span class="cm-key">Model</span><span>${esc(m.flash_model_name || m.model_name)}</span></div>`;
+  return `
+    <div class="card ${isActive ? 'active' : ''}">
+      <div class="card-head">
+        <div class="card-icon">${esc(m.kind_icon || '🤖')}</div>
+        <div style="flex:1;min-width:0">
+          <div class="card-title">${esc(m.display_name)}
+            ${isActive ? '<span class="status-tag ok" style="margin-left:6px">使用中</span>' : ''}
+            ${m.builtin ? '<span class="status-tag muted" style="margin-left:6px">内置</span>' : '<span class="status-tag muted" style="margin-left:6px">自定义</span>'}
+            ${!m.has_key ? '<span class="status-tag warn" style="margin-left:6px">无 Key</span>' : ''}
+          </div>
+          <div class="card-sub">${esc(m.kind_label)} · ${esc(m.base_url || '(无 base url)')}</div>
+        </div>
+        <div class="card-actions">
+          ${!isActive ? `<button class="btn-action primary" onclick="activateModel('${esc(m.id)}')">使用</button>` : ''}
+          ${!m.builtin ? `<button class="btn-action danger" onclick="deleteModel('${esc(m.id)}','${esc(m.display_name)}')">删除</button>` : ''}
+        </div>
+      </div>
+      <div class="card-meta">${tier}<div class="cm-row"><span class="cm-key">Key</span><span>${esc(m.api_key_masked || '—')}</span></div></div>
+    </div>
+  `;
+}
+
+function wireModelForm() {
+  const sel = document.getElementById('mfKind');
+  const hint = document.getElementById('mfKindHint');
+  const url = document.getElementById('mfBaseUrl');
+  if (!sel) return;
+  const syncHint = () => {
+    const opt = sel.selectedOptions[0];
+    const def = opt?.dataset?.defaultBase || '';
+    if (hint) hint.textContent = def ? `默认 ${def}` : '需手动填写';
+    if (url && !url.value && def) url.placeholder = `默认 ${def}`;
+  };
+  sel.onchange = syncHint;
+  syncHint();
 }
 
 async function addModel() {
-  const name = document.getElementById('mfName').value.trim();
-  const kind = document.getElementById('mfKind').value;
-  const baseUrl = document.getElementById('mfBaseUrl').value.trim();
-  const modelName = document.getElementById('mfModel').value.trim();
-  const proModel = document.getElementById('mfProModel').value.trim();
-  const apiKey = document.getElementById('mfKey').value.trim();
-  if (!name || !modelName) { showToast('名称和模型名不能为空', true); return; }
-  if (!apiKey) { showToast('API Key 不能为空', true); return; }
+  const name = document.getElementById('mfName')?.value.trim();
+  const kind = document.getElementById('mfKind')?.value;
+  const baseUrl = document.getElementById('mfBaseUrl')?.value.trim();
+  const modelName = document.getElementById('mfModel')?.value.trim();
+  const proModel = document.getElementById('mfProModel')?.value.trim();
+  const apiKey = document.getElementById('mfKey')?.value.trim();
+  if (!name) { showToast('请输入显示名称', true); return; }
+  if (!modelName) { showToast('请输入模型名', true); return; }
+  if (!apiKey) { showToast('请输入 API Key', true); return; }
   try {
     const res = await fetch('/api/models', {
       method: 'POST',
@@ -1573,82 +1695,77 @@ async function addModel() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { showToast(data.error || '添加失败', true); return; }
-    document.getElementById('mfName').value = '';
-    document.getElementById('mfBaseUrl').value = '';
-    document.getElementById('mfModel').value = '';
-    document.getElementById('mfProModel').value = '';
-    document.getElementById('mfKey').value = '';
-    showToast('模型已添加', false, 'success');
-    await loadModels();
-    renderModelList();
-  } catch (e) {
-    showToast('添加失败: ' + e.message, true);
+    showToast(`已添加 ${name}`, false, 'success');
+    resetModelForm();
+    await loadSettings();
+    renderSettingsTab();
+  } catch (e) { showToast('添加失败: ' + e.message, true); }
+}
+
+function resetModelForm() {
+  for (const id of ['mfName','mfBaseUrl','mfModel','mfProModel','mfKey']) {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
   }
 }
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
-
-// ── 辩论角色模型设置（⚙️ 模型管理弹窗内）──
-let debateRolesState = { proposer: null, opponent: null, judge: null, activeId: null };
-
-function toggleDebateRoles() {
-  const el = document.getElementById('debateRoles');
-  const chev = document.getElementById('debateRolesChevron');
-  const open = el.style.display !== 'none';
-  el.style.display = open ? 'none' : 'block';
-  chev.textContent = open ? '\u25BC' : '\u25B2';
-}
-
-async function loadDebateRoles() {
+async function deleteModel(id, displayName) {
+  if (!confirm(`删除模型配置 "${displayName}"？`)) return;
   try {
-    const res = await fetch('/api/debate-models');
-    if (!res.ok) return;
-    const data = await res.json();
-    debateRolesState = {
-      proposer: data.proposer || null,
-      opponent: data.opponent || null,
-      judge: data.judge || null,
-      activeId: data.active_id || null,
-    };
-    renderDebateRoles();
-  } catch (e) { /* offline — leave dropdowns empty */ }
+    const res = await fetch(`/api/models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '删除失败', true); return; }
+    showToast(`已删除 ${displayName}`, false, 'success');
+    await loadSettings();
+    renderSettingsTab();
+  } catch (e) { showToast('删除失败: ' + e.message, true); }
 }
 
-function renderDebateRoleSelect(sel, selected) {
-  sel.innerHTML = '';
-  const def = document.createElement('option');
-  def.value = '';
-  def.textContent = '主模型（默认）';
-  sel.appendChild(def);
-  for (const m of modelState.models) {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = `${m.display_name} · ${m.model_name}`;
-    if (m.id === selected) opt.selected = true;
-    sel.appendChild(opt);
-  }
+// ── Settings · Debate tab ───────────────────────────────────
+function renderSettingsDebate(body) {
+  body.innerHTML = `
+    <div class="settings-section">
+      <h4>辩论 / 角色模型</h4>
+      <p class="form-hint" style="margin-bottom:14px">辩论模式下，每个角色（正方 / 反方 / 裁判）可使用不同模型；默认全部沿用主模型。设置对 Web 辩论模式与 CLI（<code>debate</code> / <code>research</code> 管线）同时生效。</p>
+      ${renderRoleRow('proposer', '正方 Proposer', '提出假说或论点', '🟢', debateRoleOptions(settingsStore.debate.proposer))}
+      ${renderRoleRow('opponent', '反方 Opponent', '反驳、寻找反例', '🔴', debateRoleOptions(settingsStore.debate.opponent))}
+      ${renderRoleRow('judge', '裁判 Judge', '综合证据做出裁决', '⚖', debateRoleOptions(settingsStore.debate.judge))}
+      <div class="btn-row" style="margin-top:14px">
+        <button class="btn-action" onclick="resetDebateRoles()">重置为主模型</button>
+        <button class="btn-action primary" onclick="saveDebateRoles()">保存</button>
+      </div>
+    </div>
+  `;
 }
 
-function renderDebateRoles() {
-  const p = document.getElementById('drProposer');
-  const o = document.getElementById('drOpponent');
-  const j = document.getElementById('drJudge');
-  if (!p || !o || !j) return;
-  renderDebateRoleSelect(p, debateRolesState.proposer);
-  renderDebateRoleSelect(o, debateRolesState.opponent);
-  renderDebateRoleSelect(j, debateRolesState.judge);
+function debateRoleOptions(selected) {
+  const def = `<option value="" ${selected ? '' : 'selected'}>主模型（默认）</option>`;
+  const opts = settingsStore.models.map(m =>
+    `<option value="${esc(m.id)}" ${m.id === selected ? 'selected' : ''}>${esc(m.kind_icon || '')} ${esc(m.display_name)} · ${esc(m.flash_model_name || m.model_name)}</option>`
+  ).join('');
+  return def + opts;
+}
+
+function renderRoleRow(role, title, hint, icon, options) {
+  return `
+    <div class="role-card">
+      <div class="role-icon">${icon}</div>
+      <div class="role-label">
+        <div class="rl-title">${title}</div>
+        <div class="rl-hint">${hint}</div>
+      </div>
+      <select id="dr${title.split(' ')[0][0].toUpperCase() + title.split(' ')[0].slice(1)}">${options}</select>
+    </div>
+  `;
 }
 
 async function saveDebateRoles() {
-  const body = {
-    proposer: document.getElementById('drProposer').value || null,
-    opponent: document.getElementById('drOpponent').value || null,
-    judge: document.getElementById('drJudge').value || null,
-  };
+  const roleIds = { proposer: 'drProposer', opponent: 'drOpponent', judge: 'drJudge' };
+  const body = {};
+  for (const r of Object.keys(roleIds)) {
+    const v = document.getElementById(roleIds[r])?.value || '';
+    body[r] = v.trim() ? v : null;
+  }
   try {
     const res = await fetch('/api/debate-models', {
       method: 'POST',
@@ -1658,8 +1775,72 @@ async function saveDebateRoles() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { showToast(data.error || '保存失败', true); return; }
     showToast('辩论角色设置已保存', false, 'success');
-    await loadDebateRoles();
-  } catch (e) {
-    showToast('保存失败: ' + e.message, true);
-  }
+    await loadSettings();
+  } catch (e) { showToast('保存失败: ' + e.message, true); }
+}
+
+async function resetDebateRoles() {
+  try {
+    const res = await fetch('/api/debate-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposer: null, opponent: null, judge: null }),
+    });
+    if (!res.ok) { showToast('重置失败', true); return; }
+    showToast('已重置为主模型', false, 'success');
+    await loadSettings();
+    renderSettingsTab();
+  } catch (e) { showToast('重置失败: ' + e.message, true); }
+}
+
+// ── Settings · About tab ────────────────────────────────────
+function renderSettingsAbout(body) {
+  const active = settingsStore.active;
+  body.innerHTML = `
+    <div class="settings-section">
+      <h4>当前运行环境</h4>
+      <div class="card">
+        <div class="card-head">
+          <div class="card-icon">🤖</div>
+          <div style="flex:1;min-width:0">
+            <div class="card-title">${active ? esc(active.display_name) : '未选择'}</div>
+            <div class="card-sub">${active ? esc(active.kind_label) + ' · ' + esc(active.base_url) : '—'}</div>
+          </div>
+          <div class="card-actions">
+            ${active?.has_key ? '<span class="status-tag ok">Active Key</span>' : '<span class="status-tag warn">No Key</span>'}
+          </div>
+        </div>
+        <div class="card-meta">
+          <div class="cm-row"><span class="cm-key">Flash</span><span>${active ? esc(active.flash_model_name) : '—'}</span></div>
+          <div class="cm-row"><span class="cm-key">Pro</span><span>${active ? esc(active.pro_model_name_effective) : '—'}</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="settings-section">
+      <h4>已配置的 LLM</h4>
+      ${settingsStore.models.length ? settingsStore.models.map(m => `
+        <div class="card" style="padding:8px 12px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:16px">${esc(m.kind_icon || '🤖')}</span>
+            <span style="flex:1;font-weight:600">${esc(m.display_name)}</span>
+            <span class="status-tag ${m.has_key ? 'ok' : 'warn'}">${m.has_key ? 'Key OK' : 'No Key'}</span>
+            ${m.builtin ? '<span class="status-tag muted">内置</span>' : '<span class="status-tag muted">自定义</span>'}
+          </div>
+        </div>
+      `).join('') : emptyModels()}
+    </div>
+    <div class="settings-section">
+      <h4>关于</h4>
+      <div class="card">
+        <div class="card-head">
+          <div class="card-icon">🧪</div>
+          <div style="flex:1;min-width:0">
+            <div class="card-title">Miniagent · Round 36</div>
+            <div class="card-sub">统一设置中心 + 主题重构</div>
+          </div>
+        </div>
+        <p class="form-hint">所有 LLM 配置、辩论角色、模型图标都来自后端（<code>/api/kinds</code>、<code>/api/models</code>、<code>/api/debate-models</code>、<code>/api/settings/active</code>），前端不再硬编码枚举。</p>
+      </div>
+    </div>
+  `;
 }

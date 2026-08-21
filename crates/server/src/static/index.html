@@ -3,56 +3,80 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Miniagent</title>
+<title>Miniagent · Unified Workspace</title>
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 <div class="app">
-   <aside class="sidebar" id="sidebar">
-     <div class="sidebar-header">
-       <h2>Miniagent</h2>
-       <button class="btn-new" onclick="newTask()" title="New Task">+ New</button>
-     </div>
-    <div class="search-wrap">
-      <span class="search-icon">&#128269;</span>
-      <input class="search-input" id="searchInput" type="text" placeholder="Search tasks..." oninput="filterTasks()">
+
+  <!-- ── Sidebar ──────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">M</div>
+      <h2>Miniagent</h2>
+      <button class="btn-new" onclick="newTask()" title="New Task">+ New</button>
     </div>
- <div class="task-list" id="taskList"></div>
- <div class="skill-section" id="skillSection">
-   <div class="skill-section-header" onclick="toggleSkillPanel()">
-     <span>&#128295; Skills</span>
-     <span class="skill-count" id="skillCount">0</span>
-     <span class="skill-chevron" id="skillChevron">&#9660;</span>
-   </div>
-   <div class="skill-panel" id="skillPanel">
-     <div class="skill-search-wrap">
-       <input class="skill-search" id="skillSearch" type="text" placeholder="Search skills..." oninput="filterSkills()">
-     </div>
-     <div class="skill-list" id="skillList"></div>
-   </div>
- </div>
- <div class="sidebar-footer"><span class="dot"></span> Miniagent v0.1</div>
+
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input class="search-input" id="searchInput" type="text" placeholder="搜索任务..." oninput="filterTasks()">
+    </div>
+
+    <div class="task-list" id="taskList"></div>
+
+    <div class="sidebar-section" id="skillSection">
+      <div class="ss-header" onclick="toggleSkillPanel()">
+        <span class="ss-title">🛠 Skills</span>
+        <span class="ss-chevron" id="skillChevron">▼</span>
+      </div>
+      <div class="ss-body" id="skillPanel">
+        <div class="skill-search-wrap">
+          <input class="skill-search" id="skillSearch" type="text" placeholder="搜索技能..." oninput="filterSkills()">
+        </div>
+        <div class="skill-list" id="skillList"></div>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <span class="dot"></span>
+      <span style="flex:1">Miniagent v0.1</span>
+      <button class="btn-header" onclick="openSettings()" title="设置" style="width:26px;height:26px;font-size:13px">⚙</button>
+    </div>
   </aside>
 
+  <!-- ── Main column ──────────────────────────────────────── -->
   <div class="main">
     <div class="chat-header">
-      <button class="btn-header" id="btnToggleSidebar" onclick="toggleSidebar()" title="Toggle sidebar">&#9776;</button>
-      <button class="menu-btn" onclick="toggleSidebarMobile()">&#9776;</button>
-      <div class="stage-pills" id="stagePills"></div>
-      <h3 id="chatTitle"></h3>
-      <div class="model-select-wrap" id="modelSelectWrap" title="切换 LLM 模型">
-        <select id="modelSelect" onchange="onModelSelectChange(this.value)"></select>
-        <button class="btn-header" onclick="openModelModal()" title="管理模型配置" style="width:30px;height:30px;font-size:14px">&#9881;</button>
+      <button class="btn-header" id="btnToggleSidebar" onclick="toggleSidebar()" title="Toggle sidebar">≡</button>
+      <div class="ct-titles">
+        <div class="ct-mode">
+          <span class="mode-pill" id="modePill">⚙ Workflow</span>
+          <span id="modelSummary">—</span>
+        </div>
+        <h3 id="chatTitle"></h3>
       </div>
-      <button class="btn-cancel" id="btnCancel" onclick="cancelTask()" title="Cancel running task">&#9632; Stop</button>
-      <button class="btn-header" id="btnToggleRight" onclick="toggleRightPanel()" title="Toggle progress / files panel">&#9776;&#9776;</button>
+      <div class="stage-pills" id="stagePills"></div>
+      <button class="model-chip active" id="modelChip" onclick="openSettings('models')" title="点击切换/管理 LLM 模型">
+        <span class="mc-icon" id="modelChipIcon">🐳</span>
+        <span class="mc-name" id="modelChipName">—</span>
+        <span class="mc-caret">▾</span>
+      </button>
+      <button class="btn-cancel" id="btnCancel" onclick="cancelTask()" title="Cancel running task">■ Stop</button>
+      <button class="btn-header" id="btnToggleRight" onclick="toggleRightPanel()" title="Toggle progress / files panel">⇆</button>
     </div>
-    <div class="conn-bar" id="connBar"></div>
+
+    <div class="conn-bar connected" id="connBar">
+      <span class="cb-dot"></span>
+      <span id="connText">已连接</span>
+      <span style="flex:1"></span>
+      <span id="connMeta"></span>
+    </div>
+
     <div class="messages" id="messages">
       <div class="welcome" id="welcome">
-        <div class="welcome-icon">&#129302;</div>
+        <div class="welcome-icon">🤖</div>
         <h2>Miniagent</h2>
-        <p>AI Agent with dynamic workflow planning, tool execution, and multi-stage research.</p>
+        <p>统一科研工作流：文献 → 知识图谱 → 致病机理假说 → 辩论 → 验证计划 → 数据分析。</p>
         <div class="welcome-tips">
           <div class="welcome-tip" onclick="useTip('Summarize recent advances in CRISPR gene editing')">CRISPR Research</div>
           <div class="welcome-tip" onclick="useTip('Compare BERT and GPT architectures')">BERT vs GPT</div>
@@ -60,30 +84,32 @@
         </div>
       </div>
     </div>
+
     <div class="input-area">
       <div class="file-chips" id="fileChips"></div>
       <div class="file-chips" id="skillChips"></div>
       <div class="input-row">
-        <button class="btn-upload" onclick="document.getElementById('fileInput').click()" title="Upload file">&#128206;</button>
+        <button class="btn-upload" onclick="document.getElementById('fileInput').click()" title="Upload file">📎</button>
         <select id="modeSelect" class="mode-select" title="选择工作流模式">
-          <option value="workflow">⚙️ Workflow</option>
+          <option value="workflow">⚙ Workflow</option>
           <option value="loop">🔄 Loop</option>
-          <option value="debate">⚖️ Debate</option>
+          <option value="debate">⚖ Debate</option>
           <option value="research">🔬 Research</option>
         </select>
         <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.pdf,.csv,.json,.py,.rs,.js,.ts,.html,.css">
         <div class="input-wrap">
           <textarea id="input" rows="1" placeholder="Ask anything..." onkeydown="handleKey(event)"></textarea>
         </div>
-        <button class="btn-send" id="btnSend" onclick="sendMessage()">&#9654;</button>
+        <button class="btn-send" id="btnSend" onclick="sendMessage()">▶</button>
       </div>
     </div>
   </div>
 
+  <!-- ── Right panel ─────────────────────────────────────── -->
   <aside class="right-panel" id="rightPanel">
     <div class="rp-tabs">
-      <button class="rp-tab active" data-tab="progress" onclick="switchRightTab('progress')">&#128202; Progress</button>
-      <button class="rp-tab" data-tab="files" onclick="switchRightTab('files')">&#128193; Files</button>
+      <button class="rp-tab active" data-tab="progress" onclick="switchRightTab('progress')">📊 Progress</button>
+      <button class="rp-tab" data-tab="files" onclick="switchRightTab('files')">📁 Files</button>
     </div>
     <div class="rp-content">
       <div id="rpProgress"></div>
@@ -91,28 +117,28 @@
     </div>
   </aside>
 
-  <!-- Floating reopen buttons (visible when the respective panel is collapsed) -->
-  <button id="sidebarReopen" class="float-reopen left" onclick="expandSidebar()" title="Show sidebar" style="display:none">&#9776;</button>
-  <button id="rightReopen" class="float-reopen right" onclick="expandRightPanel()" title="Show files panel" style="display:none">&#128193;</button>
+  <button id="sidebarReopen" class="float-reopen left" onclick="expandSidebar()" title="Show sidebar" style="display:none">≡</button>
+  <button id="rightReopen" class="float-reopen right" onclick="expandRightPanel()" title="Show files panel" style="display:none">📁</button>
 </div>
 
 <div class="drag-overlay" id="dragOverlay">
   <div class="inner">
-    <div style="font-size:40px">&#128196;</div>
+    <div style="font-size:40px">📄</div>
     <p>Drop files here</p>
   </div>
 </div>
 
+<!-- ── Preview drawer ──────────────────────────────────────── -->
 <div class="preview-overlay" id="previewOverlay" onclick="if(event.target===this)closePreview()">
   <div class="preview-drawer">
     <div class="preview-head">
-      <span class="picon">&#128196;</span>
+      <span class="picon">📄</span>
       <div style="flex:1;min-width:0">
         <div class="ptitle" id="previewTitle"></div>
         <div class="pmeta" id="previewMeta"></div>
       </div>
-      <button class="btn-header" onclick="document.getElementById('previewDownload').click()" title="Download" style="width:30px;height:30px;font-size:13px">&#11015;</button>
-      <button class="preview-close" onclick="closePreview()" title="Close">&times;</button>
+      <button class="btn-header" onclick="document.getElementById('previewDownload').click()" title="Download" style="width:30px;height:30px;font-size:13px">⬇</button>
+      <button class="preview-close" onclick="closePreview()" title="Close">×</button>
     </div>
     <div class="preview-body" id="previewBody"></div>
     <a id="previewDownload" style="display:none"></a>
@@ -121,73 +147,28 @@
 
 <div class="toast" id="toast"></div>
 
-<!-- ── Model management modal（添加 / 选择 / 删除 LLM）── -->
-<div class="modal-overlay" id="modelModal" onclick="if(event.target===this)closeModelModal()">
-  <div class="modal-dialog">
-    <div class="modal-head">
-      <h3>模型管理</h3>
-      <button class="preview-close" onclick="closeModelModal()" title="Close">&times;</button>
+<!-- ── Unified settings drawer (Round 36) ─────────────────── -->
+<div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
+  <div class="settings-drawer" role="dialog" aria-label="设置">
+    <div class="settings-head">
+      <h3><span class="sh-icon">⚙</span><span>设置</span></h3>
+      <button class="preview-close" onclick="closeSettings()" title="Close">×</button>
     </div>
-    <div class="modal-body">
-      <div id="modelList" class="model-list"></div>
-      <div class="debate-roles-head" onclick="toggleDebateRoles()">
-        <span>&#9878;&#65039; 辩论角色模型（正方 / 反方 / 裁判）</span>
-        <span id="debateRolesChevron">&#9660;</span>
-      </div>
-      <div class="debate-roles" id="debateRoles" style="display:none">
-        <p class="form-hint">辩论模式下每个角色可用不同模型；默认全部使用主模型。设置对 Web 辩论模式和 CLI（debate / research 管线）同时生效。</p>
-        <div class="form-row">
-          <label>&#128221; 正方 Proposer</label>
-          <select id="drProposer"></select>
-        </div>
-        <div class="form-row">
-          <label>&#9876;&#65039; 反方 Opponent</label>
-          <select id="drOpponent"></select>
-        </div>
-        <div class="form-row">
-          <label>&#9878;&#65039; 裁判 Judge</label>
-          <select id="drJudge"></select>
-        </div>
-        <button class="btn-model-add" onclick="saveDebateRoles()">保存辩论角色设置</button>
-      </div>
-      <div class="model-form-head" onclick="toggleModelForm()">
-        <span>+ 添加自定义模型（OpenAI / Anthropic 兼容端点）</span>
-        <span id="modelFormChevron">&#9660;</span>
-      </div>
-      <div class="model-form" id="modelForm" style="display:none">
-        <div class="form-row">
-          <label>名称</label>
-          <input id="mfName" type="text" placeholder="例如: SiliconFlow GLM">
-        </div>
-        <div class="form-row">
-          <label>类型</label>
-          <select id="mfKind">
-            <option value="openai_compatible">OpenAI 兼容</option>
-            <option value="anthropic_compatible">Anthropic 兼容</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="stepfun">StepFun</option>
-            <option value="minimax">MiniMax</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <label>Base URL</label>
-          <input id="mfBaseUrl" type="text" placeholder="https://api.example.com/v1（留空用类型默认值）">
-        </div>
-        <div class="form-row">
-          <label>模型名</label>
-          <input id="mfModel" type="text" placeholder="例如: glm-4.7">
-        </div>
-        <div class="form-row">
-          <label>Pro 模型名<small>（可选，复杂任务用）</small></label>
-          <input id="mfProModel" type="text" placeholder="留空则与模型名相同">
-        </div>
-        <div class="form-row">
-          <label>API Key</label>
-          <input id="mfKey" type="password" placeholder="sk-...">
-        </div>
-        <button class="btn-model-add" onclick="addModel()">添加</button>
-        <p class="form-hint">Key 保存在服务端 models.json（已 gitignore），不会出现在代码仓库中。</p>
-      </div>
+    <div class="settings-tabs" id="settingsTabs">
+      <button class="settings-tab active" data-tab="models" onclick="switchSettingsTab('models')">
+        <span>🤖</span> 模型
+      </button>
+      <button class="settings-tab" data-tab="debate" onclick="switchSettingsTab('debate')">
+        <span>⚖</span> 辩论角色
+      </button>
+      <button class="settings-tab" data-tab="about" onclick="switchSettingsTab('about')">
+        <span>ℹ</span> 关于
+      </button>
+    </div>
+    <div class="settings-body" id="settingsBody">
+      <div class="skeleton" style="height:120px;margin-bottom:12px"></div>
+      <div class="skeleton" style="height:80px;margin-bottom:12px"></div>
+      <div class="skeleton" style="height:80px"></div>
     </div>
   </div>
 </div>

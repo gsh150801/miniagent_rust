@@ -54,6 +54,37 @@ impl ModelKind {
             Self::AnthropicCompatible => "Anthropic 兼容",
         }
     }
+
+    /// Emoji/short glyph shown in the UI next to the provider name. Chosen
+    /// by family (deepseek=🐳, stepfun=⚡, etc.) so the user can spot the
+    /// family at a glance without reading the label text.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::DeepSeek => "🐳",
+            Self::StepFun => "⚡",
+            Self::MiniMax => "🌊",
+            Self::OpenAiCompatible => "🔌",
+            Self::AnthropicCompatible => "🧠",
+        }
+    }
+
+    /// Short identifier for client-side grouping/filtering.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::DeepSeek => "deepseek",
+            Self::StepFun => "stepfun",
+            Self::MiniMax => "minimax",
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::AnthropicCompatible => "anthropic_compatible",
+        }
+    }
+
+    /// Iterate every supported family (server-driven; the frontend asks via
+    /// /api/models for the kinds list, never hardcodes the enums).
+    pub fn all() -> [ModelKind; 5] {
+        [Self::DeepSeek, Self::StepFun, Self::MiniMax,
+         Self::OpenAiCompatible, Self::AnthropicCompatible]
+    }
 }
 
 /// A single configurable LLM endpoint/model.

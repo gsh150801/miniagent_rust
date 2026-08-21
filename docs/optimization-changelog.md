@@ -2321,3 +2321,60 @@ ALS 完整管线（`cargo run -p miniagent-cli -- research -q "肌萎缩侧索�
 - **辩论修复确认**：辩论阶段（帕金森跑失败的关键环节）在 ALS run 上首次成功完成（`debate_completed`），精炼产出 `hypotheses_refined.json` + `hypotheses_refined_full.json`，验证了任务二/任务三修复的截断抢救 + 栈序闭合 + max_tokens 提升组合有效。
 - **计划生成**：2 个验证计划（`plans/validation_plan_0/1.json`），每个 4 数据分析任务 + 3~4 湿实验方案。
 - **工件全部就位**：仅落在 `result/8e55dd4e_肌萎缩侧索硬化_渐冻症_ALS_的致病机理/` 下（含 `debate_report.json` 与精炼 hypothesis 文件），仓库根目录无散落。
+
+---
+
+## Round 36: 统一设置中心 + 视觉重构
+
+### 后端
+
+`crates/core/src/models.rs` — `ModelKind` 增加 `icon()`（emoji glyph）、`slug()`、`all()`。后端成为模型种类、图标、默认 base URL 的**唯一来源**，前端不再硬编码。
+
+`crates/server/src/routes.rs` — `ModelProfileView` 新增字段：`kind_icon`、`flash_model_name`、`pro_model_name_effective`（本来就存在但前端看不到，统一后端投影）。新增两个端点：
+- `GET /api/kinds` — 枚举全部 `ModelKind`，返回 `{slug, label, icon, default_base_url}` 列表。前端从此接口填充 kind 下拉。
+- `GET /api/settings/active` — 一站式快照：`active` profile（完整 ModelProfileView）、`debate` 选择、`kinds` 列表。头部 model chip + 设置中心用同一份数据，杜绝漂移。
+
+### 前端
+
+**styles.css** — 全面重写：
+- `:root` 设计令牌重整：更中性的灰白面板（`--bg2:#fff`、`--border:#e1e3ec`），单条 `--accent` 紫蓝色用于所有交互元素。模型家族色调通过 `--kind-accent` 变量（JS 按 `kind_icon` 设置）——以前模型卡片用 `#4f8cff` 硬色，现在与主题同步。
+- 删除原模型弹窗的**深色孤立块**（它使用从未定义的 `--bg-secondary` 等变量，导致模型弹窗与浅色页面割裂）。
+- 卡片、按钮、标签、滚动条、提示、动画、响应式断点统一重做：`.card`、`.status-tag`、`.role-card`、`.form-grid`、`.settings-drawer`（抽屉动画）、`.skeleton`（占位加载）。
+- 头部连接状态条、模型 chip、模式标签（mode pill）、stage pills 全部统一风格。
+
+**index.html** — 整体重构：
+- 删除旧的 `modelSelect` `<select>` + `modelModal` 弹窗；改为头部 `model-chip` 按钮（点击直接打开设置）+ 右下 `⚙` 入口。
+- 新增统一 `.settings-overlay` 抽屉，包含三标签：**🤖 模型** / **⚖ 辩论角色** / **ℹ 关于**。
+- 头部增加 `mode-pill` 显示当前模式（与 modeSelect 同步），`modelSummary` 显示主模型与 pro 名字。
+- 连接条样式重做（明确 `connected/disconnected` 颜色），状态文字显式（"已连接"/"已断开"/"连接中..."）。
+
+**app.js** — 设置逻辑全部重写：
+- 新增 `settingsStore`（activeId / active / models / kinds / debate / settingsTab）。WS 开连时 `loadSettings()` 一次性并发拉 `active + models + kinds + debate`，保证头部 chip 与设置页同源。
+- 删除 `loadModels / loadDebateRoles / renderModelSelect / renderModelList / renderDebateRoleSelect / renderDebateRoles / addModel / openModelModal / toggleDebateRoles / toggleModelForm / debateRolesState` 等十几个碎片化函数，合并为：
+  - `openSettings(tab)` / `closeSettings()` / `switchSettingsTab(tab)` 抽屉生命周期
+  - `renderSettingsTab()` 路由三标签 → 调用 `renderSettingsModels / renderSettingsDebate / renderSettingsAbout`
+  - `renderModelCard(m, isActive)` 统一卡片渲染（内置/自定义各一张卡片，tag 显示 使用中/内置/自定义/无 Key）
+  - `wireModelForm()` 让 kind 选择自动联动 base URL 默认值提示
+  - `activateModel(id)` / `deleteModel(id, name)` / `addModel()` / `saveDebateRoles()` / `resetDebateRoles()` 全部走 `loadSettings()` 重拉数据后重渲染（单一数据源）
+- 头部 model chip（`#modelChip`）与 mode pill 由 `setMode()` 联动显示。
+
+### 统一性确认（消除的不一致点）
+
+| 之前 | 现在 |
+|---|---|
+| HTML `<option>` 硬编码 5 个 kind + `index.html:165-169` | 来自 `/api/kinds`；新增第六种时只改 `ModelKind::all()` |
+| 模型弹窗深色块与浅色页面割裂 | 全站统一中性灰白 + `--accent` |
+| header `modelSelect` 与 modal `modelList` 不同步 | 单一 `settingsStore` + `renderModelChip` |
+| `kind` 字段前端未消费 | `kind_icon` 直接用作 chip 与卡片 emoji |
+| `has_key` 不展示 | 卡片/关于页用 `status-tag warn:无 Key` 显式提示 |
+| 添加模型无 `api_key_env` UI | 仍留为进阶用法（避免 UI 复杂化）；后端支持完整 |
+| 模式选择与头部 chip 不同步 | `setMode()` 同步 mode-pill |
+
+### 验证
+
+- `cargo build -p miniagent-server` 干净。
+- Server 启动：所有路由 `200`，新字段 `kind_icon / flash_model_name / pro_model_name_effective` 在 `/api/models`、`/api/settings/active` 中正确返回（验证 `builtin-minimax` 返回 `kind_icon=🌊`、`flash_model_name=MiniMax-M3`）。
+- 切换模型往返：POST `/api/models/builtin-deepseek/activate` → `/api/settings/active` 返回 `DeepSeek 🐳`；切回 minimax 正确。
+- HTML 渲染：`/api/...` 200，`/styles.css` 200 (414 行)，`/app.js` 200 (1846 行，包含新函数 `renderSettingsModels/Debate/About`/`openSettings`/`activateModel`/`renderModelChip` 等)。
+- 现有工作流（`/api/tasks`、`/api/run`、`/api/health`、`/api/skills`、`/api/upload`、`/api/download`）无回归。
+- `cargo test --workspace` 通过（除已知 StepFun 在线订阅失效）。
