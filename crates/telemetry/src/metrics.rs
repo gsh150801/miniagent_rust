@@ -26,10 +26,6 @@ pub fn record_agent_run(elapsed: Duration, usage: &Usage) {
     TOTAL_OUTPUT_TOKENS.fetch_add(usage.output_tokens as u64, Ordering::Relaxed);
 }
 
-pub fn record_agent_failure() {
-    AGENT_FAILURES.fetch_add(1, Ordering::Relaxed);
-}
-
 pub fn record_tool_execution(tool: &str, _elapsed: Duration, success: bool) {
     TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
     if !success {

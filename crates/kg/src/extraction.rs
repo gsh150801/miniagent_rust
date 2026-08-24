@@ -10,31 +10,6 @@ pub struct ExtractionResult {
     pub relations: Vec<Relation>,
 }
 
-/// Build a prompt for entity/relation extraction from a paper.
-pub fn extraction_prompt(title: &str, abstract_text: &str, full_text: Option<&str>) -> String {
-    let text = full_text.unwrap_or(abstract_text);
-    format!(
-        r#"Extract key entities and their relationships from the following scientific paper.
-
-**Paper Title:** {title}
-**Content:** {text}
-
-Output a JSON object with:
-1. "entities": list of objects with fields:
-   - "name": canonical name
-   - "type": one of [Gene, Protein, Pathway, Disease, Phenotype, Drug, Method, Concept]
-   - "aliases": list of alternative names
-2. "relations": list of objects with fields:
-   - "from": entity name (must match an entity above)
-   - "to": entity name
-   - "type": one of [activates, inhibits, regulates, binds_to, phosphorylates, interacts_with, associated_with, correlated_with, uses_method, measured_by, is_a, part_of, located_in, supports, contradicts, extends]
-   - "evidence": short quote or description supporting this relation
-
-Focus on biologically/scientifically meaningful entities and experimentally supported relations.
-"#
-    )
-}
-
 /// Parse LLM extraction output into structured ExtractionResult
 pub fn parse_extraction_result(
     paper_id: Uuid,

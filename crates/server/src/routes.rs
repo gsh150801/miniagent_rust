@@ -10,8 +10,7 @@ use axum::{
     Json, Router,
 };
 use miniagent_agent::Agent;
-use miniagent_agent::context::RunContext;
-use miniagent_core::config::{InferenceConfig, TaskComplexity};
+use miniagent_core::config::InferenceConfig;
 use miniagent_core::message::Message as AgentMessage;
 use miniagent_core::models::{ModelKind, ModelProfile};
 use miniagent_provider::factory::{build_provider, build_provider_pair, ProviderTier};
@@ -41,6 +40,13 @@ static MARKED_JS: &str = include_str!("static/marked.min.js");
 // ── Router ──
 
 pub fn create_router(state: AppState) -> Router {
+    // Cap the per-request body size at 64 MiB. The /api/upload endpoint
+    // streams multipart payloads directly into a per-task buffer and the
+    // previous `unbounded` default allowed a single client to OOM the
+    // server with a multi-GB upload. WebSocket upgrades are exempt from
+    // this limit by virtue of using a separate request path.
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
     Router::new()
         .route("/", get(index_handler))
         .route("/styles.css", get(styles_handler))
@@ -61,8 +67,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/trace/{task_id}", get(trace_handler))
         .route("/api/provenance/{task_id}", get(provenance_handler))
         .route("/api/metrics", get(metrics_handler))
-        .route("/api/run", post(run_handler))
-        .route("/api/resume", post(resume_handler))
         // Runtime LLM model registry (add / select / delete models)
         .route("/api/models", get(models_handler).post(add_model_handler))
         .route("/api/models/{id}", axum::routing::put(update_model_handler).delete(delete_model_handler))
@@ -76,6 +80,7 @@ pub fn create_router(state: AppState) -> Router {
         // from a single response.
         .route("/api/kinds", get(kinds_handler))
         .route("/api/settings/active", get(settings_active_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -98,44 +103,6 @@ async fn marked_js_handler() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         MARKED_JS,
     )
-}
-
-// ── Legacy types ──
-
-#[derive(Debug, Deserialize)]
-struct RunRequest {
-    prompt: String,
-    #[serde(default)]
-    system: Option<String>,
-    #[serde(default = "default_provider")]
-    provider: String,
-    #[serde(default = "default_complexity")]
-    complexity: String,
-    #[serde(default)]
-    history: Vec<AgentMessage>,
-}
-
-fn default_provider() -> String { "flash".into() }
-fn default_complexity() -> String { "moderate".into() }
-
-#[derive(Debug, Serialize)]
-struct RunResponse {
-    text: String,
-    stop_reason: String,
-    usage: UsageResponse,
-    history: Vec<AgentMessage>,
-}
-
-#[derive(Debug, Serialize)]
-struct UsageResponse {
-    input_tokens: usize,
-    output_tokens: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResumeRequest {
-    checkpoint_id: String,
-    prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,61 +192,76 @@ async fn trace_handler(
     }
 }
 
-/// Return the provenance record (audit trail) for a data-analysis task.
+/// Return the provenance record(s) (audit trail) for a run's data-analysis
+/// tasks.
 ///
 /// Provenance is written by `miniagent-analysis` to
-/// `analysis/<task_id>/provenance.json` (script hash, I/O hashes, conda env +
-/// package versions, seed, git commit, exit code, stdout/stderr digests). This
-/// endpoint makes the audit trail queryable so every analysis result is
+/// `analysis/**/provenance.json` inside the task's result directory (script
+/// hash, I/O hashes, conda env + package versions, seed, git commit, exit
+/// code, stdout/stderr digests). The handler resolves the run directory from
+/// the task registry — never from the process CWD — and returns every
+/// provenance record found beneath it, so each analysis result is
 /// reproducible and inspectable.
-async fn provenance_handler(Path(task_id): Path<String>) -> Json<serde_json::Value> {
-    // Sanitize the task id to prevent path traversal.
-    let safe: String = task_id
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let dir = std::path::Path::new("analysis").join(&safe);
-    let prov_path = dir.join("provenance.json");
-
-    if !prov_path.exists() {
+async fn provenance_handler(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let Some(task) = state.tasks.get(&task_id) else {
         return Json(serde_json::json!({
-            "error": "provenance not found",
+            "error": "task not found",
             "task_id": task_id,
-            "expected_path": prov_path.display().to_string(),
         }));
-    }
-
-    let body = match std::fs::read_to_string(&prov_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("failed to read provenance: {e}"),
-                "task_id": task_id,
-            }));
-        }
     };
-    let record: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            // Fall back to returning the raw text if it isn't valid JSON.
-            serde_json::json!({ "raw": body })
-        }
-    };
+    let result_dir = task.result_dir.clone();
+    drop(task);
 
-    // List sibling artifacts (script + outputs) for convenience.
-    let mut artifacts: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    // Depth-bounded recursive scan for provenance records under the run dir.
+    fn collect_provenance(
+        dir: &std::path::Path,
+        depth: usize,
+        out: &mut Vec<(std::path::PathBuf, serde_json::Value)>,
+    ) {
+        if depth > 5 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                artifacts.push(name.to_string());
+            let path = entry.path();
+            if path.is_dir() {
+                collect_provenance(&path, depth + 1, out);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("provenance.json") {
+                if let Ok(body) = std::fs::read_to_string(&path) {
+                    let record = serde_json::from_str(&body)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": body }));
+                    out.push((path, record));
+                }
             }
         }
     }
 
+    let mut records: Vec<(std::path::PathBuf, serde_json::Value)> = Vec::new();
+    collect_provenance(&result_dir, 0, &mut records);
+
+    if records.is_empty() {
+        return Json(serde_json::json!({
+            "error": "provenance not found",
+            "task_id": task_id,
+            "searched_dir": result_dir.display().to_string(),
+        }));
+    }
+
     Json(serde_json::json!({
         "task_id": task_id,
-        "provenance": record,
-        "artifacts": artifacts,
+        "count": records.len(),
+        "records": records
+            .into_iter()
+            .map(|(path, record)| {
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "provenance": record,
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -841,7 +823,13 @@ async fn handle_run_loop(
             if agent_tx_for_fwd.send(ProgressMsg::AgentEvent(ev)).await.is_err() { break; }
         }
     });
-    agent_arc.set_event_sender(agent_event_tx).await;
+    // Register a *per-task* event sender so concurrent loop pipelines no
+    // longer clobber each other's event streams (each task gets its own
+    // independent subscription). The RAII guard is stored in AppState and
+    // dropped on completion / cancel so the shared Agent's event list
+    // stays bounded.
+    let event_guard = agent_arc.register_event_sender(agent_event_tx.clone()).await;
+    state.event_guards.insert(task_id.to_string(), event_guard);
 
     // Build a ProgressFn closure that ships per-stage events into the
     // progress channel. The closure is `FnMut` and only touches local
@@ -889,6 +877,10 @@ async fn handle_run_loop(
     // Drop the sender so the drain task exits when the channel empties.
     drop(progress_tx);
     let _ = drain_handle.await;
+    // Release the per-task event sender: stops this task from receiving
+    // any further AgentEvents emitted by other concurrent runs that happen
+    // to still be alive in this server.
+    state.event_guards.remove(&task_id);
 
     match result {
         Ok(pipeline_state) => {
@@ -2009,12 +2001,15 @@ async fn run_with_progress(
         }
     };
     tokio::spawn(async move {
-        let result = workflow.run_with_progress(None, wf_cancel, Box::new(progress_fn)).await;
+        let result = workflow.run_with_progress(wf_cancel, Box::new(progress_fn)).await;
         let _ = progress_tx.send(ProgressMsg::Done(result)).await;
     });
 
     // Wire the agent's broadcast sender so tool/skill events flow to the frontend.
-    agent_arc.set_event_sender(agent_event_tx).await;
+    // Register a per-task sender (RAII guard) so concurrent workflow runs do
+    // not clobber each other's event streams.
+    let event_guard = agent_arc.register_event_sender(agent_event_tx.clone()).await;
+    state.event_guards.insert(task_id.to_string(), event_guard);
 
     // Forward progress to WebSocket and wait for result
     let mut final_result: Option<Result<miniagent_workflow::engine::WorkflowResult, miniagent_core::error::AgentError>> = None;
@@ -2144,12 +2139,15 @@ async fn run_multi_stage_with_streaming(
         }
     };
     tokio::spawn(async move {
-        let result = workflow.run_with_progress(None, wf_cancel, Box::new(progress_fn)).await;
+        let result = workflow.run_with_progress(wf_cancel, Box::new(progress_fn)).await;
         let _ = progress_tx.send(ProgressMsg::Done(result)).await;
     });
 
     // Wire the agent's broadcast sender so tool/skill events flow to the frontend.
-    agent_arc.set_event_sender(agent_event_tx).await;
+    // Register a per-task sender (RAII guard) so concurrent workflow runs do
+    // not clobber each other's event streams.
+    let event_guard = agent_arc.register_event_sender(agent_event_tx.clone()).await;
+    state.event_guards.insert(task_id.to_string(), event_guard);
 
     // Forward progress to WebSocket and wait for result
     let mut final_result: Option<Result<miniagent_workflow::engine::WorkflowResult, miniagent_core::error::AgentError>> = None;
@@ -2389,6 +2387,10 @@ async fn finalize_task(
     response_text: String,
     mode: &str,
 ) {
+    // Release the per-task broadcast sender so the shared Agent's event
+    // list does not grow without bound and other concurrent runs are not
+    // shadowed by this task's now-defunct sender.
+    state.event_guards.remove(task_id);
     // Save the user-facing final report at `<task_dir>/<brief>.md`.
     // For workflow / loop / debate modes the AI's streamed response IS the
     // report (with a brief cover header). For research mode the research
@@ -2427,6 +2429,16 @@ async fn finalize_task(
         // shows the task was finalized.
         let stub = format!(
             "# {brief}\n\n（任务已结束，未生成 AI 回复文本；详见 `metadata.json` 与右侧 Progress / Files 面板。）\n",
+            brief = task_brief,
+        );
+        let _ = std::fs::write(&output_path, &stub);
+        result_files.push(output_filename.clone());
+    } else if is_research && !output_path.exists() {
+        // The research pipeline owns the final report; if it somehow failed
+        // to write one, leave a pointer stub so the run directory is never
+        // silently report-less.
+        let stub = format!(
+            "# {brief}\n\n（研究管线未能生成完整报告；执行轨迹见 `run_report.md` 与 `project.json`。）\n",
             brief = task_brief,
         );
         let _ = std::fs::write(&output_path, &stub);
@@ -2695,164 +2707,7 @@ async fn ws_send(socket: &Arc<Mutex<WsSink>>, msg: serde_json::Value) {
     }
 }
 
-// ── Legacy handlers ──
-
-async fn run_handler(
-    State(state): State<AppState>,
-    Json(req): Json<RunRequest>,
-) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let span = miniagent_telemetry::AgentSpan::start(
-        miniagent_core::types::RunId::new(),
-        &req.provider,
-        &req.complexity,
-    );
-
-    let complexity = parse_complexity(&req.complexity);
-    let system_prompt = req
-        .system
-        .unwrap_or_else(|| {
-            format!(
-                "You are a helpful AI research assistant.\n\n{}",
-                miniagent_core::context_info::env_block(".")
-            )
-        });
-
-    let context = RunContext::new(system_prompt)
-        .with_complexity(complexity)
-        .with_provider(parse_provider(&req.provider));
-
-    let mut history = req.history;
-    history.push(AgentMessage::user(&req.prompt));
-
-    let cancel = CancellationToken::new();
-
-    let result = state.agent.run(&history, &context, cancel).await;
-
-    match result {
-        Ok(delta) => {
-            let text = delta
-                .new_messages
-                .iter()
-                .map(|m| m.text_content())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            history.extend(delta.new_messages.clone());
-
-            let _result = span.finish(&delta.usage, None);
-
-            Ok(Json(RunResponse {
-                text,
-                stop_reason: format!("{:?}", delta.stop_reason),
-                usage: UsageResponse {
-                    input_tokens: delta.usage.input_tokens,
-                    output_tokens: delta.usage.output_tokens,
-                },
-                history,
-            }))
-        }
-        Err(e) => {
-            let error_msg = format!("{e}");
-            let _ = span.finish(
-                &miniagent_core::event::Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                },
-                Some(&error_msg),
-            );
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: error_msg }),
-            ))
-        }
-    }
-}
-
-async fn resume_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ResumeRequest>,
-) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let checkpoint_id = miniagent_core::types::CheckpointId(
-        Uuid::parse_str(&req.checkpoint_id).unwrap_or_default(),
-    );
-
-    let checkpoint = match &state.checkpoint_store {
-        Some(store) => store
-            .load(&checkpoint_id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e}") })))?,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse { error: "No checkpoint store configured".into() }),
-            ));
-        }
-    };
-
-    match checkpoint {
-        Some(ckpt) => {
-            let mut history = ckpt.history;
-            // transcript 修复：修补崩溃时可能产生的孤立 tool_use（防 API 校验错误）
-            let fixed = miniagent_core::message::validate_transcript(&mut history);
-            if fixed > 0 {
-                tracing::info!(fixed, "transcript repaired on resume");
-            }
-            history.push(AgentMessage::user(&req.prompt));
-
-            let cancel = CancellationToken::new();
-            let context = RunContext::default();
-
-            match state.agent.run(&history, &context, cancel).await {
-                Ok(delta) => {
-                    history.extend(delta.new_messages.clone());
-                    let text = delta
-                        .new_messages
-                        .iter()
-                        .map(|m| m.text_content())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    Ok(Json(RunResponse {
-                        text,
-                        stop_reason: format!("{:?}", delta.stop_reason),
-                        usage: UsageResponse {
-                            input_tokens: delta.usage.input_tokens,
-                            output_tokens: delta.usage.output_tokens,
-                        },
-                        history,
-                    }))
-                }
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: format!("{e}") }),
-                )),
-            }
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Checkpoint {checkpoint_id:?} not found") }),
-        )),
-    }
-}
-
 // ── Helpers ──
-
-fn parse_complexity(s: &str) -> TaskComplexity {
-    match s {
-        "simple" => TaskComplexity::Simple,
-        "complex" => TaskComplexity::Complex,
-        "deep" | "deep-research" => TaskComplexity::DeepResearch,
-        _ => TaskComplexity::Moderate,
-    }
-}
-
-fn parse_provider(s: &str) -> miniagent_provider::router::ProviderChoice {
-    match s {
-        "flash" => miniagent_provider::router::ProviderChoice::Flash,
-        "pro" => miniagent_provider::router::ProviderChoice::Pro,
-        _ => miniagent_provider::router::ProviderChoice::Auto,
-    }
-}
 
 fn create_new_task(state: &AppState, prompt: &str) -> (String, String, std::path::PathBuf, std::path::PathBuf) {
     let task_id = Uuid::new_v4().to_string()[..8].to_string();

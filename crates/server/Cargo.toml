@@ -10,19 +10,16 @@ miniagent-provider = { path = "../provider" }
 miniagent-agent = { path = "../agent" }
 miniagent-memory = { path = "../memory" }
 miniagent-tool = { path = "../tool" }
-miniagent-checkpoint = { path = "../checkpoint" }
 miniagent-telemetry = { path = "../telemetry" }
 miniagent-workflow = { path = "../workflow" }
 miniagent-loop-pipeline = { path = "../loop-pipeline" }
 miniagent-planning = { path = "../planning" }
 miniagent-skill = { path = "../skill" }
 miniagent-research = { path = "../research" }
-miniagent-analysis = { path = "../analysis" }
 tokio-util.workspace = true
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower-http.workspace = true
 tokio.workspace = true
-tokio-tungstenite = "0.21"
 futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true

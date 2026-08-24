@@ -17,8 +17,6 @@ use std::sync::Arc;
 pub struct PlanRunner {
     planner: Planner,
     executor: PlanExecutor,
-    /// Optional max iterations for each wave step (forwarded via the agent).
-    max_iterations: usize,
 }
 
 impl PlanRunner {
@@ -26,13 +24,7 @@ impl PlanRunner {
         Self {
             planner: Planner::new(planner_provider),
             executor: PlanExecutor::new(agent),
-            max_iterations: 50,
         }
-    }
-
-    pub fn with_max_iterations(mut self, n: usize) -> Self {
-        self.max_iterations = n;
-        self
     }
 
     fn extract_goal(input: &StageInput) -> Result<String, OrchestrationError> {

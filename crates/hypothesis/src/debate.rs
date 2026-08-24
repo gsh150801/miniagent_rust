@@ -137,12 +137,6 @@ impl HypothesisDebater {
         }
     }
 
-    /// Cap how many hypotheses are refined in one pass (default 6).
-    pub fn with_max_refine(mut self, n: usize) -> Self {
-        self.max_refine = n.max(1);
-        self
-    }
-
     /// Run the three-phase debate → compare → refine pipeline.
     pub async fn debate_and_refine(
         &self,
@@ -245,8 +239,19 @@ impl HypothesisDebater {
             }
         }
 
-        // Phase B: cross-comparison (judge = pro).
-        let comparison = self.compare(hypotheses, &verdicts, kg, cancel.clone()).await?;
+        // Phase B: cross-comparison (judge = pro). A failed comparison must
+        // not discard the per-hypothesis debate work — degrade to an empty
+        // comparison so the verdicts (and the refined set below) survive.
+        let comparison = match self.compare(hypotheses, &verdicts, kg, cancel.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "phase B cross-comparison failed — continuing with per-hypothesis verdicts only"
+                );
+                CrossComparison::default()
+            }
+        };
 
         // Phase C: refine the Revise candidates (bounded by max_refine).
         let to_refine: Vec<(Hypothesis, HypothesisVerdict)> = hypotheses
@@ -258,9 +263,19 @@ impl HypothesisDebater {
             .collect();
 
         let rounds = if to_refine.is_empty() { 1 } else { 1 + 1 };
-        let mut refined_map = self
-            .refine_batch(&to_refine, kg, cancel.clone())
-            .await?;
+        // Phase C: refinement failure degrades to "keep the debated originals
+        // with updated confidence" (the assembly loop already handles missing
+        // refined entries) instead of discarding the whole debate outcome.
+        let mut refined_map = match self.refine_batch(&to_refine, kg, cancel.clone()).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "phase C refinement failed — keeping debated originals with post-debate confidence"
+                );
+                Vec::new()
+            }
+        };
 
         // Assemble the final refined set, ordered by post-debate confidence.
         // Accept hypotheses pass through (confidence bumped to verdict value).

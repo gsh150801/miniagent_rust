@@ -70,18 +70,43 @@ impl Default for ResearchOptions {
 }
 
 /// Build the (flash, pro) provider pair from the active model profile.
-/// Panics on an unusable profile — callers validate the key first.
+/// Panics on an unusable profile — callers validate the key first
+/// (`AppConfig::require_active_key` at the top of `run_research`).
 fn make_providers(config: &AppConfig) -> (Box<dyn LlmProvider>, Box<dyn LlmProvider>) {
-    let registry = ModelRegistry::load(config);
-    let active = registry.active().clone();
-    use miniagent_provider::factory::{build_provider, ProviderTier};
-    match (
-        build_provider(&active, ProviderTier::Flash),
-        build_provider(&active, ProviderTier::Pro),
-    ) {
-        (Ok(flash), Ok(pro)) => (flash, pro),
-        (Err(e), _) | (_, Err(e)) => panic!("research pipeline: active model profile unusable: {e}"),
+    match miniagent_provider::factory::active_provider_pair(config) {
+        Ok(pair) => pair,
+        Err(e) => panic!("research pipeline: active model profile unusable: {e}"),
     }
+}
+
+/// Shared early-exit for mid-pipeline aborts (0 papers, 0 KG entities,
+/// missing debate providers, `--kg-only` completion …).
+///
+/// Goal: a run directory must NEVER end up without a user-facing final
+/// report just because a stage aborted — `write_user_report` degrades
+/// gracefully over whatever artifacts exist on disk. Persist the manifest,
+/// write both reports, and return a summary naming the stop reason.
+fn finish_partial(
+    manifest: &mut crate::ProjectManifest,
+    query: &str,
+    stop_reason: &str,
+    event_kind: &str,
+) -> String {
+    manifest.log_event(event_kind, stop_reason.to_string());
+    let _ = manifest.save();
+    let _ = manifest.write_run_report();
+    let brief = miniagent_core::paths::sanitize_task_brief(query);
+    match manifest.write_user_report(&brief) {
+        Ok(path) => println!("📁 final report (partial run): {}", path.display()),
+        Err(e) => eprintln!("⚠️  failed to write user report: {e}"),
+    }
+    format!(
+        "# Research Pipeline 已提前结束\n\n\
+         - **停止原因**：{stop_reason}\n\
+         - **部分结果报告**：`{brief}.md`（文献 / 知识图谱 / 假说等已完成章节仍可用）\n\
+         - **审计轨迹**：`project.json`（append-only 事件日志）与 `run_report.md`\n\
+         - 修复问题后重新运行同一目录即可从断点恢复（resume），已完成的阶段不会重跑。\n"
+    )
 }
 
 pub async fn run_research(
@@ -121,11 +146,6 @@ pub async fn run_research(
     use tokio_util::sync::CancellationToken;
     use std::time::Instant;
 
-    let _key = match config.require_active_key() {
-        Ok(k) => k.clone(),
-        Err(e) => { eprintln!("{e}"); return String::new(); }
-    };
-
     // The caller owns directory creation/naming (unified result/{id}_{brief}
     // scheme on both server and CLI).
     let project_dir = project_dir.to_path_buf();
@@ -153,6 +173,13 @@ pub async fn run_research(
     };
     if manifest.query != query {
         manifest.log_event("query_changed", format!("{} => {}", manifest.query, query));
+    }
+
+    // Key validation happens AFTER the manifest exists so a misconfigured
+    // environment still leaves a user-facing report explaining the stop.
+    if let Err(e) = config.require_active_key() {
+        eprintln!("{e}");
+        return finish_partial(&mut manifest, query, &format!("模型 API key 未配置：{e}"), "pipeline_aborted");
     }
 
     // dsh: append-only trajectory starts with full run attribution — model
@@ -366,9 +393,8 @@ pub async fn run_research(
             Some(serde_json::json!({ "retrieved": 0, "total_hits": total_hits })),
         );
         manifest.log_event("stage_validation_failed", "search: 0 PMIDs retrieved — aborting (check query translation / PubMed connectivity)");
-        let _ = manifest.save();
         eprintln!("\n❌ Pipeline aborted: PubMed returned 0 results. The translated query may be malformed — see project.json event_log.");
-        return String::new();
+        return finish_partial(&mut manifest, query, "PubMed 检索返回 0 篇文献（检查查询翻译 / PubMed 连通性）", "pipeline_aborted");
     }
     manifest.record_stage(
         "search",
@@ -583,9 +609,8 @@ pub async fn run_research(
             "stage_validation_failed",
             format!("kg_extraction: 0 entities from {} papers — all LLM output parses failed", paper_texts.len()),
         );
-        let _ = manifest.save();
         eprintln!("\n❌ Pipeline aborted: KG extraction produced 0 entities from {} papers. See warnings above and project.json event_log.", paper_texts.len());
-        return String::new();
+        return finish_partial(&mut manifest, query, &format!("知识图谱抽取得到 0 个实体（{0} 篇文献全部解析失败）", paper_texts.len()), "pipeline_aborted");
     }
 
     // Print KG as Mermaid
@@ -689,11 +714,7 @@ pub async fn run_research(
             phase3_dur.as_secs_f64(), total.as_secs_f64());
         println!("╚════════════════════════════════════════════════════════════╝");
         manifest.log_event("pipeline_complete_kg_only", format!("total_secs={:.1}", total.as_secs_f64()));
-        match manifest.save() {
-            Ok(path) => println!("📁 audit manifest: {}", path.display()),
-            Err(e) => println!("⚠️  failed to save project manifest: {e}"),
-        }
-        return String::new();
+        return finish_partial(&mut manifest, query, "kg-only 模式：知识图谱构建完成后按参数停止", "pipeline_complete_kg_only");
     }
 
     // ── Phase 4: Embedding & Link Prediction (resumable) ──────────
@@ -716,7 +737,7 @@ pub async fn run_research(
         // candidate generation with knowledge from previous runs. ──
         let store_path =
             std::path::PathBuf::from(std::env::var("KG_STORE_PATH").unwrap_or_else(|_| "kg_store.json".into()));
-        let mut store = miniagent_kg::KgStore::load(&store_path);
+        let store = miniagent_kg::KgStore::load(&store_path);
         if use_store && store.knowledge_graph().relation_count() > 0 {
             println!(
                   "   🗃️  KG store: {} entities / {} relations from previous runs",
@@ -1026,7 +1047,10 @@ pub async fn run_research(
             Ok((proposer, opponent, judge)) => {
                 miniagent_hypothesis::HypothesisDebater::new(proposer, opponent, judge)
             }
-            Err(e) => { eprintln!("❌ debate providers: {e}"); return String::new(); }
+            Err(e) => {
+                eprintln!("❌ debate providers: {e}");
+                return finish_partial(&mut manifest, query, &format!("辩论阶段 provider 不可用：{e}"), "pipeline_aborted");
+            }
         };
         match debater
             .debate_and_refine_with_evidence(&ranked_hyps, &kg, &evidence_map, cancel.child_token())

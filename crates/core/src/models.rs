@@ -28,8 +28,10 @@ pub enum ModelKind {
     /// MiniMax (protocol auto-detected from base_url).
     MiniMax,
     /// Any OpenAI-compatible endpoint (siliconflow, openrouter, vllm, ...).
+    #[serde(alias = "openai_compatible")]
     OpenAiCompatible,
     /// Any Anthropic Messages-compatible endpoint.
+    #[serde(alias = "anthropic_compatible")]
     AnthropicCompatible,
 }
 
@@ -229,9 +231,24 @@ impl ModelRegistry {
     pub fn load(config: &AppConfig) -> Self {
         let builtins = Self::builtin_profiles(config);
         let path = crate::paths::models_file();
+        // A malformed registry must never silently fall back to the default
+        // provider — that sends traffic to the wrong endpoint with no trace
+        // of why. Log loudly and continue with the default so the operator
+        // can fix the file.
         let file: RegistryFile = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| match serde_json::from_str::<RegistryFile>(&s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "models.json failed to parse — falling back to the default provider; \
+                         fix the file to restore custom model selection"
+                    );
+                    None
+                }
+            })
             .unwrap_or_default();
 
         let default_active = builtins
@@ -468,5 +485,21 @@ mod tests {
         let active = reg.active();
         assert!(!active.id.is_empty());
         assert!(!active.model_name.is_empty());
+    }
+
+    #[test]
+    fn model_kind_deserializes_both_spellings() {
+        // serde snake_case renders OpenAiCompatible as "open_ai_compatible";
+        // hand-written models.json files commonly use "openai_compatible".
+        // Both must deserialize (alias), or the whole registry file silently
+        // fails to parse and the default provider takes over.
+        for spelling in ["open_ai_compatible", "openai_compatible"] {
+            let v: ModelKind =
+                serde_json::from_str(&format!("\"{spelling}\"")).expect("deserializes");
+            assert_eq!(v, ModelKind::OpenAiCompatible);
+        }
+        let v: ModelKind =
+            serde_json::from_str("\"anthropic_compatible\"").expect("deserializes");
+        assert_eq!(v, ModelKind::AnthropicCompatible);
     }
 }

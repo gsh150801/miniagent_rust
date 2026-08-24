@@ -181,20 +181,6 @@ impl KnowledgeGraph {
             .unwrap_or_default()
     }
 
-    /// Query all heads for (relation_type, tail)
-    pub fn query_heads(&self, rel_type: &RelationType, tail: &EntityId) -> Vec<&EntityId> {
-        self.incoming
-            .get(tail)
-            .map(|edges| {
-                edges
-                    .iter()
-                    .filter(|(r, _, _)| r == rel_type)
-                    .map(|(_, source, _)| source)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub fn contains_edge(&self, head: &EntityId, rel_type: &RelationType, tail: &EntityId) -> bool {
         self.outgoing
             .get(head)

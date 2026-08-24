@@ -51,10 +51,6 @@ impl StageInput {
         self
     }
 
-    pub fn with_previous(mut self, prev: HashMap<NodeId, serde_json::Value>) -> Self {
-        self.previous_outputs = prev;
-        self
-    }
 }
 
 /// Side effect emitted by a stage, surfaced through `StageOutcome::side_effects`

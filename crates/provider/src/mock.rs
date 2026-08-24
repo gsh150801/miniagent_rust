@@ -18,10 +18,6 @@ impl MockProvider {
         }
     }
 
-    pub fn with_delay(mut self, ms: u64) -> Self {
-        self.delay_ms = ms;
-        self
-    }
 }
 
 #[async_trait]

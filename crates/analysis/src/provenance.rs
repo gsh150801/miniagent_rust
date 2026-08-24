@@ -78,24 +78,30 @@ pub fn record_file(path: &Path) -> Option<FileRecord> {
 /// Record every regular file under `dir` (non-recursive on top level + one
 /// shallow level for typical `figures/` / `tables/` output layouts).
 pub fn record_dir_shallow(dir: &Path) -> Vec<FileRecord> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            if let Ok(sub) = std::fs::read_dir(&p) {
-                for se in sub.flatten() {
-                    if let Some(r) = record_file(&se.path()) {
-                        out.push(r);
-                    }
+    record_dir_bounded(dir, 1)
+}
+
+/// Recursively record files up to `max_depth` directory levels below `dir`.
+///
+/// Generated analysis scripts legitimately create subdirectories (figures/,
+/// tables/) and may occasionally scatter outputs deeper when they mishandle
+/// the OUTPUT_DIR hint — provenance must capture both.
+pub fn record_dir_bounded(dir: &Path, max_depth: usize) -> Vec<FileRecord> {
+    fn walk(dir: &Path, depth_left: usize, out: &mut Vec<FileRecord>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if depth_left > 0 {
+                    walk(&p, depth_left - 1, out);
                 }
+            } else if let Some(r) = record_file(&p) {
+                out.push(r);
             }
-        } else if let Some(r) = record_file(&p) {
-            out.push(r);
         }
     }
+    let mut out = Vec::new();
+    walk(dir, max_depth, &mut out);
     out
 }
 

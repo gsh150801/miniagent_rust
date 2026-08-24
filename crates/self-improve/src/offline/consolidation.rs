@@ -4,25 +4,13 @@ use miniagent_memory::ConsolidationLevel;
 /// Sleeptime Consolidation: background memory optimization when agent is idle.
 /// Inspired by Letta Sleeptime and EngramAI.
 pub struct SleeptimeConsolidation {
-    interval_minutes: u64,
     last_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl SleeptimeConsolidation {
-    pub fn new(interval_minutes: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            interval_minutes,
             last_run: None,
-        }
-    }
-
-    pub fn should_run(&self) -> bool {
-        match self.last_run {
-            None => true,
-            Some(last) => {
-                let elapsed = chrono::Utc::now() - last;
-                elapsed.num_minutes() >= self.interval_minutes as i64
-            }
         }
     }
 
@@ -72,7 +60,7 @@ impl SleeptimeConsolidation {
 
 impl Default for SleeptimeConsolidation {
     fn default() -> Self {
-        Self::new(30)
+        Self::new()
     }
 }
 

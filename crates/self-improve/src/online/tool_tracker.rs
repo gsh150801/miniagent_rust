@@ -84,14 +84,6 @@ impl ToolReliabilityTracker {
         self.tools.get(tool_name)
     }
 
-    pub fn recommend_avoid(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|(_, r)| r.call_count >= 10 && r.success_rate < 0.5)
-            .map(|(n, _)| n.clone())
-            .collect()
-    }
-
     pub fn all(&self) -> Vec<&ToolReliability> {
         self.tools.values().collect()
     }

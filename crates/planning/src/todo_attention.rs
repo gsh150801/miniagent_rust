@@ -56,11 +56,6 @@ impl TodoAttention {
         todo
     }
 
-    pub fn with_max_items(mut self, max: usize) -> Self {
-        self.max_items = max;
-        self
-    }
-
     /// Add a new task item.
     pub fn add(&mut self, description: impl Into<String>, agent: Option<&str>, priority: u8) -> &TodoItem {
         let id = format!("t{}", self.items.len() + 1);
@@ -171,13 +166,6 @@ impl TodoAttention {
     /// Get pending items.
     pub fn pending(&self) -> Vec<&TodoItem> {
         self.items.iter().filter(|i| i.status == TodoStatus::Pending).collect()
-    }
-
-    /// Get items assigned to a specific agent.
-    pub fn for_agent(&self, agent: &str) -> Vec<&TodoItem> {
-        self.items.iter()
-            .filter(|i| i.assigned_agent.as_deref() == Some(agent))
-            .collect()
     }
 
     /// Overall progress percentage.

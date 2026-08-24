@@ -142,9 +142,6 @@ impl QLearningRouter {
         self.epsilon = (self.epsilon * 0.999).max(0.02);
     }
 
-    /// Current epsilon value (for observability).
-    pub fn current_epsilon(&self) -> f64 { self.epsilon }
-
     /// Total update steps (for observability).
     pub fn total_steps(&self) -> u64 { self.total_steps }
 

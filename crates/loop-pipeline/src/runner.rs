@@ -41,21 +41,6 @@ impl LoopRunner {
         }
     }
 
-    /// Builder-style attach for the server-side progress bridge.
-    pub fn with_progress(mut self, on_progress: ProgressFn) -> Self {
-        self.on_progress = Some(Arc::new(Mutex::new(Some(on_progress))));
-        self
-    }
-
-    /// Anchor all artifacts (dispatch outputs, checkpoints) to `dir`.
-    pub fn with_result_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.result_dir = Some(dir.into());
-        self
-    }
-
-    pub fn with_default_loops(config: Arc<AppConfig>) -> Self {
-        Self::new(config, 5)
-    }
 }
 
 #[async_trait::async_trait]

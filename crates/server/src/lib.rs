@@ -4,7 +4,6 @@ pub mod state;
 use std::sync::Arc;
 use axum::Router;
 use miniagent_agent::Agent;
-use miniagent_checkpoint::CheckpointStore;
 use miniagent_core::settings::AppConfig;
 use miniagent_memory::manager::MemoryManager;
 use state::TaskInfo;
@@ -17,7 +16,6 @@ pub struct ServerConfig {
     pub config: Arc<AppConfig>,
     pub agent: Arc<Agent>,
     pub memory: Option<MemoryManager>,
-    pub checkpoint_store: Option<CheckpointStore>,
 }
 
 impl ServerConfig {

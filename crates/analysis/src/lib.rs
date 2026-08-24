@@ -17,7 +17,7 @@ pub use geo::{clean_series_matrix, download_geo_series_matrix, geo_bucket};
 pub use notebook::{execute_notebook, jupyter_available, NotebookResult};
 pub use notebook_gen::{build_notebook, split_code_into_cells, write_notebook};
 pub use provenance::{
-    current_git_commit, preview, record_dir_shallow, record_file, sha256_hex, FileRecord,
-    ProvenanceRecord,
+    current_git_commit, preview, record_dir_bounded, record_dir_shallow, record_file,
+    sha256_hex, FileRecord, ProvenanceRecord,
 };
 pub use runner::{AnalysisResult, AnalysisRunner, RunOpts};

@@ -45,11 +45,32 @@ function setConnState(s) {
   if (txt) txt.textContent = s === 'connected' ? '已连接' : (s === 'connecting' ? '连接中...' : '已断开');
 }
 
+// Local cache of known task statuses, mirroring what the backend has reported.
+// Keyed by task_id; populated from `task_started`, `progress`, `plan`,
+// `complete`, `error` events. The middle (task list) panel reads from
+// `tasks[task_id].status`; the right (progress) panel reads from
+// `stageStatus`. Keeping this mirror lets us sync the middle panel without
+// round-tripping the whole task list on every WebSocket event.
+function syncTaskMeta(taskId, patch) {
+  if (!taskId || !patch) return;
+  const cur = tasks[taskId];
+  if (!cur) return;
+  Object.assign(cur, patch);
+  renderTaskList();
+}
+
 function handleMsg(msg) {
   switch(msg.type) {
     case 'status': addSystemMsg(msg.message); break;
     case 'task_started':
       currentTaskId = msg.task_id;
+      // Backend may have attached a status/brief snapshot — apply it so the
+      // middle panel list-item doesn't briefly show "—" before the next list
+      // refresh.
+      if (msg.task_id) syncTaskMeta(msg.task_id, {
+        status: msg.status || 'running',
+        brief: msg.brief || tasks[msg.task_id]?.brief,
+      });
       renderTaskList();
       break;
     case 'plan':
@@ -59,6 +80,9 @@ function handleMsg(msg) {
       currentPlan = { workflow: msg.workflow, stages: msg.stages };
       showPlan(msg.workflow, msg.stages);
       renderProgressView();
+      // Middle panel: a "running" task now has a plan → make sure the status
+      // pill in the list reflects that.
+      syncTaskMeta(msg.task_id, { status: 'running' });
       break;
     case 'progress':
       // Same task filter as plan: ignore progress for other tasks.
@@ -66,6 +90,7 @@ function handleMsg(msg) {
       updateStagePill(msg.stage, msg.status);
       stageStatus[msg.stage] = msg.status;
       renderProgressView();
+      syncTaskMeta(msg.task_id, { status: msg.status === 'failed' ? 'failed' : 'running' });
       break;
     case 'ask':
       // 双向 ws：后端反问用户，渲染输入框/选项卡
@@ -78,12 +103,17 @@ function handleMsg(msg) {
       stopElapsed();
       stageStatus = {};
       finishStream(msg.task_id, msg.files);
+      syncTaskMeta(msg.task_id, { status: 'completed' });
       break;
     case 'error':
       stopElapsed();
       finishStreamError(msg.message);
+      syncTaskMeta(msg.task_id, { status: 'failed' });
       break;
-    case 'tasks': tasks = msg.tasks; renderTaskList(); break;
+    case 'tasks':
+      tasks = msg.tasks;
+      renderTaskList();
+      break;
     case 'task_messages': renderHistory(msg); break;
   }
 }
@@ -99,8 +129,22 @@ function handleMsg(msg) {
 function handleAgentEvent(envelope) {
   const ev = envelope && envelope.event;
   if (!ev || !ev.type) return;
-  if (envelope.task_id && currentTaskId && envelope.task_id !== currentTaskId) return;
-  ingestAgentEvent(ev, Date.now(), true);
+  // Always feed the agent event into the local activity feed + stats so the
+  // feed reflects what the backend is emitting regardless of selection. But
+  // only re-render the right panel when this event belongs to the currently
+  // selected task — otherwise switching tasks would let unrelated events
+  // bleed into the live view of the task the user is looking at.
+  const matchesCurrent = !envelope.task_id || !currentTaskId || envelope.task_id === currentTaskId;
+  ingestAgentEvent(ev, Date.now(), matchesCurrent);
+  // Middle panel: any agent event for a known task implies it's actively
+  // running. Skip if we've already completed/failed it.
+  if (envelope.task_id && tasks[envelope.task_id]) {
+    const cur = tasks[envelope.task_id].status;
+    if (cur !== 'completed' && cur !== 'failed') {
+      tasks[envelope.task_id].status = 'running';
+      renderTaskList();
+    }
+  }
 }
 
 // Summarize tool input for display — avoid dumping huge JSON.
@@ -537,6 +581,13 @@ function renderHistory(msg) {
   el.innerHTML = '<div class="messages-inner"></div>';
   pills.innerHTML = '';
   const inner = el.querySelector('.messages-inner');
+
+  // Sync the middle panel status from the freshly-loaded task snapshot. This
+  // is the source of truth after a task completes / fails while the user was
+  // on another tab — without this the list-item stays at "running" forever.
+  if (msg.task_id && msg.status && tasks[msg.task_id]) {
+    tasks[msg.task_id].status = msg.status;
+  }
 
   if (msg.messages && msg.messages.length > 0) {
     for (const m of msg.messages) {

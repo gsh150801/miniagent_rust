@@ -29,21 +29,6 @@ impl LifecycleGuard {
         }
     }
 
-    pub fn with_baseline(mut self, score: f64) -> Self {
-        self.baseline_score = score;
-        self
-    }
-
-    pub fn with_cap(mut self, cap: usize) -> Self {
-        self.active_skill_cap = cap;
-        self
-    }
-
-    pub fn with_retirement_threshold(mut self, threshold: f64) -> Self {
-        self.retirement_threshold = threshold;
-        self
-    }
-
     /// Guard a skill change — decides whether to accept, rollback, or retire
     pub fn guard_skill_change(
         &self,
@@ -74,13 +59,6 @@ impl LifecycleGuard {
         GuardDecision::Accept
     }
 
-    /// Evaluate whether to promote a draft skill to active
-    pub fn evaluate_promotion(&self, skill: &SkillPerformance, current_active: usize) -> bool {
-        if current_active >= self.active_skill_cap {
-            return false;
-        }
-        skill.recent_score >= self.baseline_score && skill.eval_count >= 5
-    }
 }
 
 impl Default for LifecycleGuard {

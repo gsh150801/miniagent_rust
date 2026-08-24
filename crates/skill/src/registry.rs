@@ -38,23 +38,6 @@ impl SkillRegistry {
         self.skills.insert(id, bundle);
     }
 
-    pub fn unregister(&mut self, id: &SkillId) -> Option<SkillBundle> {
-        let bundle = self.skills.remove(id)?;
-
-        // Clean up indices
-        for trigger in &bundle.metadata.triggers {
-            let lower = trigger.to_lowercase();
-            if let Some(ids) = self.trigger_index.get_mut(&lower) {
-                ids.retain(|i| *i != *id);
-                if ids.is_empty() {
-                    self.trigger_index.remove(&lower);
-                }
-            }
-        }
-
-        Some(bundle)
-    }
-
     pub fn get(&self, id: &SkillId) -> Option<&SkillBundle> {
         self.skills.get(id)
     }
@@ -115,14 +98,6 @@ impl SkillRegistry {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_results);
         scored.into_iter().map(|(_, s)| s).collect()
-    }
-
-    /// Get all skills that need a specific tool.
-    pub fn skills_needing_tool(&self, tool_name: &str) -> Vec<&SkillBundle> {
-        self.tool_index
-            .get(&tool_name.to_lowercase())
-            .map(|ids| ids.iter().filter_map(|id| self.skills.get(id)).collect())
-            .unwrap_or_default()
     }
 
     pub fn all(&self) -> Vec<&SkillBundle> {

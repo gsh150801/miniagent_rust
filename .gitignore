@@ -11,7 +11,8 @@ miniagent_context/
 .miniagent-root
 .claude/
 *.py
-scripts/
+scripts/*
+!scripts/mock_llm_server.py
 *_key_findings.md
 .worktrees/
 **/.worktrees/

@@ -70,14 +70,6 @@ struct OaiMessage {
 #[serde(untagged)]
 enum OaiContent {
     Text(String),
-    MultiPart(Vec<OaiContentPart>),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OaiContentPart {
-    Text { text: String },
 }
 
 #[derive(Debug, Serialize)]

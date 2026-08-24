@@ -202,7 +202,6 @@ async fn test_incremental_run_all_success() {
     let state = WorkflowState::new();
 
     let result = wf.run_incremental(
-        None,
         tokio_util::sync::CancellationToken::new(),
         None,
         state,
@@ -233,7 +232,6 @@ async fn test_incremental_run_with_failure_and_replan() {
 
     // On failure, replan removes step2 and wires step1 → step3 directly
     let result = wf.run_incremental(
-        None,
         tokio_util::sync::CancellationToken::new(),
         None,
         state,
@@ -261,7 +259,6 @@ async fn test_incremental_run_max_loops_stops() {
     let state = WorkflowState::new();
 
     let result = wf.run_incremental(
-        None,
         tokio_util::sync::CancellationToken::new(),
         None,
         state,
@@ -301,7 +298,6 @@ async fn test_incremental_run_artifact_reuse() {
     state.mark_completed(id1, agent_output, vec![artifact_path.display().to_string()]);
 
     let result = wf.run_incremental(
-        None,
         tokio_util::sync::CancellationToken::new(),
         None,
         state,

@@ -162,69 +162,16 @@ impl Blackboard {
         self.agent.as_ref()
     }
 
-    pub fn role_dir(&self, role: &str) -> PathBuf {
-        let dir = self.work_dir.join(role);
-        std::fs::create_dir_all(&dir).ok();
-        dir
-    }
-
-    /// Grant all read/write permissions to an agent (for roles that need full FS access).
-    pub fn grant_full_access(&mut self, agent: &str) {
-        self.write_permissions.insert(agent.to_string(), vec![]);
-    }
-
-    pub fn grant_write(&mut self, agent: &str, keys: Vec<&str>) {
-        self.write_permissions.insert(agent.to_string(), keys.into_iter().map(|s| s.to_string()).collect());
-    }
-
-    pub fn can_write(&self, agent: &str, key: &str) -> bool {
-        match self.write_permissions.get(agent) {
-            Some(keys) if keys.is_empty() => true,
-            Some(keys) => keys.contains(&key.to_string()),
-            None => false,
-        }
-    }
-
-    pub fn write_artifact(&mut self, agent: &str, key: impl Into<String>, value: impl Into<String>) -> Result<(), String> {
-        let key = key.into();
-        if !self.can_write(agent, &key) {
-            return Err(format!("Agent '{agent}' lacks write permission for '{key}'"));
-        }
-        self.artifacts.insert(key.clone(), value.into());
-        Ok(())
-    }
-
     pub fn subscribe(&mut self, agent: &str, key: &str) {
         self.subscriptions.entry(key.to_string()).or_default().push(agent.to_string());
-    }
-
-    pub fn subscribers(&self, key: &str) -> Vec<&str> {
-        self.subscriptions.get(key).map(|v| v.iter().map(|s| s.as_str()).collect()).unwrap_or_default()
     }
 
     pub fn has(&self, key: &str) -> bool {
         self.artifacts.get(key).is_some_and(|v| !v.is_empty())
     }
 
-    pub fn is_new(&self, key: &str, prev_iteration: usize) -> bool {
-        self.iteration > prev_iteration && self.has(key)
-    }
-
     pub fn keys(&self) -> Vec<&str> {
         self.artifacts.keys().map(|s| s.as_str()).collect()
-    }
-
-    pub fn record_decision(&mut self, decision: DecisionRecord) {
-        self.decisions.push(decision);
-    }
-
-    pub fn last_decision(&self) -> Option<&DecisionRecord> {
-        self.decisions.last()
-    }
-
-    /// Record token usage from an LLM call.
-    pub fn record_tokens(&mut self, tokens: usize) {
-        self.budget.tokens_used += tokens;
     }
 
     /// Check if budget is exhausted.

@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use miniagent_core::config::TaskComplexity;
 use miniagent_core::types::StageId;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -122,18 +121,6 @@ impl Stage {
         self
     }
 
-    pub fn with_parallel(mut self, n: usize) -> Self {
-        self.parallel = n;
-        self
-    }
-
-    pub fn task_complexity(&self) -> TaskComplexity {
-        match self.provider {
-            ProviderSelector::Flash => TaskComplexity::Moderate,
-            ProviderSelector::Pro => TaskComplexity::Complex,
-            ProviderSelector::Auto => TaskComplexity::Moderate,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

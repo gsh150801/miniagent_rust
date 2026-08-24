@@ -35,11 +35,6 @@ impl ToolContext {
         }
     }
 
-    /// 设置 UserPrompt handler（用于 server/CLI 注入交互式实现）。
-    pub fn with_user_prompt(mut self, prompt: std::sync::Arc<dyn UserPrompt>) -> Self {
-        self.user_prompt = prompt;
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

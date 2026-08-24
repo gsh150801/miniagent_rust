@@ -254,24 +254,6 @@ fn locate_string_cols(cols: &[&str]) -> (Option<usize>, Option<usize>, Option<us
     (Some(a.unwrap_or(2)), Some(b.unwrap_or(3)), s.or(Some(5)))
 }
 
-/// Fetch protein–protein interactions from STRING for the given gene/protein
-/// identifiers and return them as interaction triples.
-pub async fn fetch_string_interactions(
-    client: &reqwest::Client,
-    genes: &[String],
-    species: u32,
-    required_score: u32,
-    score_threshold: f64,
-) -> Result<Vec<ExternalTriple>, reqwest::Error> {
-    if genes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let url = string_network_url(genes, species, required_score);
-    let resp = client.get(&url).send().await?.error_for_status()?;
-    let body = resp.text().await?;
-    Ok(parse_string_response(&body, score_threshold))
-}
-
 // ── Merge into KnowledgeGraph ──────────────────────────────────────────────
 
 /// Merge external triples into `kg`, deduplicating entities by (case-insensitive)

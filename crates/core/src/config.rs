@@ -1,28 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::budget::Budget;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
-    pub inference: InferenceConfig,
-    pub budget: Budget,
-    pub checkpoint_interval: Option<usize>, // steps
-    pub max_tool_iterations: usize,
-    pub enable_streaming: bool,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            inference: InferenceConfig::default(),
-            budget: Budget::default(),
-            checkpoint_interval: Some(5),
-            max_tool_iterations: 25,
-            enable_streaming: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct InferenceConfig {

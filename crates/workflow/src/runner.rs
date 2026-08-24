@@ -6,12 +6,10 @@
 //! loop-pipeline driver can hold a `Box<dyn StageDriver>` and pick at runtime.
 
 use crate::engine::Workflow;
-use crate::stage::{StageContext, StageMetadata, StageOutput};
+use crate::stage::{StageMetadata, StageOutput};
 use miniagent_core::orchestration::{
     OrchestrationError, ProgressFn, StageDriver, StageInput, StageOutcome,
 };
-use miniagent_core::types::StageId;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Adapter wrapping a [`Workflow`] (DAG runner) so it implements
@@ -35,23 +33,12 @@ impl DagRunner {
         }
     }
 
-    /// Builder-style attach for the server-side progress bridge. Wraps the
-    /// callback in `Arc<Mutex<Option<_>>>` so successive `StageDriver::run`
-    /// calls (e.g. retries) all share the same callback instance.
-    pub fn with_progress(mut self, on_progress: ProgressFn) -> Self {
-        self.on_progress = Some(Arc::new(Mutex::new(Some(on_progress))));
-        self
-    }
-
     /// Borrow the underlying workflow for callers that still need the rich
     /// DAG-specific API (e.g. `run_with_progress` for streaming).
     pub fn workflow(&self) -> &Workflow {
         &self.workflow
     }
 
-    pub fn into_workflow(self) -> Workflow {
-        self.workflow
-    }
 }
 
 #[async_trait::async_trait]
@@ -68,9 +55,9 @@ impl StageDriver for DagRunner {
         let cancel = input.cancel.clone();
         let on_progress = self.take_progress_fn();
         let result = if let Some(cb) = on_progress {
-            self.workflow.run_with_progress(None, cancel, cb).await?
+            self.workflow.run_with_progress(cancel, cb).await?
         } else {
-            self.workflow.run(None, cancel).await?
+            self.workflow.run(cancel).await?
         };
 
         // Collect per-stage outputs into a JSON map (the unified `data` shape)
@@ -123,19 +110,6 @@ impl DagRunner {
     }
 }
 
-/// Free helper: turn a [`StageInput`] into a [`StageContext`] for code that
-/// still operates on the workflow-native trait. Provided for the migration
-/// path; new code should use the [`StageDriver`] abstraction instead.
-///
-/// Note: `StageId` is a Uuid wrapper, so we synthesize one from the input id.
-pub fn stage_input_to_context(input: &StageInput) -> StageContext {
-    let stage_id = StageId(uuid::Uuid::new_v4());
-    let previous: HashMap<StageId, serde_json::Value> =
-        HashMap::with_capacity(input.previous_outputs.len());
-    let _ = previous; // (StageId conversion is lossy; round-trip is best-effort)
-    StageContext::new(stage_id, input.input.clone(), HashMap::new(), input.cancel.clone())
-}
-
 /// Reverse helper: turn a workflow [`StageOutput`] into a unified [`StageOutcome`].
 pub fn stage_output_to_outcome(stage_id: &str, output: &StageOutput) -> StageOutcome {
     let data = serde_json::json!({
@@ -174,7 +148,7 @@ mod tests {
         }
         async fn execute(
             &self,
-            _ctx: &StageContext,
+            _ctx: &crate::stage::StageContext,
         ) -> Result<StageOutput, StageError> {
             Ok(StageOutput {
                 data: serde_json::json!({"noop": true}),

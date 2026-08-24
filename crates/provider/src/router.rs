@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use miniagent_core::config::{InferenceConfig, TaskComplexity};
+use miniagent_core::config::TaskComplexity;
 use miniagent_core::error::AgentError;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -10,7 +10,6 @@ use crate::traits::{CompletionRequest, CompletionResponse, LlmProvider, StreamRe
 pub struct ProviderRouter {
     flash: Arc<dyn LlmProvider>,
     pro: Arc<dyn LlmProvider>,
-    default: ProviderChoice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,13 +38,7 @@ impl ProviderRouter {
         Self {
             flash,
             pro,
-            default: ProviderChoice::Auto,
         }
-    }
-
-    pub fn with_default(mut self, choice: ProviderChoice) -> Self {
-        self.default = choice;
-        self
     }
 
     pub fn select(&self, complexity: TaskComplexity, force: Option<ProviderChoice>) -> &dyn LlmProvider {
@@ -112,29 +105,3 @@ impl ProviderRouter {
 
 // ── Composite implementations for Agent convenience ──────────
 
-/// Configuration-aware inference that auto-selects Flash vs Pro
-pub async fn routed_complete(
-    router: &ProviderRouter,
-    system: &str,
-    messages: &[miniagent_core::message::Message],
-    complexity: TaskComplexity,
-    force: Option<ProviderChoice>,
-    cancel: CancellationToken,
-) -> Result<CompletionResponse, AgentError> {
-    let provider = router.select(complexity, force);
-    let config = match complexity {
-        TaskComplexity::Simple => InferenceConfig::flash(),
-        TaskComplexity::Moderate => InferenceConfig::flash(),
-        TaskComplexity::Complex => InferenceConfig::pro(),
-        TaskComplexity::DeepResearch => InferenceConfig::pro_deep(),
-    };
-
-    let request = CompletionRequest {
-        system: system.to_string(),
-        messages: messages.to_vec(),
-        tools: vec![],
-        config,
-    };
-
-    provider.complete(&request, cancel).await
-}

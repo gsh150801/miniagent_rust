@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use miniagent_checkpoint::CheckpointStore;
-use miniagent_core::checkpoint::Checkpoint;
 use miniagent_core::error::AgentError;
 use miniagent_core::secrets::ApiKey;
-use miniagent_core::types::{ProjectId, RunId, StageId, StepId};
+use miniagent_core::types::{RunId, StageId};
 use tokio_util::sync::CancellationToken;
 
 use crate::retry::RetryPolicy;
@@ -17,9 +15,7 @@ pub struct Workflow {
     pub name: String,
     pub stages: Vec<Stage>,
     pub edges: Vec<(StageId, StageId)>,
-    checkpoint_interval: usize,
     retry_policy: RetryPolicy,
-    project_id: Option<ProjectId>,
     initial_input: serde_json::Value,
     task_dir: Option<String>,
     config: Option<std::sync::Arc<miniagent_core::settings::AppConfig>>,
@@ -31,9 +27,7 @@ impl Workflow {
             name: name.into(),
             stages: Vec::new(),
             edges: Vec::new(),
-            checkpoint_interval: 5,
             retry_policy: RetryPolicy::default(),
-            project_id: None,
             initial_input: serde_json::Value::Null,
             task_dir: None,
             config: None,
@@ -52,21 +46,6 @@ impl Workflow {
 
     pub fn add_edge(mut self, from: StageId, to: StageId) -> Self {
         self.edges.push((from, to));
-        self
-    }
-
-    pub fn with_checkpoint_interval(mut self, n: usize) -> Self {
-        self.checkpoint_interval = n;
-        self
-    }
-
-    pub fn with_retry(mut self, policy: RetryPolicy) -> Self {
-        self.retry_policy = policy;
-        self
-    }
-
-    pub fn with_project(mut self, project_id: ProjectId) -> Self {
-        self.project_id = Some(project_id);
         self
     }
 
@@ -131,14 +110,12 @@ impl Workflow {
     /// in wave N complete.
     async fn run_inner(
         &self,
-        checkpoint_store: Option<&CheckpointStore>,
         cancel: CancellationToken,
         mut on_progress: Option<Box<dyn FnMut(&str, &str, Option<&serde_json::Value>) + Send>>,
     ) -> Result<WorkflowResult, AgentError> {
         let waves = self.topological_waves().map_err(AgentError::invalid_config)?;
         let run_id = RunId::new();
         let mut outputs: HashMap<StageId, StageOutput> = HashMap::new();
-        let mut step_count = 0;
 
         for (wave_idx, wave) in waves.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -226,12 +203,6 @@ impl Workflow {
                 }
             }
 
-            // Checkpoint after each wave
-            step_count += wave.len();
-            let last_stage_name = wave.last()
-                .map(|&idx| self.stages[idx].name.as_str())
-                .unwrap_or("unknown");
-            self.maybe_checkpoint(checkpoint_store, run_id, step_count, last_stage_name);
         }
 
         let total_stages: usize = waves.iter().map(|w| w.len()).sum();
@@ -252,7 +223,6 @@ impl Workflow {
     /// stages whose artifacts are intact.
     pub async fn run_incremental(
         &mut self,
-        checkpoint_store: Option<&CheckpointStore>,
         cancel: CancellationToken,
         mut on_progress: Option<Box<dyn FnMut(&str, &str, Option<&serde_json::Value>) + Send>>,
         mut state: WorkflowState,
@@ -272,9 +242,7 @@ impl Workflow {
             }
 
             let waves = self.topological_waves().map_err(AgentError::invalid_config)?;
-            let run_id = RunId::new();
             let mut outputs: HashMap<StageId, StageOutput> = state.completed_stages.clone();
-            let mut step_count = outputs.len();
             let mut any_failure = false;
 
             for (wave_idx, wave) in waves.iter().enumerate() {
@@ -389,10 +357,6 @@ impl Workflow {
                     break;
                 }
 
-                step_count += pending_wave.len();
-                let last_idx = *pending_wave.last().unwrap_or(&0);
-                let last_name = self.stages.get(last_idx).map(|s| s.name.as_str()).unwrap_or("unknown");
-                self.maybe_checkpoint(checkpoint_store, run_id, step_count, last_name);
             }
 
             // If no failures, we're done
@@ -591,19 +555,17 @@ impl Workflow {
 
     pub async fn run_with_progress(
         &self,
-        checkpoint_store: Option<&CheckpointStore>,
         cancel: CancellationToken,
         on_progress: Box<dyn FnMut(&str, &str, Option<&serde_json::Value>) + Send + 'static>,
     ) -> Result<WorkflowResult, AgentError> {
-        self.run_inner(checkpoint_store, cancel, Some(on_progress)).await
+        self.run_inner(cancel, Some(on_progress)).await
     }
 
     pub async fn run(
         &self,
-        checkpoint_store: Option<&CheckpointStore>,
         cancel: CancellationToken,
     ) -> Result<WorkflowResult, AgentError> {
-        self.run_inner(checkpoint_store, cancel, None).await
+        self.run_inner(cancel, None).await
     }
 
     fn build_stage_input(&self, stage: &Stage) -> serde_json::Value {
@@ -630,27 +592,6 @@ impl Workflow {
                 input["task_dir"] = serde_json::json!(task_dir);
             }
             input
-        }
-    }
-
-    fn maybe_checkpoint(
-        &self,
-        store: Option<&CheckpointStore>,
-        run_id: RunId,
-        step_count: usize,
-        stage_name: &str,
-    ) {
-        if step_count.is_multiple_of(self.checkpoint_interval)
-            && let (Some(store), Some(pid)) = (store, self.project_id)
-        {
-            let ckpt = Checkpoint::new(run_id, StepId::new(), step_count, vec![])
-                .with_project(pid)
-                .with_progress(serde_json::json!({
-                    "completed_stages": step_count,
-                    "total_stages": self.stages.len(),
-                    "last_stage": stage_name,
-                }));
-            let _ = store.save(&ckpt);
         }
     }
 

@@ -65,12 +65,25 @@ pub fn build_provider(profile: &ModelProfile, tier: ProviderTier) -> Result<Box<
     Ok(provider)
 }
 
-/// Build the (flash, pro) pair used by `Agent::new` / `Agent::replace_providers`.
+/// Build the (flash, pro) provider pair used by `Agent::new` / `Agent::replace_providers`.
 pub fn build_provider_pair(
     profile: &ModelProfile,
 ) -> Result<(Arc<dyn LlmProvider>, Arc<dyn LlmProvider>), String> {
     let flash: Arc<dyn LlmProvider> = build_provider(profile, ProviderTier::Flash)?.into();
     let pro: Arc<dyn LlmProvider> = build_provider(profile, ProviderTier::Pro)?.into();
+    Ok((flash, pro))
+}
+
+/// Build the boxed (flash, pro) pair for the *active* profile of the runtime
+/// registry loaded from `config`. Single replacement for the `make_providers`
+/// helpers that used to be duplicated across the CLI and research pipeline.
+pub fn active_provider_pair(
+    config: &AppConfig,
+) -> Result<(Box<dyn LlmProvider>, Box<dyn LlmProvider>), String> {
+    let registry = ModelRegistry::load(config);
+    let active = registry.active().clone();
+    let flash = build_provider(&active, ProviderTier::Flash)?;
+    let pro = build_provider(&active, ProviderTier::Pro)?;
     Ok((flash, pro))
 }
 

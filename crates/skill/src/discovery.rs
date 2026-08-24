@@ -18,11 +18,6 @@ impl SkillDiscovery {
         }
     }
 
-    pub fn with_dir(mut self, dir: impl Into<String>) -> Self {
-        self.skill_dirs.push(dir.into());
-        self
-    }
-
     /// Scan all configured directories for SKILL.md files.
     pub fn discover(&self) -> Vec<SkillBundle> {
         let mut bundles = Vec::new();
@@ -80,25 +75,6 @@ impl SkillDiscovery {
         self.load_skill_file(Path::new(path))
     }
 
-    /// List all discovered skill files without parsing them.
-    pub fn list_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        for dir in &self.skill_dirs {
-            let path = Path::new(dir);
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_dir() {
-                        let skill_file = entry_path.join("SKILL.md");
-                        if skill_file.exists() {
-                            files.push(skill_file.display().to_string());
-                        }
-                    }
-                }
-            }
-        }
-        files
-    }
 }
 
 impl Default for SkillDiscovery {

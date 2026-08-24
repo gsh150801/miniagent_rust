@@ -135,7 +135,7 @@ dependencies = [
  "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -187,12 +187,6 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -973,11 +967,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "miniagent-checkpoint",
  "miniagent-core",
  "miniagent-memory",
  "miniagent-provider",
- "miniagent-self-improve",
  "miniagent-tool",
  "serde",
  "serde_json",
@@ -1008,19 +1000,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miniagent-checkpoint"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "miniagent-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "miniagent-cli"
 version = "0.1.0"
 dependencies = [
@@ -1029,11 +1008,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "miniagent-agent",
- "miniagent-analysis",
- "miniagent-checkpoint",
  "miniagent-core",
- "miniagent-hypothesis",
- "miniagent-kg",
  "miniagent-loop-pipeline",
  "miniagent-memory",
  "miniagent-planning",
@@ -1062,7 +1037,7 @@ dependencies = [
  "dotenvy",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1092,9 +1067,6 @@ name = "miniagent-kg"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "miniagent-core",
- "miniagent-memory",
- "miniagent-provider",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -1115,7 +1087,6 @@ dependencies = [
  "miniagent-agent",
  "miniagent-core",
  "miniagent-provider",
- "miniagent-skill",
  "miniagent-tool",
  "miniagent-workflow",
  "serde",
@@ -1153,11 +1124,8 @@ dependencies = [
  "miniagent-agent",
  "miniagent-core",
  "miniagent-provider",
- "miniagent-skill",
- "miniagent-tool",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1182,17 +1150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miniagent-python"
-version = "0.1.0"
-dependencies = [
- "miniagent-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "miniagent-research"
 version = "0.1.0"
 dependencies = [
@@ -1213,17 +1170,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "miniagent-sandbox"
-version = "0.1.0"
-dependencies = [
- "miniagent-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1253,8 +1199,6 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "miniagent-agent",
- "miniagent-analysis",
- "miniagent-checkpoint",
  "miniagent-core",
  "miniagent-loop-pipeline",
  "miniagent-memory",
@@ -1268,7 +1212,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tower-http",
  "tracing",
@@ -1282,7 +1225,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "miniagent-core",
- "miniagent-self-improve",
  "miniagent-tool",
  "serde",
  "serde_json",
@@ -1335,12 +1277,9 @@ dependencies = [
  "chrono",
  "futures-util",
  "miniagent-agent",
- "miniagent-checkpoint",
  "miniagent-core",
- "miniagent-memory",
  "miniagent-provider",
  "miniagent-skill",
- "miniagent-tool",
  "regex-lite",
  "serde",
  "serde_json",
@@ -2016,31 +1955,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.18",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -2113,18 +2032,6 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c83b561d025642014097b66e6c1bb422783339e0909e4429cde4749d1990bc38"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite 0.21.0",
-]
-
-[[package]]
-name = "tokio-tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
@@ -2132,7 +2039,7 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite 0.29.0",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2278,25 +2185,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ef1a641ea34f399a848dea702823bbecfb4c486f911735368f1f137cb8257e1"
-dependencies = [
- "byteorder",
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.8.6",
- "sha1",
- "thiserror 1.0.69",
- "url",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
@@ -2308,7 +2196,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1",
- "thiserror 2.0.18",
+ "thiserror",
 ]
 
 [[package]]
@@ -2346,12 +2234,6 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
-
-[[package]]
-name = "utf-8"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"

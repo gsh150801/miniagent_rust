@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use dashmap::DashMap;
-use miniagent_agent::Agent;
-use miniagent_checkpoint::CheckpointStore;
+use miniagent_agent::{Agent, EventSenderGuard};
 use miniagent_core::models::ModelRegistry;
 use miniagent_core::settings::AppConfig;
 use miniagent_memory::manager::MemoryManager;
@@ -13,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 pub struct AppState {
     pub agent: Arc<Agent>,
     pub memory: Option<Arc<MemoryManager>>,
-    pub checkpoint_store: Option<Arc<CheckpointStore>>,
     pub tasks: Arc<DashMap<String, TaskInfo>>,
     pub task_dir: PathBuf,
     pub config: Arc<AppConfig>,
@@ -25,6 +23,12 @@ pub struct AppState {
     /// Per-task ask reply channels: 当 task 执行需要向用户提问时，注册一个 oneshot::Sender；
     /// 前端回复 {type:'ask_reply'} 时，handle_ws 取出 Sender 并 send(answer) 唤醒 task。
     pub asks: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// Per-task event-sender RAII guards. Each running task registers its
+    /// own broadcast sender via `Agent::register_event_sender`; the guard
+    /// is stored here and removed (dropped) on completion / cancel so the
+    /// shared `Agent`'s event list does not grow without bound and a
+    /// finished task no longer receives events.
+    pub event_guards: Arc<DashMap<String, EventSenderGuard>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,13 +65,13 @@ impl AppState {
         Self {
             agent,
             memory: None,
-            checkpoint_store: None,
             tasks: Arc::new(DashMap::new()),
             task_dir: miniagent_core::paths::result_root(),
             config,
             models: Arc::new(std::sync::RwLock::new(models)),
             cancels: Arc::new(DashMap::new()),
             asks: Arc::new(DashMap::new()),
+            event_guards: Arc::new(DashMap::new()),
         }
     }
 

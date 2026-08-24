@@ -159,33 +159,6 @@ pub fn memory_to_record(mem: &ExtractedMemory) -> EpisodicRecord {
     }
 }
 
-/// 完整的记忆提取+存储流程。
-///
-/// 从对话提取记忆 → 转为 EpisodicRecord → 存入 MemoryManager。
-/// 返回存储的记忆数量。
-pub async fn extract_and_store(
-    provider: &dyn LlmProvider,
-    messages: &[Message],
-    manager: &crate::manager::MemoryManager,
-    cancel: CancellationToken,
-) -> Result<usize, AgentError> {
-    let memories = extract_memories(provider, messages, cancel).await?;
-    let count = memories.len();
-
-    for mem in &memories {
-        let record = memory_to_record(mem);
-        if let Err(e) = manager.store(&record) {
-            tracing::error!(error = %e, memory_type = %mem.memory_type, "failed to store extracted memory");
-        }
-    }
-
-    if count > 0 {
-        tracing::info!(count, "extracted and stored memories from conversation");
-    }
-
-    Ok(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,23 +58,4 @@ pub fn defaults() -> ToolRegistry {
     registry
 }
 
-/// 构造带知识图谱能力的默认工具集。
-///
-/// `handle` 在所有 KG 工具间共享同一份 `KnowledgeGraph`。
-/// 若 `provider` 为 `Some`，`hypothesis_suggest` 会进一步用 LLM 生成
-/// 完整假设；否则仅返回基于 link prediction 的结构化候选。
-pub fn defaults_with_kg(
-    handle: KgHandle,
-    provider: Option<std::sync::Arc<dyn miniagent_provider::traits::LlmProvider>>,
-) -> ToolRegistry {
-    let mut registry = defaults();
-    registry.register(KgQueryTool::new(handle.clone()));
-    registry.register(KgAddTool::new(handle.clone()));
-    registry.register(match provider {
-        Some(p) => HypothesisSuggestTool::with_provider(handle, p),
-        None => HypothesisSuggestTool::new(handle),
-    });
-    registry
-}
-
 

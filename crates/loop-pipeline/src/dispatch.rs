@@ -412,8 +412,17 @@ impl PipelineStage for DispatchStage {
                 .filter_map(|id| plan.tasks.iter().find(|t| &t.id == id))
                 .collect();
 
-            // Execute wave tasks in parallel via tokio::spawn
-            // Each task reuses the shared Arc<Agent> — no rebuilding
+            // Execute wave tasks in parallel via tokio::spawn; each task
+            // reuses the shared Arc<Agent> — no rebuilding.
+            //
+            // A shared semaphore caps how many spawned tasks hit the LLM
+            // provider at once (`loop_dispatch_wave_concurrency`, default 4):
+            // a wide wave must not trigger 429 storms or spike runtime
+            // memory. Spawn (not a bare FuturesUnordered) keeps panic
+            // isolation via JoinError handling below.
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                ctx.config.loop_dispatch_wave_concurrency.max(1),
+            ));
             let mut handles = Vec::new();
             for task in &wave_tasks {
                 // ── 缺陷 #1 修复：跳过已成功且产物仍存在的任务 ──
@@ -448,15 +457,22 @@ impl PipelineStage for DispatchStage {
                 let wave_ctx = wave_context.clone();
                 let max_tool_iters = ctx.config.loop_dispatch_max_iterations;
                 let working_dir = ctx.working_dir.clone();
+                let semaphore = semaphore.clone();
 
                 handles.push(tokio::spawn(async move {
+                    // Acquire a permit before touching the provider; the
+                    // semaphore is never closed, so this only waits.
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .expect("dispatch semaphore closed");
                     execute_single_task(
                         task, agent, cancel, wave_ctx, max_tool_iters, working_dir,
                     ).await
                 }));
             }
 
-            // Collect results from all tasks in this wave
+            // Collect results from all tasks in this wave.
             for handle in handles {
                 match handle.await {
                     Ok(result) => {

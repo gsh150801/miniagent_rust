@@ -87,9 +87,6 @@ impl WhitelistApproval {
         Self::new(WhitelistMode::AcceptEdits)
     }
 
-    pub fn non_interactive() -> Self {
-        Self::new(WhitelistMode::NonInteractive)
-    }
 }
 
 #[async_trait]

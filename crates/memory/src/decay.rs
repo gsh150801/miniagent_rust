@@ -18,11 +18,6 @@ impl MemoryDecay {
         retention + lost * (-decay_rate * days_since_access).exp()
     }
 
-    /// Activation boost when a memory is recalled (use-it-or-lose-it).
-    pub fn activation_boost(strength: f64, boost: f64, max_strength: f64) -> f64 {
-        (strength + boost).min(max_strength)
-    }
-
     /// Default decay rates by memory type.
     pub fn default_rate(memory_type: &str) -> f64 {
         match memory_type {

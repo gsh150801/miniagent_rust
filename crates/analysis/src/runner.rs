@@ -22,7 +22,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::provenance::{
-    current_git_commit, preview, record_dir_shallow, record_file, sha256_hex, FileRecord,
+    current_git_commit, preview, record_dir_bounded, record_file, sha256_hex, FileRecord,
     ProvenanceRecord,
 };
 
@@ -393,7 +393,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
         };
 
         let resp = self.provider.complete(&request, cancel.clone()).await?;
-        let mut text = resp
+        let text = resp
             .content
             .iter()
             .filter_map(|b| match b {
@@ -465,7 +465,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             .iter()
             .filter_map(|p| record_file(p))
             .collect();
-        let outputs = record_dir_shallow(task_dir)
+        let outputs = record_dir_bounded(task_dir, 6)
             .into_iter()
             .filter(|r| r.path != script_path && Some(r.path.as_path()) != notebook_path)
             .collect();
@@ -684,10 +684,29 @@ fn read_data_preview(path: Option<&Path>) -> String {
 }
 
 fn collect_outputs(task_dir: &Path, script: &Path, notebook: &Path) -> Vec<PathBuf> {
-    record_dir_shallow(task_dir)
+    // Bounded recursive walk: generated scripts legitimately create
+    // subdirectories (figures/, tables/), and a script that mis-handles the
+    // OUTPUT_DIR hint can scatter files several levels deep — either way the
+    // deliverables must still be tracked for provenance.
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(task_dir, 0, &mut files);
+    files
         .into_iter()
-        .filter(|r| r.path != script && r.path != notebook)
-        .map(|r| r.path)
+        .filter(|p| p != script && p != notebook)
         .collect()
 }
 

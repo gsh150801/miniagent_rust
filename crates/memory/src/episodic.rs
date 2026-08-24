@@ -239,27 +239,6 @@ impl EpisodicMemory {
         Ok(results)
     }
 
-    pub fn link_relation(&self, relation: &Relation) -> Result<(), rusqlite::Error> {
-        let conn = self.conn_guard()?;
-        let rel_type = match &relation.relation_type {
-            RelationType::Custom(s) => s.clone(),
-            _ => format!("{:?}", relation.relation_type).to_lowercase(),
-        };
-        conn.execute(
-            "INSERT OR REPLACE INTO relations (from_id, to_id, relation_type, strength, evidence, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                relation.from_id.to_string(),
-                relation.to_id.to_string(),
-                rel_type,
-                relation.strength,
-                relation.evidence,
-                relation.created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn query_relations(
         &self,
         id: &uuid::Uuid,

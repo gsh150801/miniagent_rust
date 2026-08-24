@@ -17,15 +17,9 @@ use tokio_util::sync::CancellationToken;
 /// 注册表 = .env 内置档案（deepseek/stepfun/minimax）+ models.json 自定义档案。
 /// 所有 CLI 命令应通过此函数获取 provider —— 代码中不出现硬编码模型名。
 fn make_providers(config: &AppConfig) -> (Box<dyn LlmProvider>, Box<dyn LlmProvider>) {
-    let registry = miniagent_core::models::ModelRegistry::load(config);
-    let active = registry.active().clone();
-    use miniagent_provider::factory::{build_provider, ProviderTier};
-    match (
-        build_provider(&active, ProviderTier::Flash),
-        build_provider(&active, ProviderTier::Pro),
-    ) {
-        (Ok(flash), Ok(pro)) => (flash, pro),
-        (Err(e), _) | (_, Err(e)) => {
+    match miniagent_provider::factory::active_provider_pair(config) {
+        Ok(pair) => pair,
+        Err(e) => {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
@@ -222,17 +216,6 @@ enum Commands {
     /// Show current configuration
     Config,
 
-    /// Project management
-    Project {
-        #[command(subcommand)]
-        action: ProjectAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProjectAction {
-    Create { name: String },
-    List,
 }
 
 #[derive(Subcommand)]
@@ -359,14 +342,6 @@ async fn main() {
         Commands::Config => {
             show_config(&config);
         }
-        Commands::Project { action } => match action {
-            ProjectAction::Create { name } => {
-                println!("Project '{name}' created. Use 'miniagent research' or 'miniagent run' within this project.");
-            }
-            ProjectAction::List => {
-                println!("Projects: (use filesystem-based organization under ./projects/)");
-            }
-        },
     }
 }
 
@@ -731,7 +706,7 @@ async fn run_command(
     };
 
     // Execute via workflow engine
-    match workflow.run(None, cancel).await {
+    match workflow.run(cancel).await {
         Ok(result) => {
             for output in result.stage_outputs.values() {
                 let data = &output.data;

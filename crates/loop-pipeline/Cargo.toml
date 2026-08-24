@@ -9,7 +9,6 @@ miniagent-core = { path = "../core" }
 miniagent-provider = { path = "../provider" }
 miniagent-agent = { path = "../agent" }
 miniagent-tool = { path = "../tool" }
-miniagent-skill = { path = "../skill" }
 miniagent-workflow = { path = "../workflow" }
 serde.workspace = true
 serde_json.workspace = true

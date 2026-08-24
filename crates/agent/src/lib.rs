@@ -1,26 +1,20 @@
 pub mod context;
-pub mod hooks;
 pub mod agent_tool;
 
 use std::sync::Arc;
 
-use miniagent_checkpoint::CheckpointStore;
-use miniagent_core::checkpoint::Checkpoint;
 use miniagent_core::config::{InferenceConfig, TaskComplexity};
 use miniagent_core::error::AgentError;
 use miniagent_core::event::{AgentEvent, ContentBlock, StopReason, Usage};
 use miniagent_core::message::Message;
-use miniagent_core::types::{RunId, StepId};
+use miniagent_core::types::RunId;
 use miniagent_memory::manager::MemoryManager;
 use miniagent_memory::ConsolidationLevel;
 use miniagent_provider::router::ProviderRouter;
 use miniagent_provider::traits::{CompletionRequest, LlmProvider, ToolDef};
-use miniagent_self_improve::SelfImprover;
 use miniagent_tool::executor::{ToolCallRequest, ToolExecutor};
 use miniagent_tool::traits::ToolContext;
 use tokio_util::sync::CancellationToken;
-
-use crate::hooks::{HookAction, HookEvent, HookRegistry};
 
 pub use context::RunContext;
 
@@ -54,11 +48,8 @@ pub struct Agent {
     /// 在 Arc<Agent> 上调用 replace_tools 而不需要 &mut self）。
     tool_executor: Arc<std::sync::Mutex<Option<Arc<ToolExecutor>>>>,
     memory: Option<Arc<MemoryManager>>,
-    checkpoint_store: Option<Arc<CheckpointStore>>,
-    self_improver: Option<Arc<tokio::sync::Mutex<SelfImprover>>>,
-    hooks: Option<Arc<HookRegistry>>,
     config: Option<Arc<miniagent_core::settings::AppConfig>>,
-    event_sender: Option<Arc<tokio::sync::Mutex<Option<tokio::sync::broadcast::Sender<AgentEvent>>>>>,
+    event_sender: Option<Arc<tokio::sync::Mutex<Vec<tokio::sync::broadcast::Sender<AgentEvent>>>>>,
     sub_agent_rx: Option<std::sync::Mutex<tokio::sync::broadcast::Receiver<AgentEvent>>>,
 }
 
@@ -87,9 +78,6 @@ impl Agent {
             provider_router: Arc::new(std::sync::RwLock::new(ProviderRouter::new(flash, pro))),
             tool_executor: Arc::new(std::sync::Mutex::new(None)),
             memory: None,
-            checkpoint_store: None,
-            self_improver: None,
-            hooks: None,
             config: None,
             event_sender: None,
             sub_agent_rx: None,
@@ -122,21 +110,6 @@ impl Agent {
         self
     }
 
-    pub fn with_checkpoints(mut self, store: CheckpointStore) -> Self {
-        self.checkpoint_store = Some(Arc::new(store));
-        self
-    }
-
-    pub fn with_self_improver(mut self, improver: SelfImprover) -> Self {
-        self.self_improver = Some(Arc::new(tokio::sync::Mutex::new(improver)));
-        self
-    }
-
-    pub fn with_hooks(mut self, registry: HookRegistry) -> Self {
-        self.hooks = Some(Arc::new(registry));
-        self
-    }
-
     /// Attach an `AppConfig` so runtime parameters (history limits, error
     /// thresholds, etc.) are read from `.env` instead of compiled-in defaults.
     pub fn with_config(mut self, config: Arc<miniagent_core::settings::AppConfig>) -> Self {
@@ -163,10 +136,6 @@ impl Agent {
         self.config.as_ref()
             .map(|c| c.agent_max_consecutive_errors)
             .unwrap_or(MAX_CONSECUTIVE_ERRORS)
-    }
-
-    pub fn self_improver(&self) -> Option<&tokio::sync::Mutex<SelfImprover>> {
-        self.self_improver.as_deref()
     }
 
     /// Owned provider handles (safe to hold across `.await`).
@@ -261,28 +230,48 @@ impl Agent {
         })
     }
 
-    /// Run registered hooks for a given event. Returns the action to take.
-    async fn run_hooks(&self, event: HookEvent, data: serde_json::Value, run_id: RunId, iteration: usize) -> HookAction {
-        let Some(ref registry) = self.hooks else { return HookAction::Continue };
-        registry.run_hooks(event, data, format!("{}", run_id.0), iteration).await
-    }
-
-    /// Fire-and-forget event emission to the optional broadcast channel.
+    /// Fire-and-forget event emission to every registered broadcast sender.
+    ///
+    /// Multiple consumers can subscribe concurrently (e.g. one WebSocket per
+    /// running task); each gets its own cloned sender so a slow or dropped
+    /// consumer does not steal events from the others.
     pub async fn emit_event(&self, event: AgentEvent) {
         if let Some(ref inner) = self.event_sender {
-            let sender_guard = inner.lock().await;
-            if let Some(ref sender) = *sender_guard {
-                let _ = sender.send(event);
+            let guard = inner.lock().await;
+            for sender in guard.iter() {
+                let _ = sender.send(event.clone());
             }
         }
     }
 
-    /// Set the broadcast sender so external consumers receive events.
-    /// This is intended to be called once at server startup before any run.
-    pub async fn set_event_sender(&self, sender: tokio::sync::broadcast::Sender<AgentEvent>) {
+    /// Register a new broadcast sender and return a guard that removes it
+    /// when dropped. Each call returns an independent sender, so concurrent
+    /// runs no longer clobber each other's event streams.
+    ///
+    /// The guard's `Drop` impl is best-effort: it locks the inner vec and
+    /// removes its sender. If the runtime is already shutting down, the
+    /// senders are simply dropped together with the Agent.
+    pub async fn register_event_sender(
+        &self,
+        sender: tokio::sync::broadcast::Sender<AgentEvent>,
+    ) -> EventSenderGuard {
         if let Some(ref inner) = self.event_sender {
             let mut guard = inner.lock().await;
-            *guard = Some(sender);
+            // Drop senders whose receivers are gone to keep the list small.
+            guard.retain(|s| s.receiver_count() > 0);
+            guard.push(sender.clone());
+            let shared = Arc::clone(inner);
+            let raw = sender.clone();
+            EventSenderGuard {
+                inner: Some(shared),
+                sender: Some(raw),
+            }
+        } else {
+            // No container: emit nothing and return a no-op guard.
+            EventSenderGuard {
+                inner: None,
+                sender: None,
+            }
         }
     }
 
@@ -339,13 +328,6 @@ impl Agent {
         self.emit_event(AgentEvent::RunStarted { run_id, timestamp: chrono::Utc::now() }).await;
 
         for iteration in 0..max_iterations {
-            // BeforeAgentLoop hook
-            let _ = self.run_hooks(
-                HookEvent::BeforeAgentLoop,
-                serde_json::json!({ "messages": history.len(), "iteration": iteration }),
-                run_id, iteration,
-            ).await;
-
             // LLM 调用 + 重试（参考 cc-python-claude query_loop 的错误恢复策略）
             // 429/529 瞬时错误 → 指数退避重试（最多 3 次）
             // 其他错误 → 直接失败
@@ -392,38 +374,7 @@ impl Agent {
             total_usage.input_tokens += delta.usage.input_tokens;
             total_usage.output_tokens += delta.usage.output_tokens;
 
-            // AfterLlmCall hook (track token usage)
-            let _ = self.run_hooks(
-                HookEvent::AfterLlmCall,
-                serde_json::json!({
-                    "input_tokens": delta.usage.input_tokens,
-                    "output_tokens": delta.usage.output_tokens,
-                    "stop_reason": format!("{:?}", stop_reason),
-                }),
-                run_id, iteration,
-            ).await;
-
             history.extend(delta.new_messages.clone());
-
-            // Auto-save checkpoint if configured
-            if context.checkpoint_enabled
-                && let Some(ref store) = self.checkpoint_store
-                    && let Some(ref project_id) = context.project_id
-                        && iteration % context.checkpoint_interval.unwrap_or(5) == 0 {
-                            let ckpt = Checkpoint::new(
-                                run_id,
-                                StepId::new(),
-                                iteration,
-                                history.clone(),
-                            )
-                            .with_project(*project_id);
-                            let _ = store.save(&ckpt);
-                            let _ = self.run_hooks(
-                                HookEvent::OnCheckpoint,
-                                serde_json::json!({ "step": iteration }),
-                                run_id, iteration,
-                            ).await;
-                        }
 
             match stop_reason {
                 StopReason::ToolUse => {
@@ -463,33 +414,6 @@ impl Agent {
                             break;
                         }
 
-                        // BeforeToolCall hook: check each tool call
-                        let mut blocked = false;
-                        for (_, info) in &raw_tool_calls {
-                            match self.run_hooks(
-                                HookEvent::BeforeToolCall,
-                                info.clone(),
-                                run_id, iteration,
-                            ).await {
-                                HookAction::Block(reason) => {
-                                    tracing::warn!(reason = %reason, "Hook blocked tool call");
-                                    history.push(Message::tool(
-                                        "hook_blocked",
-                                        format!("Operation blocked: {reason}"),
-                                    ));
-                                    blocked = true;
-                                    break;
-                                }
-                                HookAction::Skip => {
-                                    tracing::warn!("Hook skipped tool call");
-                                    blocked = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if blocked { continue; }
-
                         let tool_calls: Vec<ToolCallRequest> = raw_tool_calls.into_iter()
                             .map(|(req, _)| req)
                             .collect();
@@ -520,73 +444,34 @@ impl Agent {
                             .execute_batch(&tool_calls, &ctx, cancel.child_token())
                             .await;
 
-                        // ── Self-improvement: track tool reliability ──
-                        if let Some(ref improver) = self.self_improver {
-                            let mut imp = improver.lock().await;
-                            for (call_id, output) in &results {
-                                let tool_name = tool_calls.iter()
-                                    .find(|tc| tc.id == *call_id)
-                                    .map(|tc| tc.name.as_str())
-                                    .unwrap_or("unknown");
-                                let is_error = output.metadata.as_ref()
-                                    .map(|m| m.is_error).unwrap_or(false);
-                                let latency = output.metadata.as_ref()
-                                    .map(|m| m.duration_ms).unwrap_or(0);
-
-                                // 日志：记录工具调用结果（成功/失败/结果/耗时）
-                                // target=tool_call 放行到 info；失败时用 error 级别
-                                if is_error {
-                                    tracing::error!(
-                                        target: "tool_call",
-                                        call_id = ?call_id,
-                                        tool = %tool_name,
-                                        duration_ms = latency,
-                                        result = %output.content.chars().take(500).collect::<String>(),
-                                        "tool_call_failed",
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        target: "tool_call",
-                                        call_id = ?call_id,
-                                        tool = %tool_name,
-                                        duration_ms = latency,
-                                        result = %output.content.chars().take(500).collect::<String>(),
-                                        "tool_call_completed",
-                                    );
-                                }
-
-                                if is_error {
-                                    imp.on_tool_failure(tool_name, &output.content);
-                                } else {
-                                    imp.on_tool_success(tool_name, latency);
-                                }
-                            }
-                        } else {
-                            // 无 self_improver 时也要记录工具调用日志
-                            for (call_id, output) in &results {
-                                let tool_name = tool_calls.iter()
-                                    .find(|tc| tc.id == *call_id)
-                                    .map(|tc| tc.name.as_str())
-                                    .unwrap_or("unknown");
-                                let is_error = output.metadata.as_ref()
-                                    .map(|m| m.is_error).unwrap_or(false);
-                                let latency = output.metadata.as_ref()
-                                    .map(|m| m.duration_ms).unwrap_or(0);
-                                if is_error {
-                                    tracing::error!(
-                                        target: "tool_call",
-                                        call_id = ?call_id, tool = %tool_name, duration_ms = latency,
-                                        result = %output.content.chars().take(500).collect::<String>(),
-                                        "tool_call_failed",
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        target: "tool_call",
-                                        call_id = ?call_id, tool = %tool_name, duration_ms = latency,
-                                        result = %output.content.chars().take(500).collect::<String>(),
-                                        "tool_call_completed",
-                                    );
-                                }
+                        // ── Tool-call logging (target=tool_call) ──
+                        for (call_id, output) in &results {
+                            let tool_name = tool_calls.iter()
+                                .find(|tc| tc.id == *call_id)
+                                .map(|tc| tc.name.as_str())
+                                .unwrap_or("unknown");
+                            let is_error = output.metadata.as_ref()
+                                .map(|m| m.is_error).unwrap_or(false);
+                            let latency = output.metadata.as_ref()
+                                .map(|m| m.duration_ms).unwrap_or(0);
+                            if is_error {
+                                tracing::error!(
+                                    target: "tool_call",
+                                    call_id = ?call_id,
+                                    tool = %tool_name,
+                                    duration_ms = latency,
+                                    result = %output.content.chars().take(500).collect::<String>(),
+                                    "tool_call_failed",
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: "tool_call",
+                                    call_id = ?call_id,
+                                    tool = %tool_name,
+                                    duration_ms = latency,
+                                    result = %output.content.chars().take(500).collect::<String>(),
+                                    "tool_call_completed",
+                                );
                             }
                         }
 
@@ -600,7 +485,7 @@ impl Agent {
                             consecutive_errors = 0;
                         }
 
-                        // Append tool results and run AfterToolCall hook
+                        // Append tool results to the transcript.
                         for (call_id, output) in results {
                             let tool_name = tool_calls.iter()
                                 .find(|tc| tc.id == call_id)
@@ -620,15 +505,6 @@ impl Agent {
                                 duration_ms,
                                 is_error,
                             }).await;
-                            let _ = self.run_hooks(
-                                HookEvent::AfterToolCall,
-                                serde_json::json!({
-                                    "tool_call_id": format!("{}", call_id.0),
-                                    "output_preview": output.content.chars().take(200).collect::<String>(),
-                                    "is_error": output.metadata.as_ref().map(|m| m.is_error).unwrap_or(false),
-                                }),
-                                run_id, iteration,
-                            ).await;
                             history.push(Message::tool(
                                 format!("{}", call_id.0),
                                 &output.content,
@@ -689,24 +565,6 @@ impl Agent {
         // Episode-end consolidation
         if let Some(ref mem) = self.memory {
             mem.consolidate(ConsolidationLevel::EpisodeEnd).await;
-        }
-
-        // ── Self-improvement: reflect on the completed episode ──
-        if let Some(ref improver) = self.self_improver {
-            let sm_delta = miniagent_self_improve::integrator::AgentDelta {
-                new_messages: vec![],
-                stop_reason: last_delta.as_ref()
-                    .map(|d| d.stop_reason.clone())
-                    .unwrap_or(StopReason::EndTurn),
-                usage: total_usage.clone(),
-            };
-            let mut imp = improver.lock().await;
-            let reflection = imp.on_step(history, &sm_delta, cancel.child_token()).await;
-            tracing::debug!(
-                self_score = reflection.self_score,
-                error_detected = reflection.error_detected,
-                "Self-improvement step reflection"
-            );
         }
 
         let final_delta = last_delta.unwrap_or(AgentDelta {
@@ -890,5 +748,41 @@ impl Agent {
             return vec![];
         }
         vec![Message::assistant(response.content.clone())]
+    }
+}
+
+/// RAII guard that unregisters a per-task broadcast sender when dropped.
+///
+/// Returned from [`Agent::register_event_sender`]. Each running task holds
+/// one guard; dropping it (naturally or via panic) ensures the shared
+/// `Agent`'s event list doesn't grow without bound and that a finished
+/// task no longer receives events.
+pub struct EventSenderGuard {
+    inner: Option<Arc<tokio::sync::Mutex<Vec<tokio::sync::broadcast::Sender<AgentEvent>>>>>,
+    sender: Option<tokio::sync::broadcast::Sender<AgentEvent>>,
+}
+
+impl Drop for EventSenderGuard {
+    fn drop(&mut self) {
+        // Best-effort: if the runtime is still alive, take the lock and
+        // remove our sender. We use a synchronous block_in_place-safe path
+        // by spawning a tiny task; if that fails (no runtime), we leak the
+        // sender and let it be cleaned up when the Agent is dropped.
+        if let (Some(inner), Some(sender)) = (self.inner.take(), self.sender.take()) {
+            let shared = Arc::clone(&inner);
+            let raw = sender;
+            // Try synchronous removal first via try_lock to avoid spawning.
+            if let Ok(mut guard) = shared.try_lock() {
+                guard.retain(|s| !s.same_channel(&raw));
+                return;
+            }
+            // Fallback: hand off to the runtime if it's still around.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let mut guard = shared.lock().await;
+                    guard.retain(|s| !s.same_channel(&raw));
+                });
+            }
+        }
     }
 }

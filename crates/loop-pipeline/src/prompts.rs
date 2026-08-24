@@ -1,20 +1,3 @@
-use miniagent_tool::registry::ToolRegistry;
-
-/// Generate a comprehensive tool usage guide for any agent that has tool access.
-/// This is the SINGLE source of truth for tool instructions in the entire pipeline.
-pub fn tool_usage_guide(registry: &ToolRegistry) -> String {
-    let defs = registry.get_definitions();
-    let mut guide = String::from(
-        "## Available Tools\n\
-         You have the following tools at your disposal. USE THEM — do not simulate results.\n\n"
-    );
-
-    for def in &defs {
-        guide.push_str(&format!("- **{}**: {}  \n", def.name, def.description));
-    }
-
-    guide
-}
 
 /// Get a role-filtered subset of tool names.
 pub fn tools_for_role(role: &str) -> &'static [&'static str] {

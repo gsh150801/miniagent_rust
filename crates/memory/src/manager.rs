@@ -89,24 +89,6 @@ impl MemoryManager {
 
     // ── Relations ─────────────────────────────────────────────
 
-    pub fn link_relations(
-        &self,
-        from: &Uuid,
-        to: &Uuid,
-        rel_type: RelationType,
-        evidence: &str,
-    ) -> Result<(), rusqlite::Error> {
-        let relation = Relation {
-            from_id: *from,
-            to_id: *to,
-            relation_type: rel_type,
-            strength: 1.0,
-            evidence: evidence.to_string(),
-            created_at: Utc::now(),
-        };
-        self.episodic.link_relation(&relation)
-    }
-
     pub fn query_relations(
         &self,
         id: &Uuid,

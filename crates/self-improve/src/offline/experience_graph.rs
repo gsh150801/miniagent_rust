@@ -80,59 +80,12 @@ impl ExperienceGraph {
         });
     }
 
-    /// Find similar experiences by task signature (cosine similarity)
-    pub fn find_similar(&self, signature: &[f64], threshold: f64, max_results: usize) -> Vec<&ExperienceNode> {
-        let mut scored: Vec<(f64, &ExperienceNode)> = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let sim = cosine_similarity(signature, &node.task_signature);
-                (sim, node)
-            })
-            .filter(|(sim, _)| *sim >= threshold)
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(max_results);
-        scored.into_iter().map(|(_, node)| node).collect()
-    }
-
-    /// Query for patterns: find success patterns similar to this task
-    pub fn query_success_patterns(&self, signature: &[f64]) -> Vec<&ExperienceNode> {
-        self.find_similar(signature, 0.5, 5)
-            .into_iter()
-            .filter(|n| n.node_type == NodeType::SuccessPattern)
-            .collect()
-    }
-
-    /// Query for pitfalls: find failure patterns similar to this task
-    pub fn query_pitfalls(&self, signature: &[f64]) -> Vec<&ExperienceNode> {
-        self.find_similar(signature, 0.5, 5)
-            .into_iter()
-            .filter(|n| n.node_type == NodeType::FailurePattern)
-            .collect()
-    }
-
     pub fn node_count(&self) -> usize { self.nodes.len() }
     pub fn edge_count(&self) -> usize { self.edges.len() }
 
-    /// Get all nodes (for lexical search / external iteration).
-    pub fn all_nodes(&self) -> &[ExperienceNode] {
-        &self.nodes
-    }
 }
 
 impl Default for ExperienceGraph {
     fn default() -> Self { Self::new() }
 }
 
-fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
-    dot / (norm_a * norm_b)
-}

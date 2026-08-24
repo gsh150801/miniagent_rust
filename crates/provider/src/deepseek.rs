@@ -252,11 +252,6 @@ impl DeepSeekClient {
         self
     }
 
-    pub fn with_thinking_budget(mut self, tokens: u32) -> Self {
-        self.thinking_budget = tokens;
-        self
-    }
-
     /// Build a proxy from standard environment variables.
     /// Checks `ALL_PROXY` / `all_proxy` → `HTTPS_PROXY` / `https_proxy` → `HTTP_PROXY` / `http_proxy`.
     fn proxy_from_env() -> Option<String> {
@@ -721,7 +716,4 @@ impl DeepSeekPro {
         DeepSeekClient::new(api_key, PRO_MODEL, true)
     }
 
-    pub fn with_thinking(api_key: &ApiKey, thinking_budget: u32) -> DeepSeekClient {
-        DeepSeekClient::new(api_key, PRO_MODEL, true).with_thinking_budget(thinking_budget)
-    }
 }

@@ -71,6 +71,10 @@ pub struct AppConfig {
     pub loop_explore_max_iterations: usize,
     /// Max tool iterations for dispatched tasks.
     pub loop_dispatch_max_iterations: usize,
+    /// Max concurrently dispatched tasks within a single wave. Caps the
+    /// `FuturesUnordered` width in `dispatch.rs` so a 50-task wave does
+    /// not flood the LLM provider and OOM the Tokio runtime.
+    pub loop_dispatch_wave_concurrency: usize,
     /// Max output tokens for stage LLM calls.
     pub loop_plan_max_tokens: u32,
     pub loop_explore_max_tokens: u32,
@@ -144,6 +148,7 @@ impl AppConfig {
             loop_cost_min_progress: Self::parsed("LOOP_COST_MIN_PROGRESS", 10.0),
             loop_explore_max_iterations: Self::parsed("LOOP_EXPLORE_MAX_ITERATIONS", 10),
             loop_dispatch_max_iterations: Self::parsed("LOOP_DISPATCH_MAX_ITERATIONS", 15),
+            loop_dispatch_wave_concurrency: Self::parsed("LOOP_DISPATCH_WAVE_CONCURRENCY", 4),
             loop_plan_max_tokens: Self::parsed("LOOP_PLAN_MAX_TOKENS", 4000),
             loop_explore_max_tokens: Self::parsed("LOOP_EXPLORE_MAX_TOKENS", 4000),
             loop_evaluate_max_tokens: Self::parsed("LOOP_EVALUATE_MAX_TOKENS", 2000),
@@ -192,11 +197,6 @@ impl AppConfig {
     /// Returns true if the active provider is MiniMax.
     pub fn is_minimax(&self) -> bool {
         self.provider == "minimax"
-    }
-
-    /// Returns true if the active provider is DeepSeek (default).
-    pub fn is_deepseek(&self) -> bool {
-        self.provider == "deepseek"
     }
 
     /// Require the API key for whichever provider is currently active.

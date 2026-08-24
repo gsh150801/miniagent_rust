@@ -37,15 +37,6 @@ impl RetryPolicy {
         Duration::from_millis(capped as u64)
     }
 
-    pub fn no_retry() -> Self {
-        Self {
-            max_retries: 0,
-            initial_delay: Duration::ZERO,
-            max_delay: Duration::ZERO,
-            multiplier: 1.0,
-            retry_on_error: false,
-        }
-    }
 }
 
 impl Default for RetryPolicy {

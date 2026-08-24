@@ -8,9 +8,6 @@ license.workspace = true
 miniagent-core = { path = "../core" }
 miniagent-agent = { path = "../agent" }
 miniagent-provider = { path = "../provider" }
-miniagent-tool = { path = "../tool" }
-miniagent-memory = { path = "../memory" }
-miniagent-checkpoint = { path = "../checkpoint" }
 miniagent-skill = { path = "../skill" }
 serde.workspace = true
 serde_json.workspace = true

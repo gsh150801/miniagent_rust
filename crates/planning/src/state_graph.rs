@@ -177,11 +177,6 @@ impl StateGraph {
         self
     }
 
-    pub fn add_tool(mut self, name: impl Into<String>, tool: impl Into<String>) -> Self {
-        self.nodes.insert(name.into(), GraphNode::Tool { tool_name: tool.into() });
-        self
-    }
-
     pub fn add_human(mut self, name: impl Into<String>, prompt: impl Into<String>) -> Self {
         self.nodes.insert(name.into(), GraphNode::Human { prompt: prompt.into() });
         self
@@ -796,29 +791,6 @@ impl Checkpoint {
         serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// List all checkpoints in a work directory.
-    pub fn list_checkpoints(work_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let dir = work_dir.join("checkpoints");
-        std::fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|e| e == "json"))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Find the latest checkpoint for a given node.
-    pub fn latest_for_node(work_dir: &std::path::Path, node_name: &str) -> Option<Self> {
-        let checkpoints = Self::list_checkpoints(work_dir);
-        let prefix = format!("ckpt_{node_name}_");
-        let matching: Vec<_> = checkpoints.iter()
-            .filter(|p| p.file_name().unwrap_or_default().to_string_lossy().starts_with(&prefix))
-            .collect();
-        matching.last().and_then(|p| Self::load_from_disk(p).ok())
-    }
 }
 
 #[cfg(test)]

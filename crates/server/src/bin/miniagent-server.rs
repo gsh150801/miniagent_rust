@@ -71,7 +71,6 @@ async fn main() {
         config: config.clone(),
         agent: agent.clone(),
         memory: None,
-        checkpoint_store: None,
     };
 
     // Probe search backend health in background — won't block server startup

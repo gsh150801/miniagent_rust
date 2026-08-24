@@ -1,5 +1,4 @@
 use miniagent_core::config::TaskComplexity;
-use miniagent_core::types::ProjectId;
 use miniagent_provider::router::ProviderChoice;
 
 #[derive(Debug, Clone)]
@@ -9,9 +8,6 @@ pub struct RunContext {
     pub provider_override: Option<ProviderChoice>,
     pub max_tool_iterations: usize,
     pub max_tokens: Option<u32>,
-    pub checkpoint_enabled: bool,
-    pub checkpoint_interval: Option<usize>,
-    pub project_id: Option<ProjectId>,
     pub working_dir: String,
     /// When set, only these tool names are exposed to the LLM.
     /// The executor still holds all tools, but the LLM only sees the allowed subset.
@@ -26,9 +22,6 @@ impl RunContext {
             provider_override: None,
             max_tool_iterations: 10,
             max_tokens: None,
-            checkpoint_enabled: false,
-            checkpoint_interval: Some(5),
-            project_id: None,
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".into()),
@@ -43,17 +36,6 @@ impl RunContext {
 
     pub fn with_provider(mut self, choice: ProviderChoice) -> Self {
         self.provider_override = Some(choice);
-        self
-    }
-
-    pub fn with_checkpoint(mut self) -> Self {
-        self.checkpoint_enabled = true;
-        self
-    }
-
-    pub fn with_project(mut self, project_id: ProjectId) -> Self {
-        self.project_id = Some(project_id);
-        self.checkpoint_enabled = true;
         self
     }
 

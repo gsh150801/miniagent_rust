@@ -30,18 +30,6 @@ impl Default for TokenBudget {
 }
 
 impl TokenBudget {
-    pub fn remaining_input(&self) -> usize {
-        self.max_input_tokens
-            .saturating_sub(self.consumed)
-            .min(self.total_limit.unwrap_or(usize::MAX).saturating_sub(self.consumed))
-    }
-
-    pub fn is_exhausted(&self) -> bool {
-        self.remaining_input() == 0
-            || self
-                .total_limit
-                .is_some_and(|limit| self.consumed >= limit)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,10 +42,6 @@ pub struct TimeBudget {
 
 
 impl TimeBudget {
-    pub fn is_expired(&self) -> bool {
-        self.max_seconds
-            .is_some_and(|max| self.elapsed_secs >= max)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,10 +60,6 @@ impl Default for MoneyBudget {
 }
 
 impl MoneyBudget {
-    pub fn is_exhausted(&self) -> bool {
-        self.max_usd
-            .is_some_and(|max| self.consumed_usd >= max)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,10 +78,6 @@ impl Default for IterationBudget {
 }
 
 impl IterationBudget {
-    pub fn is_exhausted(&self) -> bool {
-        self.current_iteration >= self.max_tool_iterations
-    }
-
     pub fn increment(&mut self) {
         self.current_iteration += 1;
     }

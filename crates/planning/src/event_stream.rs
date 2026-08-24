@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 /// Typed event for the agent event stream.
 /// Every agent action is recorded as a typed event, enabling:
@@ -54,11 +53,6 @@ impl EventStream {
         };
         stream.load_from_disk();
         stream
-    }
-
-    pub fn with_max_events(mut self, max: usize) -> Self {
-        self.max_in_memory = max;
-        self
     }
 
     /// Append an event. Writes to both memory and disk (append-only).
@@ -116,18 +110,6 @@ impl EventStream {
         });
     }
 
-    /// Convenience: tool invocation event.
-    pub fn tool_invoked(&mut self, agent: &str, tool: &str, input_summary: &str) {
-        self.push(AgentEvent {
-            timestamp: chrono::Utc::now(),
-            agent: agent.into(),
-            kind: EventKind::ToolInvoked,
-            details: format!("{tool}: {input_summary}"),
-            file_refs: vec![],
-            success: true,
-        });
-    }
-
     /// Convenience: checkpoint saved event.
     pub fn checkpoint_saved(&mut self, agent: &str, path: &str) {
         self.push(AgentEvent {
@@ -150,21 +132,6 @@ impl EventStream {
         filtered.into_iter().rev().collect()
     }
 
-    /// Get events relevant to a specific role (own events only).
-    /// The role dependency concept was tied to the deleted `agent_profile`
-    /// module; callers that need cross-role visibility should pass the agent
-    /// names directly to [`Self::recent`].
-    pub fn relevant_to(&self, role: &str, count: usize) -> Vec<&AgentEvent> {
-        self.events.iter()
-            .filter(|e| e.agent == role)
-            .rev()
-            .take(count)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect()
-    }
-
     /// Format recent events as a text block for inclusion in prompts.
     /// KV-cache friendly: stable format, append-only.
     pub fn format_recent(&self, count: usize, agent_filter: Option<&str>) -> String {
@@ -177,16 +144,6 @@ impl EventStream {
             let status = if e.success { "OK" } else { "FAIL" };
             format!("[{ts}] [{status}] {}: {}", e.agent, e.details)
         }).collect::<Vec<_>>().join("\n")
-    }
-
-    /// Count events by kind.
-    pub fn count_by_kind(&self, kind: EventKind) -> usize {
-        self.events.iter().filter(|e| e.kind == kind).count()
-    }
-
-    /// Count events for a specific agent.
-    pub fn count_for_agent(&self, agent: &str) -> usize {
-        self.events.iter().filter(|e| e.agent == agent).count()
     }
 
     /// Total event count (in memory).
@@ -216,10 +173,4 @@ impl EventStream {
         }
     }
 
-    /// Compute total wall-clock duration from first to last event.
-    pub fn total_duration(&self) -> Option<Duration> {
-        let first = self.events.first()?;
-        let last = self.events.last()?;
-        last.timestamp.signed_duration_since(first.timestamp).to_std().ok()
-    }
 }

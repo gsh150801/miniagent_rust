@@ -2418,3 +2418,78 @@ StepFun 在线订阅早已失效，相关测试每次 `cargo test` 都失败（�
 
 - `cargo test --workspace` 0 失败。
 - 渐冻症完整 e2e（任务三）：待验证 `<brief>.md` 覆盖 1-9 节全部内容。
+
+## Round 38: 代码瘦身 + 稳定性 + 中止也出报告 + 桩 LLM 端到端
+
+### 任务一：瘦身与稳定性
+
+- **删除死 crate**：`crates/python`（PyO3 绑定，无依赖方）、`crates/sandbox`（stub，无依赖方）从 workspace 移除并删除目录。
+- **去重 provider 构造**：`make_providers` 此前在 `cli/main.rs` 与 `research/pipeline.rs` 逐字重复。新增 `provider::factory::active_provider_pair(&AppConfig)`，两处瘦身为薄委托。
+- **dispatch 并发上限**（修复上轮未完成的半成品）：`dispatch.rs` 的 wave 并发此前无限（`tokio::spawn` 全量并发，宽 wave 会打爆 provider 429 / runtime 内存）；上轮遗留的 `FuturesUnordered` 改法既丢了 panic 隔离又没真正限流且编译失败。最终实现：保留 `tokio::spawn`（JoinError 处理不丢）+ 共享 `Semaphore`（`loop_dispatch_wave_concurrency`，默认 4）。
+- **`/api/provenance/{task_id}` 修复**：此前按进程 CWD 解析 `analysis/{task_id}/provenance.json`（永远 404）。改为从任务注册表解析 `result_dir`，深度受限递归收集全部 `provenance.json` 返回列表。
+- **models.json 解析鲁棒性**（e2e 调试中挖出的暗坑）：`ModelKind` serde snake_case 将 `OpenAiCompatible` 渲染为 `open_ai_compatible`，手写 `openai_compatible` 的 models.json 会让整个注册表解析失败并被 `unwrap_or_default()` **静默**回退到默认 provider（流量打到错误端点且无迹可查）。修复：变体加 `alias = "openai_compatible"`/`"anthropic_compatible"`；解析失败改为 `tracing::error` 大声告警。新增回归测试 `model_kind_deserializes_both_spellings`。
+- **杂项**：`minimax.rs` 死序列化变体（`MultiPart`/`OaiContentPart`）、两处 `unused_mut` 清理；`cargo check --workspace` 0 警告。
+
+### 任务三：中止也产出用户报告 + TL;DR
+
+- **`write_user_report` 补全 TL;DR**：上轮注释声称"built last, inserted at top"但从未实现。现以占位符拼接实现：核心结论（辩论最强假说 / 置信度最高假说 + 置信度 + 陈述截断）、关键数字一行（文献/KG/假说/计划/分析任务）、建议下一步（首个数据分析或湿实验任务目标）。
+- **`finish_partial` 统一中止路径**：`run_research` 此前 5 个提前退出点（key 校验失败、PubMed 0 结果、KG 0 实体、kg-only 完成、辩论 provider 不可用）直接 `return String::new()`——**目录里什么都不留**。现在统一走 `finish_partial`：记事件、存 manifest、写 run_report + 用户报告（对缺失产物优雅降级）、返回带恢复指引的摘要。
+- **server 兜底**：`finalize_task` research 模式下若管线因故没写出 `{brief}.md`，落一个指引占位，目录永不"无报告"。
+- **相对路径健壮性**：验证计划路径为相对路径时按 manifest 目录解析（而非进程 CWD）。
+- **新增测试**：`user_report_full_run_renders_all_sections`（全量产物 → 9 节 + TL;DR 全渲染、占位符不泄漏）、`user_report_partial_run_still_renders`（空目录 → 优雅降级）。
+
+### 任务三：端到端测试（含可复用的桩 LLM）
+
+真实 provider 全部额度耗尽（MiniMax 429 套餐上限 / DeepSeek 402 欠费 / StepFun 400 无订阅）——环境问题而非代码问题。为此新增 **`scripts/mock_llm_server.py`**：OpenAI 协议兼容的确定性桩，按 prompt 语义路由返回各阶段（查询翻译 / 相关度过滤 / KG 抽取 / 假说评估 / 辩论三方 / 交叉比较 / 验证计划 / 分析脚本）的合法 JSON/代码。注册为 `custom-mock-llm` 档案后，除 LLM 推理外的全部代码路径（PubMed 真检索、efetch、KG 合并、TransE 链路预测、辩论编排、GEO grounding、Jupyter notebook 执行、溯源、报告）都走真实实现。此桩沉淀为资产，CI/无额度环境可随时复跑 e2e。
+
+### 任务二：前端方案
+
+新增 `docs/08-frontend-redesign.md`：按四目标分组的前端优化点（阶段时间线、KG 交互可视化、假说对比工作台、验证计划视图、notebook 在线渲染、全屏报告阅读、审计时间线、溯源面板、断点续跑 UI、长列表虚拟化等）+ 三阶段实施方案 + 验收标准。
+
+### Round 38 补充：辩论优雅降级 + 产物收集修复（e2e 驱动）
+
+端到端验证又暴露并修复两处：
+
+- **辩论 Phase B/C 单点失败丢弃全部成果**：`debate_and_refine` 中交叉比较（Phase B）与精炼（Phase C）此前用 `?` 直接上抛——5 个假说的三方辩论结果因精炼一次 JSON 解析失败而被整体丢弃。现在两处均降级为 `tracing::warn` + 空结果继续（装配循环本就支持缺失精炼条目的回退：保留原假说 + 辩论后置信度）。
+- **分析产物收集过浅**：`collect_outputs`/provenance 只扫任务目录 2 层；脚本建 `figures/` 子目录或误用 OUTPUT_DIR 时产物"消失"（报告为 0 output files 且溯源缺失）。新增 `provenance::record_dir_bounded(dir, depth)`（有界递归，深度 6），两处统一使用。
+- **e2e 验证（Round 37 遗留的"待验证"）**：真实 provider 全部额度耗尽，采用 `scripts/mock_llm_server.py` 桩 LLM 完成 ALS 全管线端到端（41.7s）：PubMed 真检索（翻译 → 24554 命中取 12）、相关度过滤 5/12、KG 10 实体/13 关系、TransE 链路预测 10 候选、5 假说 + 排序、辩论（逐假说裁决 + 最强假说 + 矛盾对 + 合并建议 + 5 精炼假说）、2 验证计划（数据分析 + 湿实验）、2 个 Jupyter 真执行 notebook（80 行合成队列，ALS 5.085 vs 对照 3.969）+ 溯源 + 每任务 2 个产物文件；最终报告 583 行 9 节全渲染。产物目录：`result/dae5f657_肌萎缩侧索硬化_渐冻症_ALS_的致病机理/`。
+- 中止场景验证：provider 全挂时的 3 次真实运行均产出"部分运行最终报告"（`finish_partial` 生效），目录不再空手而归。
+
+### 架构审视结论（任务一）
+
+- 角色系统存在三套（loop-pipeline `roles/` executor-validator-arbiter、planning `roles/` 13 角色、workflow `stages.rs` critic/synthesizer），本轮**未**合并（改动面大、行为等价性验证成本高），但已消除 provider 构造与 review 之外的直接重复；三套角色合并建议列入后续路线。
+- `planning`（StateGraph/13 角色）与 `loop-pipeline`（Explore-Plan-Dispatch-Evaluate-Repair）是两个并行编排范式，`research` 是第三条领域专用管线——三者共存是刻意设计（server 三模式入口），但 `memory`/`checkpoint`/`self-improve` 仅部分路径接线，server 路径未启用记忆，属后续可瘦身点。
+
+## Round 39: 深度代码瘦身（死代码 / 死依赖 / 在线测试清理）
+
+**规模**：80 个文件，+1473 / **−3292 行**；crates 18 → **17**；`cargo check --workspace --tests` 0 警告；全量测试 290 通过 0 失败。
+
+### 死依赖（13 处，全部先验证零文本引用再删）
+- `kg`：miniagent-core / provider / memory（kg 完全自包含）
+- `cli`：checkpoint / kg / hypothesis / analysis（统一经 miniagent-research）
+- `planning`：tool / skill / tempfile；`loop-pipeline`：skill
+- `server`：analysis / tokio-tungstenite；`skill`：self-improve；`workflow`：tool / memory / checkpoint
+- `agent`：checkpoint / self-improve（随子系统下线）
+
+### 整链下线的未接线子系统
+- **hooks（571 行）**：`agent::hooks` 全仓零接线（无任何调用方 `with_hooks`）、未见于设计文档 → 删除模块 + Agent 字段 + 循环内 5 处 hook 调用点。
+- **checkpoint（整链）**：AppState 字段恒为 None、server 两处调用恒传 `None`、agent 字段从未被读 → 删除 `crates/checkpoint`（185 行）、`core::checkpoint` 模块、`Workflow::run*` 签名中的 `Option<&CheckpointStore>` 参数（贯穿 engine/runner/cli/server/测试）、`RunContext` 的 checkpoint 字段、`AgentConfig`（无人使用，含 checkpoint_interval）、`/api/resume`（依赖 checkpoint 且前端不用）。注意：loop-pipeline 的文件式断点（`_checkpoint.json`）与 research 的 manifest resume **不受影响**。
+- **agent 的 self-improver 接线**：`with_self_improver` 零调用方 → 移除字段/接线/循环内反思与工具追踪分支（工具日志分支保留并去重）。self-improve crate 保留（CLI demo + 设计文档），但级联删除其死 API：reflection 模块（147 行）、on_step / on_tool_* / find_relevant_experiences / consolidate 触发器等 15 个零调用方方法。
+- 死 ID 类型：`AgentId` / `ProjectId` / `SessionId` / `CheckpointId`（types.rs 中零外部引用）。
+
+### 死函数清理（三轮级联扫描，共 ~80 个零调用方 pub fn）
+core/kg/loop-pipeline/provider/telemetry/skill/tool/workflow/planning/memory/hypothesis/agent 全覆盖。方法论：全仓正则扫描 pub fn 名 → 排除公共命名 → 逐 crate 删除（括号配平验证的脚本 + 编译器孤儿告警驱动迭代）直至扫描收敛为空。
+
+### 旧端点与桩命令
+- 删除 `/api/run`、`/api/resume`（前端 app.js 未用；属 WebSocket 化前的遗留 REST）及其全部类型/辅助函数。
+- 删除 CLI `project create|list` 桩命令（只打印占位文本）。
+
+### 在线测试清理
+- 删除 loop-pipeline 集成测试中 5 个真实 API 在线测试（`test_planner_real_api_call` / `test_explorer_real_api_call_with_tools` / `test_full_pipeline_multi_loop` / `test_full_loop_pipeline_real_api` / `test_real_long_running_research_pipeline`）+ `try_load_api_key` 辅助：仅靠"有没有 key"门控，有 key 烧配额、无 key 静默跳过，皆非可靠断言（Round 37 清了 StepFun 版，本轮补齐 DeepSeek 版）。integration_test.rs 3708 → 3346 行，纯 mock 测试全保留。
+
+### 根目录残留清理
+`miniagent_context/`（遗留路径）、`miniagent_debate/`（遗留输出目录）、`reports/`（空）、`efetch_multi.txt`（调试转储）、`result/fib.py`、`result/_recovered_from_worktrees/`。
+
+### 保留决策（有意不动）
+- `memory`（CLI+server 实际接线）、`self-improve` crate（CLI demo + docs/03 设计）、`planning`/`workflow`/`loop-pipeline` 三编排范式（server 三模式入口）。
+- provider 各响应结构体上的 `#[allow(dead_code)]` 字段：建模线上协议格式，删除无收益。
