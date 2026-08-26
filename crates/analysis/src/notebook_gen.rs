@@ -73,33 +73,73 @@ pub fn write_notebook(nb: &Value, path: &Path) -> Result<(), AgentError> {
 /// Split a Python script into code-cell-sized blocks.
 ///
 /// A new cell begins at a **top-level** boundary: a blank line whose next
-/// non-blank line starts at column 0 (no leading whitespace). This avoids
-/// breaking indented blocks (function/class/loop bodies), whose internal blank
-/// lines are always followed by indented lines. Empty/whitespace-only scripts
-/// yield a single empty cell so the notebook stays structurally valid.
+/// non-blank line starts at column 0 (no leading whitespace). Boundaries
+/// inside indented blocks are avoided, and — critically — boundaries inside
+/// triple-quoted strings are avoided too: a blank line inside a docstring or
+/// multiline literal otherwise splits mid-string, which runs fine as a `.py`
+/// but leaves the notebook cells with `SyntaxError: EOF while scanning
+/// triple-quoted string literal` (observed on real generated analyses).
 pub fn split_code_into_cells(code: &str) -> Vec<String> {
     let lines: Vec<&str> = code.lines().collect();
     if lines.is_empty() {
         return vec![String::new()];
     }
 
+    // For each line, whether a triple-quoted literal is open at its start.
+    let mut in_triple: Vec<bool> = Vec::with_capacity(lines.len());
+    let mut open: Option<char> = None; // the quote char of the open '''/"""
+    for line in &lines {
+        in_triple.push(open.is_some());
+        let mut chars = line.chars().peekable();
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && open.is_some() {
+                escaped = true;
+                continue;
+            }
+            if c == '#' && open.is_none() {
+                break; // comment: rest of the line is not code
+            }
+            if c == '"' || c == '\'' {
+                let triple = chars.peek() == Some(&c) && {
+                    let mut look = chars.clone();
+                    look.next();
+                    look.next() == Some(*&c)
+                };
+                if let Some(q) = open {
+                    if triple && q == c {
+                        // consume the remaining two quotes
+                        chars.next();
+                        chars.next();
+                        open = None;
+                    }
+                } else if triple {
+                    chars.next();
+                    chars.next();
+                    open = Some(c);
+                }
+                // single quotes toggle nothing here: they open/close within
+                // one line for our purposes (we only track multi-line state);
+                // a single-quoted string never spans lines.
+            }
+        }
+    }
+
     let mut cells: Vec<String> = Vec::new();
     let mut current: Vec<&str> = Vec::new();
-    // `true` while we are inside an indented (nested) block.
-    let mut in_block = false;
 
     for (i, line) in lines.iter().enumerate() {
         let is_blank = line.trim().is_empty();
         let indented = line.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
 
-        // Update block state based on the current line.
-        if !is_blank {
-            in_block = indented;
-        }
-
         let prev_blank = i > 0 && lines[i - 1].trim().is_empty();
         // Decide whether to start a fresh cell *before* appending this line.
-        if prev_blank && !is_blank && !indented {
+        // Never split while a triple-quoted literal spans this boundary.
+        if prev_blank && !is_blank && !indented && !in_triple[i] {
             // Top-level boundary: flush the previous cell (trim trailing blanks).
             if !current.is_empty() {
                 while current.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
@@ -113,11 +153,6 @@ pub fn split_code_into_cells(code: &str) -> Vec<String> {
         }
 
         current.push(line);
-
-        // `in_block` is only consulted to avoid false splits; the boundary
-        // condition above already requires `!indented`, so nested blank lines
-        // never trigger a split. Keep the variable referenced for clarity.
-        let _ = in_block;
     }
 
     if !current.is_empty() {
@@ -309,6 +344,38 @@ mod tests {
     fn split_single_block_returns_one_cell() {
         let cells = split_code_into_cells("x = 1\ny = 2\n");
         assert_eq!(cells.len(), 1);
+    }
+
+    #[test]
+    fn split_does_not_break_triple_quoted_strings() {
+        // Regression (observed on a real generated analysis): a blank line
+        // inside a docstring used to split mid-string, giving notebook cells
+        // `SyntaxError: EOF while scanning triple-quoted string literal`.
+        let code = "import os\n\nDOC = \"\"\"\nline one\n\nline two after blank\n\"\"\"\n\nx = 1\n";
+        let cells = split_code_into_cells(code);
+        // The docstring must stay with the cell that opened it.
+        let joined = cells.join("\n⟦CELL⟧\n");
+        assert!(
+            joined.contains("\"\"\"\nline one") || joined.contains("DOC"),
+            "docstring opener intact: {joined:?}"
+        );
+        // Reassembled code (cells concatenated with blank lines) parses as
+        // valid Python semantics-wise: each cell must be independently valid.
+        for (i, cell) in cells.iter().enumerate() {
+            assert!(
+                !(cell.contains("line one") && !cell.contains("\"\"\"")),
+                "cell {i} contains string body without its opener: {cell:?}"
+            );
+        }
+        assert!(cells.last().unwrap().trim() == "x = 1");
+    }
+
+    #[test]
+    fn split_triple_single_quotes_also_safe() {
+        let code = "a = 1\n\ns = '''\npara\n\npara2\n'''\n\nb = 2\n";
+        let cells = split_code_into_cells(code);
+        assert!(cells.iter().any(|c| c.contains("'''") && c.contains("para2")));
+        assert!(cells.last().unwrap().trim() == "b = 2");
     }
 
     #[test]

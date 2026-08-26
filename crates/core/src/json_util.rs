@@ -157,13 +157,118 @@ pub fn extract_json_object(text: &str) -> Option<String> {
     last_range.map(|r| text[r].to_string())
 }
 
+/// Remove trailing commas from JSON (`,}` / `,]` with whitespace between).
+///
+/// LLMs frequently emit `{"a": [1, 2,]}`-style output which strict parsers
+/// reject; observed live as a whole-paper loss in KG extraction. String-aware:
+/// commas inside string literals are left untouched.
+pub fn strip_trailing_commas(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        if escape_next {
+            escape_next = false;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == ',' && !in_string {
+            // Look ahead: skip whitespace; a closer means this comma trails.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                i += 1; // drop the comma
+                continue;
+            }
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Replace bare `NaN` / `Infinity` / `-Infinity` literals (illegal in JSON,
+/// but emitted by LLMs) with `null`, outside string literals.
+pub fn strip_invalid_json_numbers(s: &str) -> String {
+    const TOKENS: [&str; 3] = ["NaN", "Infinity", "-Infinity"];
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut rest = s;
+    'outer: while !rest.is_empty() {
+        let ch = rest.chars().next().unwrap();
+        if escape_next {
+            escape_next = false;
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if !in_string {
+            for tok in TOKENS {
+                // Only replace token boundaries: preceded by ':'/','/'[' or
+                // whitespace, followed by ','/'}'/']/whitespace.
+                if rest.starts_with(tok) {
+                    let before_ok = out
+                        .chars()
+                        .last()
+                        .is_none_or(|c| c == ':' || c == ',' || c == '[' || c.is_whitespace());
+                    let after = &rest[tok.len()..];
+                    let after_ok = after
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c == ',' || c == '}' || c == ']' || c.is_whitespace());
+                    if before_ok && after_ok {
+                        out.push_str("null");
+                        rest = after;
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
 /// Full pipeline: strip fences → fix truncation → extract JSON object.
 ///
-/// Convenience for the common case where an LLM response contains
-/// fenced, possibly-truncated JSON among other text.
+/// Convenience for the common case where an LLM response contains fenced,
+/// possibly-truncated JSON among other text.
 pub fn extract_and_repair(text: &str) -> String {
     let cleaned = strip_markdown_fences(&strip_reasoning_tags(text));
-    let repaired = fix_truncated_json(&cleaned);
+    let repaired = strip_trailing_commas(&fix_truncated_json(&cleaned));
+    let repaired = strip_invalid_json_numbers(&repaired);
     extract_json_object(&repaired).unwrap_or_else(|| repaired.trim().to_string())
 }
 
@@ -301,5 +406,67 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&result).is_ok(),
             "Expected valid JSON, got: {result}"
         );
+    }
+
+    #[test]
+    fn test_strip_trailing_commas_objects_and_arrays() {
+        let raw = "{\n  \"a\": [1, 2, 3,],\n  \"b\": {\"c\": 1,},\n}";
+        let fixed = strip_trailing_commas(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+            "got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_commas_preserves_in_string_commas() {
+        let raw = r#"{"a": "hello,}", "b": "x, ]", "c": [1,]}"#;
+        let fixed = strip_trailing_commas(raw);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect(&fixed);
+        assert_eq!(v["a"], "hello,}");
+        assert_eq!(v["b"], "x, ]");
+        assert_eq!(v["c"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_strip_trailing_commas_after_truncation_fix() {
+        // `{"a": [1, 2,` → fix_truncated_json closes to `{"a": [1, 2,]` →
+        // strip removes the pre-`]` comma → valid JSON.
+        let raw = "{\"a\": [1, 2,";
+        let result = extract_and_repair(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result).is_ok(),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extract_and_repair_real_kg_style_trailing_comma() {
+        // Shape observed live: a trailing comma after the last relation object.
+        let raw = "{\n  \"entities\": [{\"name\": \"X\", \"type\": \"Gene\",}],\n  \"relations\": [{\"from\": \"X\", \"to\": \"Y\", \"type\": \"activates\", \"evidence\": \"e\",}]\n}";
+        let result = extract_and_repair(raw);
+        let v: serde_json::Value = serde_json::from_str(&result).expect(&result);
+        assert_eq!(v["entities"][0]["name"], "X");
+    }
+
+    #[test]
+    fn test_strip_invalid_json_numbers() {
+        let raw = "{\"a\": NaN, \"b\": [1, Infinity, -Infinity], \"c\": \"NaN in text\"}";
+        let fixed = strip_invalid_json_numbers(raw);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect(&fixed);
+        assert!(v["a"].is_null());
+        assert!(v["b"][1].is_null());
+        assert!(v["b"][2].is_null());
+        assert_eq!(v["c"], "NaN in text");
+    }
+
+    #[test]
+    fn test_nan_inside_identifiers_preserved() {
+        // `NaN` inside a word (e.g. a name) must not be touched.
+        let raw = "{\"gene\": \"NANOG\", \"x\": NaN}";
+        let fixed = strip_invalid_json_numbers(raw);
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect(&fixed);
+        assert_eq!(v["gene"], "NANOG");
+        assert!(v["x"].is_null());
     }
 }

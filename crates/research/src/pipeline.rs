@@ -1237,8 +1237,28 @@ pub async fn run_research(
                         println!("✅ {n_da} data-analysis task(s), {n_wl} wet-lab protocol(s)");
                         plans.push((i, h, plan));
                     }
-                    Ok(Err(e)) => println!("❌ {e}"),
-                    Err(e) => println!("❌ task failed: {e}"),
+                    // Both LLM attempts failed (observed live: a reasoning
+                    // model returned empty content 4×). Fall back to a
+                    // deterministic minimal plan so the validation/analysis
+                    // tail of the pipeline still runs — recorded for audit.
+                    Ok(Err(e)) => {
+                        println!("❌ {e} → falling back to minimal template plan");
+                        manifest.log_event(
+                            "validation_plan_fallback",
+                            format!("hypothesis {}: LLM plan generation failed ({e}); using minimal template plan", h.id),
+                        );
+                        let plan = miniagent_hypothesis::ValidationPlan::minimal(&h);
+                        plans.push((i, h, plan));
+                    }
+                    Err(e) => {
+                        println!("❌ task failed: {e} → falling back to minimal template plan");
+                        manifest.log_event(
+                            "validation_plan_fallback",
+                            format!("hypothesis {}: plan task panicked ({e}); using minimal template plan", h.id),
+                        );
+                        let plan = miniagent_hypothesis::ValidationPlan::minimal(&h);
+                        plans.push((i, h, plan));
+                    }
                 }
             }
 
@@ -1290,6 +1310,11 @@ pub async fn run_research(
     // ── Phase 8: Data Analysis Execution (resumable) ──────────────
     // Execute each data-analysis task end-to-end with full provenance. (Goal 4)
     // Artifacts (script/notebook/provenance) land inside the project dir.
+    // Per-outcome counters so the audit manifest reflects how many analyses
+    // actually produced results (a stage that ran but whose tasks all failed
+    // is NOT a silent success).
+    let (mut ok_count, mut fail_count, mut dry_count, mut repair_count) =
+        (0usize, 0usize, 0usize, 0usize);
     let phase8_dur = if analyze && !validation_plans.is_empty() {
         let phase_start = Instant::now();
         println!("\n━━━ Phase 8: Data Analysis Execution ━━━");
@@ -1355,10 +1380,18 @@ pub async fn run_research(
                     Ok(res) => {
                         if res.dry_run {
                             println!("📝 dry-run (script + notebook generated)");
+                            dry_count += 1;
                         } else if res.success {
                             println!("✅ {} output file(s) [{:?}]", res.output_files.len(), res.execution_backend);
+                            ok_count += 1;
                         } else {
                             println!("⚠️  {}", res.error.unwrap_or_default());
+                            fail_count += 1;
+                        }
+                        let repairs = res.provenance.repair_history.len();
+                        if repairs > 0 {
+                            repair_count += repairs;
+                            println!("      🔧 {} self-repair round(s) used", repairs);
                         }
                         println!("      notebook: {} (executed: {})", res.notebook_path.display(), res.notebook_executed);
                         if let Some(p) = res.provenance_path.as_ref() {
@@ -1395,6 +1428,14 @@ pub async fn run_research(
             }
         }
         let _ = manifest.save();
+        if ok_count + fail_count + dry_count > 0 {
+            manifest.log_event(
+                "analysis_outcomes",
+                format!(
+                    "succeeded={ok_count} failed={fail_count} dry_run={dry_count} self_repair_rounds={repair_count}"
+                ),
+            );
+        }
         phase_start.elapsed()
     } else {
         std::time::Duration::default()
@@ -1408,7 +1449,13 @@ pub async fn run_research(
         },
         phase8_dur,
         vec![],
-        Some(serde_json::json!({ "analyses": manifest.analyses.len() })),
+        Some(serde_json::json!({
+            "analyses": manifest.analyses.len(),
+            "succeeded": ok_count,
+            "failed": fail_count,
+            "dry_run": dry_count,
+            "self_repair_rounds": repair_count,
+        })),
     );
 
     let total = start.elapsed();
@@ -1519,18 +1566,51 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
         },
     };
 
-    let resp = flash.complete(&request, cancel).await?;
+    let resp = flash.complete(&request, cancel.clone()).await?;
     let response_text = resp.content.iter()
         .filter_map(|b| match b {
             miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         }).collect::<Vec<_>>().join("");
     // extract_and_repair strips <think> blocks + markdown fences and repairs
-    // truncated JSON; silent unwrap_or_default used to turn any parse failure
-    // into an empty KG (0 entities) with no trace of why.
+    // truncated/trailing-comma/NaN JSON. Reasoning models sometimes burn the
+    // whole budget on thinking and return nothing — one corrective retry
+    // recovers the paper instead of silently dropping it from the KG.
     let repaired = miniagent_core::json_util::extract_and_repair(&response_text);
     match serde_json::from_str::<serde_json::Value>(&repaired) {
         Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
+        Err(_first_err) if repaired.trim().is_empty() => {
+            eprintln!("   ⚠ KG extraction empty response for PMID {pmid}; retrying");
+            let retry_request = miniagent_provider::traits::CompletionRequest {
+                system: request.system.clone(),
+                messages: vec![miniagent_core::message::Message::user(format!(
+                    "{prompt}\n\nYour previous answer was empty. Output ONLY the JSON object now."
+                ))],
+                tools: vec![],
+                config: miniagent_core::config::InferenceConfig {
+                    temperature: Some(0.1),
+                    max_tokens: Some(16_384),
+                    ..Default::default()
+                },
+            };
+            let resp = flash.complete(&retry_request, cancel.child_token()).await?;
+            let text = resp.content.iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("");
+            let repaired = miniagent_core::json_util::extract_and_repair(&text);
+            match serde_json::from_str::<serde_json::Value>(&repaired) {
+                Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
+                Err(e) => {
+                    eprintln!(
+                        "   ⚠ KG extraction parse failed for PMID {pmid} (retry): {e}; output head: {:?}",
+                        repaired.chars().take(160).collect::<String>()
+                    );
+                    Ok(parse_extraction_result(uuid::Uuid::new_v4(), &serde_json::Value::Null))
+                }
+            }
+        }
         Err(e) => {
             eprintln!(
                 "   ⚠ KG extraction parse failed for PMID {pmid}: {e}; output head: {:?}",

@@ -33,6 +33,69 @@ impl ValidationPlan {
     pub fn task_count(&self) -> usize {
         self.data_analysis_tasks.len() + self.wet_lab_protocols.len()
     }
+
+    /// Deterministic fallback plan for when LLM generation fails repeatedly
+    /// (e.g. a reasoning model returns empty content on every attempt). One
+    /// standard differential-expression task over GEO + a placeholder wet-lab
+    /// protocol, anchored on the hypothesis statement. The pipeline's GEO
+    /// grounding step backfills a concrete accession afterwards.
+    ///
+    /// Better a generic, executable plan than a silently missing one — the
+    /// fallback is recorded in the audit log by the caller.
+    pub fn minimal(hypothesis: &super::Hypothesis) -> Self {
+        let gene = hypothesis
+            .statement
+            .split_whitespace()
+            .find(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/'))
+            .unwrap_or("target gene")
+            .to_string();
+        Self {
+            hypothesis_id: hypothesis.id,
+            rationale: format!(
+                "Fallback plan (LLM generation failed): standard differential-expression \
+                 validation of the hypothesis '{}' across public Alzheimer's-relevant \
+                 expression datasets.",
+                hypothesis.statement
+            ),
+            data_analysis_tasks: vec![DataAnalysisTask {
+                id: "DA-1".into(),
+                objective: format!(
+                    "Test whether {gene}-related expression differs between disease and \
+                     control cohorts, as predicted by the hypothesis"
+                ),
+                dataset_source: DatasetSource::Geo,
+                dataset_accession: None,
+                cohort_definition: "disease vs control".into(),
+                variables: AnalysisVariables {
+                    independent: vec![format!("{gene} expression")],
+                    dependent: vec!["disease status".into()],
+                    covariates: vec!["age".into(), "sex".into()],
+                },
+                statistical_method: "differential expression (t-test with BH FDR correction)"
+                    .into(),
+                expected_outcome: "significant expression difference between cohorts in the \
+                                   direction predicted by the hypothesis"
+                    .into(),
+                deliverable: "DE table CSV + volcano plot PNG".into(),
+                priority: 0.5,
+            }],
+            wet_lab_protocols: vec![WetLabProtocol {
+                id: "WL-1".into(),
+                objective: "Confirm the expression change by qPCR on an independent cohort"
+                    .into(),
+                reagents: vec!["RNA extraction kit".into(), "reverse transcription kit".into()],
+                steps: vec![
+                    "Extract total RNA from cohort samples".into(),
+                    "Reverse-transcribe to cDNA".into(),
+                    "Run qPCR with gene-specific primers and housekeeping controls".into(),
+                ],
+                controls: vec!["housekeeping gene (GAPDH)".into(), "no-template control".into()],
+                expected_outcome: "qPCR fold-change agrees with the in-silico direction".into(),
+                timeline_days: Some(5),
+                feasibility: 0.9,
+            }],
+        }
+    }
 }
 
 /// One executable computational analysis task.

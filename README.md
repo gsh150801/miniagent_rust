@@ -113,6 +113,12 @@ miniagent research -q "BRCA1 DNA repair breast cancer" -n 10
 # 仅构建知识图谱，不生成假设
 miniagent research -q "gene editing off-target" -n 5 --kg-only
 
+# 四目标全流程：文献 → KG 链路预测 → 假说 → 证据辩论/比较/完善 →
+# 验证计划 (数据分析任务 + 湿实验方案) → 端到端数据分析 (自动下载 GEO
+# 数据、生成并执行 .ipynb、全程 provenance 审计、失败自修复)
+miniagent research -q "Alzheimer's disease pathogenesis mechanism" \
+  -n 10 --validate --analyze --top-n 3
+
 # ── 技能管理 / Skill Management ───────────────────────
 miniagent skill list              # 列出所有技能
 miniagent skill search "meta analysis"  # 语义搜索
@@ -211,7 +217,22 @@ Agent::run_with_loop(history, context, cancel) → AgentDelta  // 多轮工具�
 论文 → LLM 实体抽取 → KG (实体+关系)
   → TransE 嵌入 → 链路预测 (KGE + 路径 + GIVE)
     → DeepSeek Pro 验证 → 排序假设 + 实验方案
+      → 证据辩论/跨假说比较/精炼 (web 检索证据 + 验证 URL 抓取)
 ```
+
+### 数据分析自修复 / Analysis Self-Repair
+
+Phase 8 的每个数据分析任务运行 **生成 → 执行 → 修复** 回路（最多 3 次尝试）：
+
+- **GEO 数据 schema 摘要**：清洗后的 series matrix (ATTR_Sample_* 元数据 + 表达矩阵)
+  以结构化摘要喂给脚本生成，脚本按真实列名编写，而非盲猜。
+- **依赖自动补装**：执行前解析脚本 import，对将运行它的每个解释器
+  (Jupyter 内核 python / conda 环境 python) 探测缺失模块并 pip 安装，
+  ModuleNotFoundError 不再消耗 LLM 修复轮次。
+- **错误反馈修复**：脚本失败时，真实 stderr + 数据 schema 回传 LLM 重新生成完整脚本。
+- **空脚本防护**：推理模型耗尽预算返回空代码时记为诚实失败，不再产生"空 notebook 执行成功"。
+- **审计**：每轮修复记录在 `provenance.json` 的 `repair_history`；
+  `project.json` 的 analysis 阶段指标含 succeeded/failed/dry_run/self_repair_rounds。
 
 ### 自改进 / Self-Improvement
 

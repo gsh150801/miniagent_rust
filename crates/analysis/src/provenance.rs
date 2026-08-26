@@ -52,6 +52,22 @@ pub struct ProvenanceRecord {
     /// `"jupyter"`, `"python"`, or `"dry_run"` — how the analysis was executed.
     #[serde(default)]
     pub execution_backend: String,
+    /// Self-repair history: one entry per failed attempt that triggered a
+    /// regeneration (error tail + what was done). Empty when the script ran
+    /// on the first try.
+    #[serde(default)]
+    pub repair_history: Vec<RepairAttempt>,
+}
+
+/// One repair iteration of an analysis task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairAttempt {
+    /// 1-based attempt number that failed.
+    pub attempt: usize,
+    /// What the runner did next, e.g. `"regenerated script via LLM"`.
+    pub action: String,
+    /// Tail of the failed attempt's stderr (or generation error).
+    pub error_tail: String,
 }
 
 impl ProvenanceRecord {
@@ -237,6 +253,7 @@ mod tests {
             notebook_path: Some(PathBuf::from("analysis.ipynb")),
             notebook_executed: true,
             execution_backend: "jupyter".into(),
+            repair_history: vec![],
         };
         let json = rec.to_json_pretty().unwrap();
         assert!(json.contains("\"task_id\": \"DA-1\""));
