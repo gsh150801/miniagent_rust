@@ -234,6 +234,18 @@ Phase 8 的每个数据分析任务运行 **生成 → 执行 → 修复** 回�
 - **审计**：每轮修复记录在 `provenance.json` 的 `repair_history`；
   `project.json` 的 analysis 阶段指标含 succeeded/failed/dry_run/self_repair_rounds。
 
+### 跨供应商故障回退 / Cross-Vendor Fallback
+
+只要 `.env` 配置了不止一家的 API key，长文本生成类调用会自动获得
+**多供应商容灾**（KG 抽取 / 数据分析脚本生成 / 验证计划生成）：
+
+- 主供应商失败（429 配额、402 欠费、空输出、截断）时按
+  **DeepSeek → StepFun → MiniMax** 顺序逐家重试，跳过当前活跃家族；
+- GEO 下载前置可用性校验（无样本属性/无表达表的系列直接拒绝，
+  触发 dry-run 而不是生成必然失败的脚本）；
+- 全部供应商不可用时管线诚实熔断并在报告中给出断点恢复指引
+  （同一 `--project-dir` 重跑即 resume，已完成阶段不重复消耗配额）。
+
 ### 自改进 / Self-Improvement
 
 | 层 Layer | 组件 Component | 用途 Purpose |

@@ -91,11 +91,22 @@ pub struct AnalysisResult {
 
 pub struct AnalysisRunner {
     provider: Box<dyn LlmProvider>,
+    /// Alternate-vendor clients used only when the primary provider returns
+    /// empty/truncated code after its budget escalation (provider-level
+    /// degradation recovery), tried in order. Built via
+    /// `factory::codegen_fallback_providers`.
+    codegen_fallback: Vec<Box<dyn LlmProvider>>,
 }
 
 impl AnalysisRunner {
     pub fn new(provider: Box<dyn LlmProvider>) -> Self {
-        Self { provider }
+        Self { provider, codegen_fallback: Vec::new() }
+    }
+
+    /// Wire cross-family fallbacks used for script generation only.
+    pub fn with_codegen_fallback(mut self, providers: Vec<Box<dyn LlmProvider>>) -> Self {
+        self.codegen_fallback = providers;
+        self
     }
 
     /// Execute a data-analysis task end-to-end.
@@ -578,65 +589,50 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             },
         };
 
-        let resp = self.provider.complete(&request, cancel.clone()).await?;
-        let text = resp
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        let to_script = |text: &str| {
+            json_util::strip_markdown_fences(&json_util::strip_reasoning_tags(text))
+                .trim()
+                .to_string()
+        };
+
+        let resp = complete_code_text(self.provider.as_ref(), &request, cancel.clone()).await?;
+        let mut script = to_script(&resp);
 
         // Reasoning models can exhaust the token budget on chain-of-thought
         // and return empty code, or the code itself gets cut mid-expression
         // (unbalanced brackets → SyntaxError on run). One retry with a
-        // quadrupled budget recovers both (same pattern as validation plans).
-        let script = json_util::strip_markdown_fences(&json_util::strip_reasoning_tags(&text))
-            .trim()
-            .to_string();
-        let needs_retry =
-            script.is_empty() || python_looks_truncated(&script);
-        if needs_retry && !script.is_empty() {
-            tracing::warn!(
-                "script looks truncated ({}), retrying with larger budget",
-                task.id
-            );
-        }
-        let text = if needs_retry {
-            if script.is_empty() {
+        // quadrupled budget recovers both (same pattern as validation plans);
+        // when the PRIMARY vendor still fails — repeated empty output is a
+        // provider-level degradation, not a prompt problem — retry once more
+        // on an alternate-vendor fallback client if one is wired up.
+        let needs_retry = script.is_empty() || python_looks_truncated(&script);
+        if needs_retry {
+            let why = if script.is_empty() { "empty" } else { "truncated" };
+            tracing::warn!("script generation {why} ({}), escalating budget/provider", task.id);
+            let mut retry = request.clone();
+            retry.config.max_tokens = Some(16_384);
+            let mut text =
+                complete_code_text(self.provider.as_ref(), &retry, cancel.clone()).await?;
+            script = to_script(&text);
+            if (script.is_empty() || python_looks_truncated(&script))
+                && !self.codegen_fallback.is_empty()
+            {
                 tracing::warn!(
-                    "script generation empty ({}), retrying with larger budget",
+                    "primary provider still returned {} script ({}); walking cross-family fallbacks",
+                    if script.is_empty() { "empty" } else { "truncated" },
                     task.id
                 );
+                for fb in &self.codegen_fallback {
+                    text = complete_code_text(fb.as_ref(), &retry, cancel.clone()).await?;
+                    script = to_script(&text);
+                    if !script.is_empty() && !python_looks_truncated(&script) {
+                        break;
+                    }
+                }
             }
-            let retry = CompletionRequest {
-                system: request.system.clone(),
-                messages: request.messages.clone(),
-                tools: vec![],
-                config: miniagent_core::config::InferenceConfig {
-                    temperature: Some(0.1),
-                    max_tokens: Some(16_384),
-                    ..Default::default()
-                },
-            };
-            let resp = self.provider.complete(&retry, cancel.clone()).await?;
-            resp.content
-                .iter()
-                .filter_map(|b| match b {
-                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        } else {
-            text
-        };
+        }
 
-        // Strip reasoning tags + markdown fences if the model added them
-        // despite instructions (reasoning models emit <think> inline).
-        Ok(json_util::strip_markdown_fences(&json_util::strip_reasoning_tags(&text)).trim().to_string())
+        Ok(script)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -860,6 +856,24 @@ fn detect_conda() -> Option<String> {
 }
 
 // ── Self-repair helpers ─────────────────────────────────────────
+
+/// One completion call against any provider, returning concatenated text.
+async fn complete_code_text(
+    provider: &dyn LlmProvider,
+    req: &CompletionRequest,
+    cancel: CancellationToken,
+) -> Result<String, AgentError> {
+    let resp = provider.complete(req, cancel).await?;
+    Ok(resp
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(""))
+}
 
 /// Context for one LLM repair round: the failed script plus the real
 /// execution error.

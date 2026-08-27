@@ -87,6 +87,93 @@ pub fn active_provider_pair(
     Ok((flash, pro))
 }
 
+/// Build a code-generation fallback provider from a *different* vendor
+/// family than the active one (DeepSeek → StepFun → MiniMax preference).
+///
+/// Long-form code generation is the stage most sensitive to a single
+/// provider's degradation: when the active model repeatedly returns empty
+/// content even after its built-in larger-budget retry (observed live:
+/// entire analysis tasks died on empty output during a MiniMax episode),
+/// an alternate-vendor client recovers the task. Returns `None` when no
+/// other family has an API key configured, or when the active family IS
+/// deepseek and nothing else is available.
+pub fn codegen_fallback_provider(config: &AppConfig) -> Option<Box<dyn LlmProvider>> {
+    codegen_fallback_providers(config).into_iter().next()
+}
+
+/// All cross-family code-generation fallback providers, in preference order
+/// (DeepSeek → StepFun → MiniMax, never the active family). Callers should
+/// try them in order: when the first fallback ALSO fails (observed live:
+/// MiniMax hit its token cap while the DeepSeek account was out of balance),
+/// the next family still rescues the task.
+pub fn codegen_fallback_providers(config: &AppConfig) -> Vec<Box<dyn LlmProvider>> {
+    use crate::deepseek::DeepSeekFlash;
+    use crate::minimax::MiniMaxFlash;
+    use crate::stepfun::StepFunFlash;
+
+    let active = if config.is_stepfun() {
+        CodegenFamily::StepFun
+    } else if config.is_minimax() {
+        CodegenFamily::MiniMax
+    } else {
+        CodegenFamily::DeepSeek
+    };
+    let available = [
+        config.deepseek_api_key.is_some(),
+        config.stepfun_api_key.is_some(),
+        config.minimax_api_key.is_some(),
+    ];
+    let mut out: Vec<Box<dyn LlmProvider>> = Vec::new();
+    for family in pick_fallback_order(active, available) {
+        match family {
+            CodegenFamily::DeepSeek => {
+                if let Some(key) = config.deepseek_api_key.as_ref() {
+                    out.push(Box::new(DeepSeekFlash::new(key)));
+                }
+            }
+            CodegenFamily::StepFun => {
+                if let Some(key) = config.stepfun_api_key.as_ref() {
+                    out.push(Box::new(StepFunFlash::new(key)));
+                }
+            }
+            CodegenFamily::MiniMax => {
+                if let Some(key) = config.minimax_api_key.as_ref() {
+                    out.push(Box::new(MiniMaxFlash::new(key)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Vendor families usable for cross-family code generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodegenFamily {
+    DeepSeek,
+    StepFun,
+    MiniMax,
+}
+
+/// Pure fallback selection: prefer DeepSeek, then StepFun, then MiniMax —
+/// never the active family itself. `available` = [deepseek, stepfun,
+/// minimax] key presence. Returns ALL usable families in order so callers
+/// can walk past a broken first choice. Unit-testable without real config.
+fn pick_fallback_order(
+    active: CodegenFamily,
+    available: [bool; 3],
+) -> Vec<CodegenFamily> {
+    const ORDER: [CodegenFamily; 3] = [
+        CodegenFamily::DeepSeek,
+        CodegenFamily::StepFun,
+        CodegenFamily::MiniMax,
+    ];
+    ORDER.iter()
+        .zip(available)
+        .filter(|(family, present)| **family != active && *present)
+        .map(|(family, _)| *family)
+        .collect()
+}
+
 /// Build the provider serving a debate role from an already-resolved
 /// profile (caller resolves via [`ModelRegistry::role_profile`]). Debate
 /// calls are reasoning-heavy → Pro tier.
@@ -140,6 +227,35 @@ pub fn resolve_debate_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codegen_fallback_prefers_other_family() {
+        use CodegenFamily as F;
+        // Preference order DeepSeek > StepFun > MiniMax, never the active one.
+        let first = |active, avail| {
+            pick_fallback_order(active, avail).into_iter().next()
+        };
+        assert_eq!(first(F::MiniMax, [true, true, false]), Some(F::DeepSeek));
+        // Full order: when the first fallback is broken the caller walks on.
+        assert_eq!(
+            pick_fallback_order(F::MiniMax, [true, true, true]),
+            vec![F::DeepSeek, F::StepFun]
+        );
+        assert_eq!(
+            pick_fallback_order(F::MiniMax, [false, true, true]),
+            vec![F::StepFun]
+        );
+        assert_eq!(first(F::StepFun, [true, true, true]), Some(F::DeepSeek));
+        // Active deepseek with only its own key → no cross-family option.
+        assert_eq!(pick_fallback_order(F::DeepSeek, [true, false, false]), vec![]);
+        // Active deepseek with only minimax key → MiniMax fallback.
+        assert_eq!(
+            first(F::DeepSeek, [false, false, true]),
+            Some(F::MiniMax)
+        );
+        // Nothing available anywhere.
+        assert_eq!(first(F::MiniMax, [false, false, false]), None);
+    }
 
     fn profile(kind: ModelKind) -> ModelProfile {
         ModelProfile {

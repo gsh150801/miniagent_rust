@@ -534,12 +534,30 @@ pub async fn run_research(
             loaded.entity_count(), loaded.relation_count());
     } else {
         // Bounded-concurrency LLM extraction (goal 1: performance): one shared
-        // flash provider, several papers in flight at once.
+        // flash provider, several papers in flight at once. Cross-family
+        // fallbacks absorb provider-level failures such as 429 token-cap
+        // exhaustion or an out-of-balance account.
+        let extraction_fallbacks: Vec<std::sync::Arc<dyn LlmProvider>> =
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Arc::from)
+                .collect();
+        if !extraction_fallbacks.is_empty() {
+            println!(
+                "   🔁 KG extraction: {} fallback provider(s) wired",
+                extraction_fallbacks.len()
+            );
+            manifest.log_event(
+                "extraction_fallback_wired",
+                format!("KG extraction using {} cross-family fallback provider(s)", extraction_fallbacks.len()),
+            );
+        }
         let concurrency = 6usize;
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut jobs = Vec::with_capacity(paper_texts.len());
         for (i, (pmid, text)) in paper_texts.iter().enumerate() {
             let flash = flash.clone();
+            let fallbacks = extraction_fallbacks.clone();
             let sem = sem.clone();
             let cancel = cancel.child_token();
             let pmid = pmid.clone();
@@ -548,7 +566,7 @@ pub async fn run_research(
                 i,
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await;
-                    extract_paper_entities(flash, &pmid, &text, cancel).await
+                    extract_paper_entities(flash, fallbacks, &pmid, &text, cancel).await
                 }),
             ));
         }
@@ -1205,15 +1223,24 @@ pub async fn run_research(
                     let _permit = sem.acquire().await.expect("semaphore closed");
                     // Validation plans are long, schema-heavy JSON; reasoning
                     // models (pro) burn the budget on CoT and emit truncated
-                    // or empty JSON, so use the flash chat model with one retry.
+                    // or empty JSON, so use the flash chat model first. When
+                    // it fails outright, retry on a cross-family fallback
+                    // client if another vendor's key is configured — repeated
+                    // empty output is provider degradation, not prompt error.
+                    let mut providers: Vec<Box<dyn LlmProvider>> =
+                        vec![make_providers(&cfg).0];
+                    providers.extend(
+                        miniagent_provider::factory::codegen_fallback_providers(&cfg),
+                    );
                     let mut last_err = None;
-                    for attempt in 0..2 {
-                        let generator = HypothesisGenerator::new()
-                            .with_provider(make_providers(&cfg).0);
+                    for (idx, provider) in providers.into_iter().enumerate() {
+                        let generator =
+                            HypothesisGenerator::new().with_provider(provider);
                         match generator.generate_validation_plan(&task_h, &kg, cancel.clone()).await {
                             Ok(plan) => return Ok(plan),
                             Err(e) => {
-                                eprintln!("[plan attempt {} failed: {e}]", attempt + 1);
+                                let tag = if idx == 0 { "" } else { " (fallback provider)" };
+                                eprintln!("[plan attempt {} failed{tag}: {e}]", idx + 1);
                                 last_err = Some(e);
                             }
                         }
@@ -1320,8 +1347,22 @@ pub async fn run_research(
         println!("\n━━━ Phase 8: Data Analysis Execution ━━━");
 
         // Script generation is long-form code; reasoning models (pro) can
-        // return empty content, so use the flash chat model here too.
-        let runner = miniagent_analysis::AnalysisRunner::new(make_providers(config).0);
+        // return empty content, so use the flash chat model here too. A
+        // cross-family fallback client (when another vendor's key is
+        // configured) rescues tasks when the primary vendor degrades.
+        let mut runner = miniagent_analysis::AnalysisRunner::new(make_providers(config).0);
+        let codegen_fallbacks = miniagent_provider::factory::codegen_fallback_providers(config);
+        if !codegen_fallbacks.is_empty() {
+            println!(
+                "   🔁 codegen fallback provider(s) wired: {}",
+                codegen_fallbacks.len()
+            );
+            manifest.log_event(
+                "codegen_fallback_wired",
+                format!("analysis runner using {} cross-family fallback(s) for script generation", codegen_fallbacks.len()),
+            );
+            runner = runner.with_codegen_fallback(codegen_fallbacks);
+        }
         // Absolute project dir: the runner executes with different CWDs
         // (jupyter inherits the process CWD, scripts run with
         // current_dir(working_dir)), so only absolute paths are unambiguous.
@@ -1534,10 +1575,15 @@ pub async fn run_research(
 
 // ── Pipeline helpers ─────────────────────────────────────────
 
-/// Extract entities/relations from one paper abstract via the shared flash
-/// provider. Runs inside a parallel task (goal 1: performance).
+/// Extract entities/relations from one paper abstract. Runs inside a parallel
+/// task (goal 1: performance). When the primary flash provider errors (e.g.
+/// a 429 token-cap under concurrent pipelines), the cross-family fallbacks
+/// are tried in order (MiniMax cap → DeepSeek balance → StepFun …) before
+/// giving up; parse failures on an EMPTY response retry on the first
+/// fallback too.
 async fn extract_paper_entities(
     flash: std::sync::Arc<dyn LlmProvider>,
+    fallbacks: Vec<std::sync::Arc<dyn LlmProvider>>,
     pmid: &str,
     text: &str,
     cancel: CancellationToken,
@@ -1566,7 +1612,29 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
         },
     };
 
-    let resp = flash.complete(&request, cancel.clone()).await?;
+    // Primary call with provider-level degradation recovery: walk the
+    // fallback list on any provider error.
+    let resp = match flash.complete(&request, cancel.clone()).await {
+        Ok(r) => r,
+        Err(primary_err) => {
+            let mut last = primary_err;
+            let mut recovered = None;
+            for fb in &fallbacks {
+                eprintln!("   ⚠ KG extraction primary provider failed for PMID {pmid} ({last}); retrying on fallback");
+                match fb.complete(&request, cancel.clone()).await {
+                    Ok(r) => {
+                        recovered = Some(r);
+                        break;
+                    }
+                    Err(e) => last = e,
+                }
+            }
+            match recovered {
+                Some(r) => r,
+                None => return Err(last),
+            }
+        }
+    };
     let response_text = resp.content.iter()
         .filter_map(|b| match b {
             miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
@@ -1574,13 +1642,17 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
         }).collect::<Vec<_>>().join("");
     // extract_and_repair strips <think> blocks + markdown fences and repairs
     // truncated/trailing-comma/NaN JSON. Reasoning models sometimes burn the
-    // whole budget on thinking and return nothing — one corrective retry
-    // recovers the paper instead of silently dropping it from the KG.
+    // whole budget on thinking and return nothing — one corrective retry,
+    // preferring the fallback provider (an empty answer is usually the same
+    // provider episode that just failed above), recovers the paper instead
+    // of silently dropping it from the KG.
     let repaired = miniagent_core::json_util::extract_and_repair(&response_text);
     match serde_json::from_str::<serde_json::Value>(&repaired) {
         Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
         Err(_first_err) if repaired.trim().is_empty() => {
             eprintln!("   ⚠ KG extraction empty response for PMID {pmid}; retrying");
+            let retry_provider: std::sync::Arc<dyn LlmProvider> =
+                fallbacks.first().cloned().unwrap_or_else(|| flash.clone());
             let retry_request = miniagent_provider::traits::CompletionRequest {
                 system: request.system.clone(),
                 messages: vec![miniagent_core::message::Message::user(format!(
@@ -1593,7 +1665,7 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
                     ..Default::default()
                 },
             };
-            let resp = flash.complete(&retry_request, cancel.child_token()).await?;
+            let resp = retry_provider.complete(&retry_request, cancel.child_token()).await?;
             let text = resp.content.iter()
                 .filter_map(|b| match b {
                     miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),

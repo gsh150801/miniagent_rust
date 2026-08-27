@@ -171,19 +171,22 @@ pub async fn download_geo_series_matrix(
         Err(e) => return Err(format!("download {url}: {e}")),
     };
 
-    // Decompress and clean in one pass.
+    // Decompress and clean in one pass, then gate usability BEFORE persisting:
+    // a matrix without sample attributes or expression data only produces
+    // analyses that fail mid-run.
     let mut decoder = flate2::read::GzDecoder::new(&gz[..]);
     let mut raw = String::new();
     decoder
         .read_to_string(&mut raw)
         .map_err(|e| format!("gunzip {accession}: {e}"))?;
-    let tsv = clean_series_matrix(&raw);
-    if tsv.trim().is_empty() {
-        return Err(format!(
-            "{accession}: series matrix contains no expression table \
-             (RNA-seq counts-only series often lack one — see the GEO page)"
-        ));
-    }
+    let (tsv, stats) = clean_series_matrix_with_stats(&raw);
+    validate_cleaned_tsv(&tsv).map_err(|e| format!("{accession}: {e}"))?;
+    tracing::info!(
+        accession = %accession,
+        attr_rows = stats.attr_rows,
+        expr_rows = stats.expr_rows,
+        "GEO series matrix usable"
+    );
     std::fs::write(&dest, tsv).map_err(|e| format!("write {}: {e}", dest.display()))?;
     tracing::info!(accession = %accession, path = %dest.display(), "GEO series matrix downloaded");
     Ok(dest)
@@ -274,10 +277,18 @@ fn parse_size(tok: &str) -> Option<u64> {
 /// Keep `!Sample_*` metadata rows (renamed `ATTR_Sample_*`) plus the
 /// expression matrix between the table markers; drop `!Series_*` bookkeeping.
 pub fn clean_series_matrix(raw: &str) -> String {
+    clean_series_matrix_with_stats(raw).0
+}
+
+/// [`clean_series_matrix`] plus usability counts: the number of
+/// `ATTR_Sample_*` metadata rows and the number of expression data rows
+/// (table lines after the `ID_REF` header).
+pub fn clean_series_matrix_with_stats(raw: &str) -> (String, MatrixStats) {
     let mut out = String::new();
     let mut in_table = false;
     let mut attr_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut stats = MatrixStats::default();
     for line in raw.lines() {
         let line = line.trim_end_matches('\r');
         if line.starts_with("!series_matrix_table_begin") {
@@ -289,6 +300,11 @@ pub fn clean_series_matrix(raw: &str) -> String {
             continue;
         }
         if in_table {
+            if line.starts_with("ID_REF") || line.starts_with("\"ID_REF") {
+                stats.has_header = true;
+            } else if !line.trim().is_empty() {
+                stats.expr_rows += 1;
+            }
             out.push_str(line);
             out.push('\n');
         } else if let Some(rest) = line.strip_prefix("!Sample_") {
@@ -304,13 +320,61 @@ pub fn clean_series_matrix(raw: &str) -> String {
             } else {
                 key
             };
+            stats.attr_rows += 1;
             out.push_str(&final_key);
             out.push('\t');
             out.push_str(value_part);
             out.push('\n');
         }
     }
-    out
+    (out, stats)
+}
+
+/// Usability counts of a cleaned series-matrix TSV.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MatrixStats {
+    /// Number of `ATTR_Sample_*` metadata rows written.
+    pub attr_rows: usize,
+    /// Number of expression data rows (table lines after the `ID_REF` header).
+    pub expr_rows: usize,
+    /// Whether an `ID_REF` expression-table header was present.
+    pub has_header: bool,
+}
+
+/// Gate a cleaned TSV before feeding it to downstream analysis: a matrix
+/// without sample metadata or without expression data produces broken
+/// analyses that only fail mid-run (observed live: scripts raising
+/// "No sample attributes parsed" / "expression rows = 0"). Returns a
+/// descriptive error naming exactly what is missing.
+pub fn validate_cleaned_tsv(tsv: &str) -> Result<(), String> {
+    let trimmed = tsv.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "series matrix contains no expression table (RNA-seq counts-only series often \
+             lack one — see the GEO page)"
+                .to_string(),
+        );
+    }
+    if !trimmed.lines().any(|l| l.starts_with("ATTR_Sample_")) {
+        return Err("series matrix has no per-sample attribute rows (ATTR_Sample_*) — \
+                    cohorts cannot be defined"
+            .to_string());
+    }
+    let header_cols = trimmed
+        .lines()
+        .find(|l| l.starts_with("ID_REF") || l.starts_with("\"ID_REF"))
+        .map(|l| l.split('\t').count())
+        .unwrap_or(0);
+    if !trimmed
+        .lines()
+        .any(|l| l.starts_with("ID_REF") || l.starts_with("\"ID_REF"))
+    {
+        return Err("series matrix has no ID_REF expression-table header".to_string());
+    }
+    if header_cols < 2 {
+        return Err("expression table header has no sample columns".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -356,6 +420,37 @@ mod tests {
     #[test]
     fn empty_matrix_is_empty() {
         assert!(clean_series_matrix("!Series_title\tfoo\n").trim().is_empty());
+    }
+
+    #[test]
+    fn usability_gate_rejects_unusable_matrices() {
+        // No ATTR rows at all.
+        let no_attrs = "ID_REF\tGSM1\n1007_s_at\t3.1\n";
+        assert!(validate_cleaned_tsv(no_attrs).is_err());
+        // No expression table.
+        let no_table = "ATTR_Sample_title\tA\tB\n";
+        assert!(validate_cleaned_tsv(no_table).is_err());
+        // Header without sample columns.
+        let no_cols = "ATTR_Sample_title\nID_REF\n1.0\n";
+        assert!(validate_cleaned_tsv(no_cols).is_err());
+        // Fully usable (quoted header, as GEO writes it).
+        let good = "ATTR_Sample_title\t\"AD\"\t\"CTL\"\n\"ID_REF\"\tGSM1\tGSM2\n1007_s_at\t3.1\t4.2\n";
+        assert!(validate_cleaned_tsv(good).is_ok());
+    }
+
+    #[test]
+    fn stats_count_attr_and_expr_rows() {
+        let raw = "!Sample_title\tA\tB\n\
+                   !Sample_characteristics_ch1\tdx\n\
+                   !series_matrix_table_begin\n\
+                   ID_REF\tGSM1\tGSM2\n\
+                   probe1\t1\t2\n\
+                   probe2\t3\t4\n\
+                   !series_matrix_table_end\n";
+        let (_, stats) = clean_series_matrix_with_stats(raw);
+        assert_eq!(stats.attr_rows, 2);
+        assert_eq!(stats.expr_rows, 2);
+        assert!(stats.has_header);
     }
 
     #[test]
