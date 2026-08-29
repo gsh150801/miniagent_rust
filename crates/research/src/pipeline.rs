@@ -15,21 +15,24 @@ use miniagent_core::settings::AppConfig;
 use miniagent_provider::traits::LlmProvider;
 
 
-/// Coarse phase progress callback: `(stage_key, "running" | "completed")`.
+/// Coarse phase progress callback: `(stage_key, "running" | "completed", detail)`.
+/// The optional third argument carries a human-readable phase summary
+/// (loop orchestrator) so the server can forward it to the frontend; plain
+/// pipeline phase transitions pass `None`.
 /// Shared through `Arc` so the server can move it into a channel-forwarding
 /// task while the pipeline owns a clone.
-pub type ResearchProgress = Arc<dyn Fn(&str, &str) + Send + Sync>;
+pub type ResearchProgress = Arc<dyn Fn(&str, &str, Option<&str>) + Send + Sync>;
 
 fn phase_begin(on_progress: &Option<ResearchProgress>, stage: &str) {
     if let Some(cb) = on_progress {
-        cb(stage, "running");
+        cb(stage, "running", None);
     }
 }
 
 fn phase_end(on_progress: &Option<ResearchProgress>, prev: &mut Option<&'static str>) {
     if let Some(p) = prev.take()
         && let Some(cb) = on_progress {
-        cb(p, "completed");
+        cb(p, "completed", None);
     }
 }
 
@@ -396,8 +399,20 @@ pub async fn run_research(
                 || (0x3000..=0x303F).contains(&u)   // CJK punctuation
                 || (0xFF00..=0xFFEF).contains(&u)   // fullwidth forms
         });
-        let is_valid =
-            |s: &str| !s.is_empty() && !s.contains('<') && s.len() <= 2_000 && !has_cjk(s);
+        // Syntactic validation must include bracket/quote BALANCE: a query
+        // truncated at the token cap (e.g. ending `OR "multi` with an unclosed
+        // quote and one open paren) is exactly what made PubMed match 2.3M
+        // papers — the unparseable tail degenerates the boolean expression.
+        let balanced = |s: &str| {
+            s.matches('(').count() == s.matches(')').count() && s.matches('"').count() % 2 == 0
+        };
+        let is_valid = |s: &str| {
+            !s.is_empty()
+                && !s.contains('<')
+                && s.len() <= 2_000
+                && !has_cjk(s)
+                && balanced(s)
+        };
 
         let mut providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
         providers.extend(
@@ -408,7 +423,7 @@ pub async fn run_research(
         let mut translation_provenance: Vec<String> = Vec::new();
         'translation: for (p_idx, provider) in providers.iter().enumerate() {
             let first = provider
-                .complete(&make_request(translation_prompt.clone(), 400), cancel.child_token())
+                .complete(&make_request(translation_prompt.clone(), 16_384), cancel.child_token())
                 .await
                 .ok()
                 .map(|resp| extract(&resp))
