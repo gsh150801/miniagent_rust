@@ -12,7 +12,9 @@
 //! orchestrator) without pulling in the agent/kg/hypothesis crates.
 
 pub mod pipeline;
+pub mod loop_orchestrator;
 pub mod review;
+pub use loop_orchestrator::run_research_in_loop;
 pub use pipeline::{run_research, ResearchOptions, ResearchProgress};
 
 use anyhow::{Context, Result};
@@ -220,6 +222,13 @@ impl ProjectManifest {
     }
 
     /// True when a stage with `name` has already completed (resume guard).
+    /// Remove completed status for the named stages so the next resume
+    /// re-executes them (loop-orchestrated repair path).
+    pub fn reset_stages(&mut self, names: &[&str]) {
+        self.stages
+            .retain(|s| !(names.contains(&s.name.as_str()) && s.status == StageStatus::Completed));
+    }
+
     pub fn is_stage_done(&self, name: &str) -> bool {
         self.stages
             .iter()

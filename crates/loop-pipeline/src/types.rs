@@ -45,6 +45,10 @@ pub struct EvaluationResult {
     pub unmet_goals: Vec<String>,
     pub should_continue: bool,
     pub summary: String,
+    /// Three-way adjudication record (advocate/challenger/arbiter) produced
+    /// when this evaluation decided the pipeline would stop.
+    #[serde(default)]
+    pub adjudication: Option<serde_json::Value>,
 }
 
 /// Repair analysis for a failed task
@@ -93,6 +97,12 @@ pub struct PipelineState {
     /// Collected stage outputs for history replay.
     #[serde(default)]
     pub stage_outputs: Vec<StageOutputRecord>,
+    /// User clarifications gathered by the Clarify stage (ask/reply).
+    #[serde(default)]
+    pub clarifications: Vec<crate::clarify::Clarification>,
+    /// Whether the Clarify stage already ran for this pipeline run.
+    #[serde(default)]
+    pub clarified: bool,
 }
 
 /// A lightweight record of a stage output for history replay.
@@ -120,6 +130,8 @@ impl PipelineState {
             no_progress_streak: 0,
             total_tokens_used: 0,
             stage_outputs: Vec::new(),
+            clarifications: Vec::new(),
+            clarified: false,
         }
     }
 

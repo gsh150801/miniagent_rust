@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::stage::{PipelineStage, StageContext, StageOutput};
 use crate::types::PipelineState;
 use crate::explore::ExploreStage;
+use crate::clarify::ClarifyStage;
 use crate::plan::PlanStage;
 use crate::dispatch::DispatchStage;
 use crate::evaluate::EvaluateStage;
@@ -196,6 +197,7 @@ impl LoopPipeline {
         }
 
         let explore = ExploreStage;
+        let clarify = ClarifyStage;
         let plan = PlanStage;
         let dispatch = DispatchStage;
         let evaluate = EvaluateStage;
@@ -237,6 +239,23 @@ impl LoopPipeline {
             ctx.collect_messages(output.new_messages);
             emit("explore", "completed", Some(&explore_summary));
             tracing::info!("Explore done: {}", output.summary);
+
+            // Phase 1b: Clarify (once per run; optional — asks the user when
+            // the task has material ambiguity and an interactive channel is
+            // wired; skipped silently otherwise).
+            if !ctx.state.clarified {
+                tracing::info!("Clarify phase");
+                emit("clarify", "running", None);
+                let output = Self::execute_isolated(&clarify, &ctx, cancel.child_token()).await;
+                ctx.state = output.updated_state;
+                let clarify_summary = serde_json::json!({"summary": output.summary});
+                ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
+                    stage: "clarify".into(),
+                    summary: clarify_summary.clone(),
+                });
+                emit("clarify", "completed", Some(&clarify_summary));
+                tracing::info!("Clarify done: {}", output.summary);
+            }
 
             // Phase 2: PLAN (isolated — fallback to single-task plan downstream)
             tracing::info!("Plan phase");

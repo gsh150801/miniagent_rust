@@ -67,6 +67,8 @@ pub struct ReportReview {
 /// Inputs the review needs: the report text plus the ground-truth facts
 /// extracted from the manifest (already serialized by the caller).
 pub struct ReviewContext {
+    /// The user's original research request, for topic-coherence review.
+    pub question: String,
     pub report_markdown: String,
     /// `"hypotheses": 5, "validation_plans": 2, ...` style key facts.
     pub facts: Vec<(String, String)>,
@@ -264,6 +266,7 @@ Report draft (may be truncated):
 ```
 
 Check:
+0. TOPIC COHERENCE: the report must actually answer the research question above. If the report's hypotheses/datasets/conclusions belong to a different topic, that is a high-severity issue.
 1. Every number in the report that matches a fact above must agree.
 2. Required sections: 文献综述, 知识图谱, 假说, 辩论, 验证计划, 数据分析交付, 引用索引. Note any missing section.
 3. The 数据分析交付 section must state per-task outcomes honestly (failures reported as failures).
@@ -356,7 +359,11 @@ pub fn combine(
     let verdict = if mechanical_bad {
         "fail"
     } else if issues.iter().any(|i| i.severity == "high") {
-        "pass_with_warnings"
+        // LLM high-severity issues (e.g. topic mismatch) mean the report
+        // would mislead a reader — same escalation class as a mechanical
+        // mismatch. (First live review run flagged a fully off-topic report
+        // yet still returned pass_with_warnings; this closes that gap.)
+        "fail"
     } else if !issues.is_empty() {
         "pass_with_warnings"
     } else {
@@ -438,6 +445,7 @@ mod tests {
 
     fn ctx_with(report: &str, facts: Vec<(&str, &str)>) -> ReviewContext {
         ReviewContext {
+            question: "test question".into(),
             report_markdown: report.into(),
             facts: facts
                 .into_iter()

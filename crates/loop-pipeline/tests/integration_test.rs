@@ -249,6 +249,8 @@ fn mock_state(loop_count: usize, max_loops: usize, completed: bool) -> PipelineS
         no_progress_streak: 0,
         total_tokens_used: 0,
         stage_outputs: Vec::new(),
+        clarifications: Vec::new(),
+        clarified: false,
     }
 }
 
@@ -275,6 +277,7 @@ fn make_eval(completed: usize, failed: usize, pending: usize, progress: f64, sho
         unmet_goals: vec![],
         should_continue,
         summary: format!("{completed}/{total} done"),
+        adjudication: None,
     }
 }
 
@@ -810,6 +813,7 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
         unmet_goals: vec!["CRISPR clinical trials research incomplete".into(), "Synthesis report blocked pending all research".into()],
         should_continue: should_continue_1,
         summary: "2/4 tasks done. CRISPR research failed due to API timeout. Synthesis blocked. Continuing to loop 2.".into(),
+        adjudication: None,
     };
     ctx.state.evaluations.push(eval_1);
 
@@ -947,6 +951,7 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
         unmet_goals: vec![],
         should_continue: !should_stop,
         summary: "All 4 research topics completed. Final synthesis produced.".into(),
+        adjudication: None,
     };
     let should_continue_2 = eval_2.should_continue;
     ctx.state.evaluations.push(eval_2);
@@ -1056,6 +1061,7 @@ fn test_e2e_no_progress_safety_stops_infinite_loop() {
         tasks_completed: 2, tasks_failed: 1, tasks_pending: 0,
         overall_progress_pct: 66.0, failed_task_ids: vec!["analyze_data".into()],
         unmet_goals: vec!["Analysis incomplete".into()], should_continue: true,
+        adjudication: None,
         summary: format!("2/3 done after loop {loop_num}. Analysis still failing."),
     };
 
@@ -1162,6 +1168,7 @@ fn test_e2e_max_loops_boundary_forced_stop() {
             failed_task_ids: if loop_i >= 2 { vec![format!("task_{}", loop_i + 1)] } else { vec![] },
             unmet_goals: vec!["Incomplete".into()],
             should_continue: true,
+            adjudication: None,
             summary: format!("Loop {} eval", loop_i + 1),
         });
 
@@ -1451,6 +1458,7 @@ fn test_multi_loop_dynamic_plan_evolution() {
         failed_task_ids: vec!["finance".into()],
         unmet_goals: vec!["Finance AI research incomplete".into(), "Synthesis blocked pending all research".into()],
         should_continue, summary: "3/4 tasks. Finance failed (API 503). Need to retry with fallback source.".into(),
+        adjudication: None,
     });
     assert!(should_continue, "Loop 1: should continue with failures");
 
@@ -1532,6 +1540,7 @@ fn test_multi_loop_dynamic_plan_evolution() {
         failed_task_ids: vec!["finance_trends".into()],
         unmet_goals: vec!["Fintech trends incomplete".into()],
         should_continue: true,
+        adjudication: None,
         summary: "finance_market done. finance_trends needs retry with pagination.".into(),
     });
 
@@ -1562,6 +1571,7 @@ fn test_multi_loop_dynamic_plan_evolution() {
         overall_progress_pct: 100.0,
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
+        adjudication: None,
         summary: "All research complete. Final synthesis produced.".into(),
     });
     ctx.state.completed = true;
@@ -1680,6 +1690,7 @@ fn test_multi_loop_quality_self_assessment() {
                           "No discussion of hybrid cryptographic schemes".into()],
         should_continue: true,  // ← key: continue even though all passed
         summary: "Both tasks technically completed but quality is insufficient. Analysis is superficial — only mentions Shor's algorithm without covering NIST PQC standards, lattice-based cryptography, or real-world timelines.".into(),
+        adjudication: None,
     };
     ctx.state.evaluations.push(eval_1);
     assert!(ctx.state.evaluations[0].should_continue,
@@ -1740,6 +1751,7 @@ fn test_multi_loop_quality_self_assessment() {
         overall_progress_pct: 100.0,
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
+        adjudication: None,
         summary: "Comprehensive analysis complete. All quality criteria satisfied.".into(),
     });
     ctx.state.completed = true;
@@ -1859,6 +1871,7 @@ fn test_multi_loop_multiple_failure_modes() {
         failed_task_ids: vec!["fetch_data".into(), "compute_ma".into(), "generate_chart".into(), "write_report".into()],
         unmet_goals: vec!["All tasks failed due to fetch_data failure (chain reaction)".into()],
         should_continue: true,
+        adjudication: None,
         summary: "0/4 tasks. Root cause: fetch_data failed due to network timeout. Chain reaction to all downstream tasks.".into(),
     });
 
@@ -1948,6 +1961,7 @@ fn test_multi_loop_multiple_failure_modes() {
         tasks_completed: 4, tasks_failed: 0, tasks_pending: 0,
         overall_progress_pct: 100.0, failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
+        adjudication: None,
         summary: "All 4 tasks completed successfully after retry with fixed timeout and column inspection step.".into(),
     });
     ctx.state.completed = true;
@@ -2108,6 +2122,7 @@ fn test_long_running_complex_research_pipeline() {
         failed_task_ids: vec!["res_safety".into()],
         unmet_goals: vec!["AI safety research incomplete — missing technical safety frameworks and regulatory comparisons".into()],
         should_continue: true,
+        adjudication: None,
         summary: "4/5 research tasks completed. AI safety failed due to data retrieval issues. Need better search strategy.".into(),
     });
     assert!(ctx.state.evaluations[0].should_continue);
@@ -2223,6 +2238,7 @@ fn test_long_running_complex_research_pipeline() {
         unmet_goals: vec!["Report could benefit from more quantitative benchmark comparisons across all 5 areas".into()],
         should_continue: true, // quality-based continue
         summary: "All research complete. Report is comprehensive. Could add cross-area benchmark comparison table.".into(),
+        adjudication: None,
     });
     assert!(ctx.state.evaluations[1].should_continue,
         "Evaluator decides to continue for quality improvement despite no failures");
@@ -2254,6 +2270,7 @@ fn test_long_running_complex_research_pipeline() {
         overall_progress_pct: 100.0,
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
+        adjudication: None,
         summary: "Benchmark comparison added. Report is comprehensive with quantitative comparisons across all 5 areas.".into(),
     });
     ctx.state.completed = true;
@@ -2398,6 +2415,7 @@ fn test_ultra_long_running_cumulative_repairs() {
         overall_progress_pct: 16.7, failed_task_ids: vec!["task_2".into(), "task_3".into()],
         unmet_goals: vec!["Dataset B collection failed".into(), "Cleaning blocked".into()],
         should_continue: true,
+        adjudication: None,
         summary: "1/6 tasks. Dataset B API rate limited. Need retry with backoff.".into(),
     });
     ctx.state.repair_analyses.push(RepairAnalysis {
@@ -2438,6 +2456,7 @@ fn test_ultra_long_running_cumulative_repairs() {
         overall_progress_pct: 50.0, failed_task_ids: vec!["task_5".into()],
         unmet_goals: vec!["Predictive model failed convergence".into()],
         should_continue: true,
+        adjudication: None,
         summary: "3/4 loop 2 tasks done. ARIMA model failed. Need alternative approach.".into(),
     });
     ctx.state.repair_analyses.push(RepairAnalysis {
@@ -2476,6 +2495,7 @@ fn test_ultra_long_running_cumulative_repairs() {
         overall_progress_pct: 50.0, failed_task_ids: vec!["task_4_validate".into(), "task_6".into()],
         unmet_goals: vec!["Trend validation failed — bias in normalization".into()],
         should_continue: true,
+        adjudication: None,
         summary: "Model works but validation revealed normalization bias. Need to re-examine preprocessing.".into(),
     });
     ctx.state.repair_analyses.push(RepairAnalysis {
@@ -2544,6 +2564,7 @@ fn test_ultra_long_running_cumulative_repairs() {
         tasks_completed: 3, tasks_failed: 0, tasks_pending: 0,
         overall_progress_pct: 100.0, failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
+        adjudication: None,
         summary: "Pipeline complete. Normalization fixed, validation passed, comprehensive report generated.".into(),
     });
     ctx.state.completed = true;
@@ -2672,6 +2693,7 @@ fn test_5_loop_no_progress_safety_stop() {
             overall_progress_pct: 66.0, failed_task_ids: vec!["problem_1".into()],
             unmet_goals: vec!["Problem 1 unsolved: ∫e^(-x²)dx has no elementary closed form".into()],
             should_continue: true,
+            adjudication: None,
             summary: format!("{}/3 done. Problem 1 persistent: Gaussian integral needs special function or numerical method.", 2),
         });
 
@@ -2703,6 +2725,7 @@ fn test_5_loop_no_progress_safety_stop() {
             overall_progress_pct: 66.0, failed_task_ids: vec!["problem_1".into()],
             unmet_goals: vec!["Problem 1 still unsolved".into()],
             should_continue: true,
+            adjudication: None,
             summary: "Still 2/3 done. Problem 1 persistent.".into(),
         });
 
@@ -2829,6 +2852,7 @@ fn test_12_loop_software_refactoring_pipeline() {
             overall_progress_pct: progress.min(100.0), failed_task_ids: vec![],
             unmet_goals: vec!["Core extraction in progress".into()],
             should_continue: true, summary: format!("Phase 1 loop {loop_i}: {completed}/3 tasks this round"),
+            adjudication: None,
         });
 
         if r1 { completed_set.insert("auth".into()); }
@@ -2901,6 +2925,7 @@ fn test_12_loop_software_refactoring_pipeline() {
             overall_progress_pct: progress, failed_task_ids: vec![],
             unmet_goals: vec!["Phase 2 in progress".into()],
             should_continue: true, summary: format!("Phase 2 loop {}: {}/9 cumulative", loop_i, completed_set.len()),
+            adjudication: None,
         });
         ctx.state.loop_count += 1;
 
@@ -2967,6 +2992,7 @@ fn test_12_loop_software_refactoring_pipeline() {
             tasks_pending: 0, overall_progress_pct: progress, failed_task_ids: vec![],
             unmet_goals: vec![], should_continue: !r4,
             summary: format!("Phase 3 loop {loop_i}: {}/9 cumulative", completed_set.len()),
+            adjudication: None,
         });
 
         if !r3 {

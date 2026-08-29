@@ -293,7 +293,7 @@ async fn main() {
             let opts = miniagent_research::ResearchOptions {
                 max_papers, kg_only, validate, analyze,
                 data, top_n, enrich_file, enrich_delim,
-                enrich_relation, debate, min_year, use_store,
+                enrich_relation, debate, min_year, use_store, stop_after: None,
             };
             // Unified result layout: result/{id}_{brief} (server-compatible).
             let dir = match project_dir.as_deref() {
@@ -301,7 +301,10 @@ async fn main() {
                 None => miniagent_core::paths::result_root().join(cli_task_dir_name(&query)),
             };
             println!("📁 project dir: {}", dir.display());
-            let summary = miniagent_research::run_research(query.clone(), dir.clone(), opts, config.clone(), None).await;
+            // Research × Loop: same loop-orchestrated path as the server
+            // (per-phase explore→plan→dispatch→adjudicate→repair); the
+            // clarify step self-skips without an interactive channel.
+            let summary = miniagent_research::run_research_in_loop(query.clone(), dir.clone(), opts, config.clone(), None, None).await;
             println!("{summary}");
             // The research pipeline writes `<brief>.md` (user-facing report)
             // and `<brief>.md` is what the server's restart-restore scan

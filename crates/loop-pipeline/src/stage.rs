@@ -24,6 +24,9 @@ pub struct StageContext {
     pub config: Arc<AppConfig>,
     pub agent: Arc<Agent>,
     pub working_dir: String,
+    /// Optional interactive clarify channel (server wires the WS ask/reply
+    /// protocol; CLI runs pass None so clarification is skipped).
+    pub clarify_hook: Option<crate::clarify::ClarifyHook>,
 }
 
 impl StageContext {
@@ -40,6 +43,7 @@ impl StageContext {
             messages: Vec::new(),
             config,
             agent,
+            clarify_hook: None,
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".into()),
@@ -85,6 +89,12 @@ impl StageContext {
 
     pub fn with_max_loops(mut self, n: usize) -> Self {
         self.state.max_loops = n;
+        self
+    }
+
+    /// Wire the interactive clarify channel (server ask/reply protocol).
+    pub fn with_clarify_hook(mut self, hook: crate::clarify::ClarifyHook) -> Self {
+        self.clarify_hook = Some(hook);
         self
     }
 

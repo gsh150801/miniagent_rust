@@ -147,7 +147,7 @@ impl PipelineStage for EvaluateStage {
             },
         };
 
-        let response = provider.complete(&request, cancel).await?;
+        let response = provider.complete(&request, cancel.clone()).await?;
         let text: String = response.content.iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text.clone()),
@@ -177,6 +177,7 @@ impl PipelineStage for EvaluateStage {
                     unmet_goals: vec!["Evaluation parse failed, defaulting to continue".into()],
                     should_continue: failed > 0 || loop_count == 0,
                     summary: format!("{}/{} tasks completed. {} failed.", completed, total, failed),
+                    adjudication: None,
                 }
             }
         };
@@ -190,6 +191,64 @@ impl PipelineStage for EvaluateStage {
             evaluation.should_continue = false;
         } else if loop_count == 0 && completed == 0 {
             evaluation.should_continue = true;
+        }
+
+        // ── 三方裁决（advocate → challenger → arbiter）───────────────
+        // 当评估准备判定"全部完成"时，用辩论式三方裁决复核：主张方陈述
+        // 完成理由，挑战方主动找缺口（缺失产物/跑题/无依据声明），
+        // 裁决方依据双方陈述裁定 complete / needs_repair。裁决为
+        // needs_repair 时强制继续下一轮修复循环，其建议进入 unmet_goals。
+        // LLM 全部不可用时保持原判定（裁决是质量门，不是唯一信号）。
+        if !evaluation.should_continue {
+            let result_block: String = relevant_results.iter()
+                .map(|r| {
+                    let status = if r.success { "✓" } else { "✗" };
+                    format!("{status} [{}] {}", r.task_id,
+                        r.output.chars().take(400).collect::<String>())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let evidence = format!(
+                "Task outcomes:\n{result_block}\n\nWorking-dir artifacts:\n{}",
+                list_dir_files(&ctx.working_dir),
+            );
+            let providers: Vec<std::sync::Arc<dyn miniagent_provider::traits::LlmProvider>> = vec![
+                ctx.agent.flash_provider(),
+                ctx.agent.pro_provider(),
+            ];
+            match crate::adjudicate::adjudicate(
+                &plan.overall_goal,
+                &format!("{} subtask(s) executed across {} loop(s)", plan.tasks.len(), loop_count + 1),
+                &evidence,
+                &providers,
+                cancel.child_token(),
+            )
+            .await
+            {
+                Ok(adj) => {
+                    evaluation.adjudication = Some(serde_json::to_value(&adj).unwrap_or(serde_json::Value::Null));
+                    if adj.verdict == crate::adjudicate::AdjudicationVerdict::NeedsRepair {
+                        tracing::info!(
+                            unmet = ?adj.unmet,
+                            "adjudication overrode stop: needs_repair — forcing continue"
+                        );
+                        evaluation.should_continue = true;
+                        for u in &adj.unmet {
+                            evaluation.unmet_goals.push(u.clone());
+                        }
+                        for s in &adj.suggestions {
+                            evaluation.unmet_goals.push(format!("Repair suggestion: {s}"));
+                        }
+                        evaluation.summary = format!(
+                            "Adjudication: needs_repair — {}. {}",
+                            adj.summary, evaluation.summary
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "three-way adjudication unavailable — keeping evaluation as-is");
+                }
+            }
         }
 
         // ── 客观产物校验（缺陷 #3 修复）──────────────────────────────
@@ -307,6 +366,20 @@ impl PipelineStage for EvaluateStage {
     }
 }
 
+
+/// Bounded file listing of the working directory for adjudication evidence.
+fn list_dir_files(dir: &str) -> String {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten().take(40) {
+            let p = e.path();
+            if p.is_file() {
+                out.push(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            }
+        }
+    }
+    if out.is_empty() { "(none listed)".into() } else { out.join(", ") }
+}
 
 /// 客观产物校验：检查 plan 中标记为"成功"的 task，其 expected_output 提到的文件是否真存在。
 /// 返回产物文件缺失的 task_id 列表（"幽灵成功"——标记成功但产物不在）。

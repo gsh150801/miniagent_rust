@@ -1171,6 +1171,7 @@ dependencies = [
  "miniagent-core",
  "miniagent-hypothesis",
  "miniagent-kg",
+ "miniagent-loop-pipeline",
  "miniagent-provider",
  "miniagent-skill",
  "miniagent-tool",

@@ -48,6 +48,11 @@ pub struct ResearchOptions {
     pub debate: bool,
     pub min_year: String,
     pub use_store: bool,
+    /// Run only up to the named phase and stop (loop-orchestrated research
+    /// drives one phase per subtask; resume skips everything before it).
+    /// Phase keys: "literature" | "kg" | "prediction" | "hypotheses" |
+    /// "debate" | "validation" | "analysis" | "review". None = run all.
+    pub stop_after: Option<String>,
 }
 
 impl Default for ResearchOptions {
@@ -65,6 +70,7 @@ impl Default for ResearchOptions {
             debate: false,
             min_year: "2023".into(),
             use_store: false,
+            stop_after: None,
         }
     }
 }
@@ -121,7 +127,10 @@ pub async fn run_research(
     // as borrows so the pipeline body reads unchanged.
     let query: &str = &query;
     let config: &Arc<AppConfig> = &config;
-    let max_papers = opts.max_papers;
+    // Scope parameters; `min_year_owned`/`max_papers` may be refined by the
+    // LLM requirement-extraction pass below (explicit option values are the
+    // defaults the model fills from).
+    let mut max_papers = opts.max_papers;
     let kg_only = opts.kg_only;
     let validate = opts.validate;
     let analyze = opts.analyze;
@@ -131,8 +140,26 @@ pub async fn run_research(
     let enrich_delim = opts.enrich_delim;
     let enrich_relation = opts.enrich_relation.as_str();
     let debate = opts.debate;
-    let min_year = opts.min_year.as_str();
+    let mut min_year_owned: String = opts.min_year.clone();
     let use_store = opts.use_store;
+    let stop_after: Option<String> = opts.stop_after.clone();
+    // Loop-orchestrated research drives ONE phase per subtask invocation:
+    // when `stop_after` names the phase just completed, stop here (resume
+    // skips everything before it, so the next subtask continues cleanly).
+    let phase_stop = |phase: &str,
+                      manifest: &mut crate::ProjectManifest,
+                      q: &str|
+     -> Option<String> {
+        if stop_after.as_deref() == Some(phase) {
+            return Some(finish_partial(
+                manifest,
+                q,
+                &format!("stop_after={phase}：该阶段完成（loop 编排模式按阶段推进）"),
+                "phase_stop",
+            ));
+        }
+        None
+    };
     let mut prev_phase: Option<&'static str> = None;
     use miniagent_kg::embedding::KgeModel;
     use miniagent_kg::link_prediction::LinkPredictionScorer;
@@ -202,7 +229,7 @@ pub async fn run_research(
                 "analyze": analyze,
                 "top_n": top_n,
                 "debate": debate,
-                "min_year": min_year,
+                "min_year": min_year_owned,
                 "use_store": use_store,
             })
             .to_string(),
@@ -226,9 +253,82 @@ pub async fn run_research(
     // `complete` takes `&self`, so one client is shared across parallel calls.
     let flash: std::sync::Arc<dyn LlmProvider> = make_providers(config).0.into();
 
+    // ── Phase 0: Requirement Extraction (generic, LLM derived) ─────
+    // Research requests state scope constraints in free language ("近8年",
+    // "comprehensive", "at most 20 papers"). The model maps that intent to
+    // concrete parameters — no regex, no language-specific parsing. Unstated
+    // fields keep their configured defaults; explicit CLI/option values win.
+    {
+        let extraction_prompt = format!(
+            "Extract research-scope constraints from this research request. \
+             Output ONLY JSON: {{\"year_from\": <earliest publication year as a 4-digit integer, or null if not stated>, \
+             \"max_papers\": <number of papers to retrieve as an integer, or null if not stated>, \
+             \"notes\": \"<one short sentence>\"}}\n\nResearch request: {query}"
+        );
+        let request = miniagent_provider::traits::CompletionRequest {
+            system: "You extract structured research-scope requirements. Output ONLY valid JSON.".into(),
+            messages: vec![miniagent_core::message::Message::user(&extraction_prompt)],
+            tools: vec![],
+            config: miniagent_core::config::InferenceConfig {
+                temperature: Some(0.0),
+                max_tokens: Some(4_096),
+                ..Default::default()
+            },
+        };
+        let mut extraction_providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+        extraction_providers.extend(
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into),
+        );
+        for provider in &extraction_providers {
+        if let Ok(resp) = provider.complete(&request, cancel.child_token()).await {
+            let text: String = resp
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let repaired = miniagent_core::json_util::extract_and_repair(&text);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                let y = v["year_from"].as_u64().filter(|y| (1900..=2100).contains(y));
+                let n = v["max_papers"].as_u64().filter(|n| (1..=500).contains(n));
+                let notes = v["notes"].as_str().unwrap_or("");
+                if y.is_some() || n.is_some() {
+                    let y_old = min_year_owned.clone();
+                    if let Some(y) = y {
+                        min_year_owned = y.to_string();
+                    }
+                    if let Some(n) = n {
+                        max_papers = n as usize;
+                    }
+                    println!(
+                        "   🎯 requirement extraction: year_from={min_year_owned} (was {y_old}), max_papers={max_papers} — {notes}"
+                    );
+                    manifest.log_event(
+                        "requirements_extracted",
+                        format!("year_from={} max_papers={max_papers} notes={notes}", min_year_owned),
+                    );
+                }
+                break; // extraction done
+            }
+        }
+        }
+    }
+    let min_year: &str = &min_year_owned;
+
     // ── Phases 1–2: Literature Search + Abstracts (resumable) ──────
     let papers_path = project_dir.join("papers.json");
     let mut paper_texts: Vec<(String, String)> = Vec::new();
+    // Effective English PubMed query — persisted alongside the corpus so the
+    // disease anchor and corpus-coherence gate work identically on resume.
+    let pubmed_query_path = project_dir.join("pubmed_query.txt");
+    let mut pubmed_query: String = std::fs::read_to_string(&pubmed_query_path)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let resumed_papers: Option<Vec<(String, String)>> = if manifest.is_stage_done("abstracts") {
         std::fs::read(&papers_path)
             .ok()
@@ -246,7 +346,14 @@ pub async fn run_research(
         (std::time::Duration::default(), std::time::Duration::default())
     } else {
     // ── Phase 1: Translate query to PubMed syntax if needed ──────
-    let pubmed_query = if has_non_english(query) {
+    // Generic, provider-agnostic: translate with the primary flash model,
+    // escalate budget, then walk the cross-family fallback list. A non-English
+    // research question is NEVER sent to PubMed raw — an unparseable term
+    // makes NCBI match the entire database (measured: 6M hits with date
+    // filters ignored), which silently poisons every downstream stage. When
+    // no provider can produce a valid English query, the pipeline aborts with
+    // a clear stop reason instead.
+    if has_non_english(query) {
         let translation_prompt = format!(
             "Convert this research question into a PubMed search query.\n\
              Use English terms with boolean operators (AND/OR/NOT).\n\
@@ -256,12 +363,12 @@ pub async fn run_research(
              Research question: {query}\n\n\
              PubMed query:"
         );
-        let make_request = |prompt: String| miniagent_provider::traits::CompletionRequest {
+        let make_request = |prompt: String, max_tokens: u32| miniagent_provider::traits::CompletionRequest {
             system: "You are a PubMed search expert. Output ONLY the query string.".into(),
             messages: vec![miniagent_core::message::Message::user(prompt)],
             tools: vec![],
             config: miniagent_core::config::InferenceConfig {
-                temperature: Some(0.0), max_tokens: Some(100), ..Default::default()
+                temperature: Some(0.0), max_tokens: Some(max_tokens), ..Default::default()
             },
         };
         let extract = |resp: &miniagent_provider::traits::CompletionResponse| {
@@ -277,46 +384,89 @@ pub async fn run_research(
             .trim()
             .to_string()
         };
-        // Self-verification (dsh): a valid PubMed query is pure ASCII. A model
-        // echoing the original non-English question back would silently yield
-        // 0 hits, so verify and retry once with an explicit corrective nudge.
-        let is_valid = |s: &str| !s.is_empty() && !s.contains('<') && s.len() <= 400 && !has_non_english(s);
-        let first = flash
-            .complete(&make_request(translation_prompt.clone()), cancel.child_token())
-            .await
-            .ok()
-            .map(|resp| extract(&resp))
-            .unwrap_or_default();
-        let translated = if is_valid(&first) {
-            first
-        } else {
-            let retry_prompt = format!(
-                "The previous attempt failed: it must be a pure-ASCII English PubMed \
-                 query with boolean operators, with NO Chinese characters, NO quotes, \
-                 NO explanation.\n\nPrevious attempt: {first}\n\nResearch question: {query}\n\n\
-                 Corrected PubMed query:"
-            );
-            let second = flash
-                .complete(&make_request(retry_prompt), cancel.child_token())
+        // Format validation only — no domain terms. PubMed queries with
+        // synonym expansions legitimately exceed 400 chars, so length is
+        // only bounded loosely; the non-English check targets CJK ranges
+        // (curly quotes / en-dashes in English text are fine), and the
+        // corpus-coherence gate is what actually catches whole-database
+        // garbage retrieval.
+        let has_cjk = |s: &str| s.chars().any(|c| {
+            let u = c as u32;
+            (0x4E00..=0x9FFF).contains(&u)          // CJK unified ideographs
+                || (0x3000..=0x303F).contains(&u)   // CJK punctuation
+                || (0xFF00..=0xFFEF).contains(&u)   // fullwidth forms
+        });
+        let is_valid =
+            |s: &str| !s.is_empty() && !s.contains('<') && s.len() <= 2_000 && !has_cjk(s);
+
+        let mut providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+        providers.extend(
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into),
+        );
+        let mut translation_provenance: Vec<String> = Vec::new();
+        'translation: for (p_idx, provider) in providers.iter().enumerate() {
+            let first = provider
+                .complete(&make_request(translation_prompt.clone(), 400), cancel.child_token())
                 .await
                 .ok()
                 .map(|resp| extract(&resp))
                 .unwrap_or_default();
-            if is_valid(&second) {
-                second
+            let first_head: String = first.chars().take(40).collect();
+            let candidate = if is_valid(&first) {
+                first
             } else {
-                manifest.log_event(
-                    "query_translation_failed",
-                    format!("model returned non-English/invalid query twice (last: {second:?}); falling back to raw query"),
+                let retry_prompt = format!(
+                    "The previous attempt failed: it must be a pure-ASCII English PubMed \
+                     query with boolean operators, with NO Chinese characters, NO quotes, \
+                     NO explanation.\n\nPrevious attempt: {first}\n\nResearch question: {query}\n\n\
+                     Corrected PubMed query:"
                 );
-                query.to_string()
+                let second = provider
+                    .complete(&make_request(retry_prompt, 16_384), cancel.child_token())
+                    .await
+                    .ok()
+                    .map(|resp| extract(&resp))
+                    .unwrap_or_default();
+                if is_valid(&second) { second } else { String::new() }
+            };
+            if is_valid(&candidate) {
+                pubmed_query = candidate;
+                translation_provenance.push(format!("provider#{p_idx}"));
+                break 'translation;
             }
-        };
-        eprintln!("   Query translated: {query} → {translated}");
-        translated
+            translation_provenance.push(format!("provider#{p_idx}: invalid({first_head})"));
+        }
+        if !is_valid(&pubmed_query) {
+            // All providers failed — abort loudly. Sending the raw non-English
+            // question to PubMed matches the whole database and produces an
+            // off-topic run whose stages all "succeed" (the failure mode this
+            // replaces).
+            let reason = format!(
+                "查询翻译失败：{} 个供应商均无法产出有效英文 PubMed 查询（{}）。为避免整库误检，管线中止；请稍后重试或改用英文描述研究问题。",
+                providers.len(),
+                translation_provenance.join("; "),
+            );
+            manifest.record_stage(
+                "search",
+                crate::StageStatus::Failed,
+                std::time::Duration::default(),
+                vec![],
+                Some(serde_json::json!({ "translation": "failed" })),
+            );
+            manifest.log_event("query_translation_failed", reason.clone());
+            eprintln!("\n❌ Pipeline aborted: {reason}");
+            return finish_partial(&mut manifest, query, &reason, "pipeline_aborted");
+        }
+        manifest.log_event("query_translated", format!("{} → {}", query, pubmed_query));
+        eprintln!("   Query translated: {query} → {pubmed_query}");
     } else {
-        query.to_string()
-    };
+        pubmed_query = query.to_string();
+    }
+    // Persist the effective English query: the disease-anchor stage and the
+    // corpus-coherence gate both operate on it, including on resume.
+    let _ = std::fs::write(&pubmed_query_path, &pubmed_query);
 
     // ── Phase 1b: Search PubMed (multi-batch pagination) ──────────
     let phase_start = Instant::now();
@@ -475,17 +625,151 @@ pub async fn run_research(
     (phase1_dur, phase2_dur)
     };
 
+    // ── Phase 2a: Corpus-Coherence Gate (fail-closed, LLM judged) ──
+    // Generic protection against whole-database retrieval and any other
+    // systematic retrieval failure: one LLM verdict on whether the corpus as
+    // a whole is on-topic for the research question. No keyword lists or
+    // numeric thresholds — the model decides from the titles and the question.
+    // An incoherent corpus poisons KG, hypotheses, plans, and analysis while
+    // every stage still "succeeds" (the live failure this gate exists for),
+    // so incoherence aborts the pipeline for audit instead of continuing.
+    if !manifest.is_stage_done("corpus_coherence") && !paper_texts.is_empty() {
+        let phase_start = Instant::now();
+        println!("\n━━━ Phase 2a: Corpus-Coherence Gate ━━━");
+        let titles: Vec<String> = paper_texts
+            .iter()
+            .map(|(pmid, text)| {
+                let head: String = text.chars().take(140).collect();
+                format!("PMID {pmid}: {head}")
+            })
+            .collect();
+        let coherence_prompt = format!(
+            "Research question:\n{query}\n\nRetrieved corpus ({n} papers, title/abstract heads):\n{titles}\n\n\
+             Judge ONLY whether this corpus as a whole is on-topic for the research question. \
+             Output ONLY JSON: {{\"coherent\": true|false, \"on_topic_estimate\": <0-100>, \"reason\": \"<one sentence>\"}}",
+            n = titles.len(),
+            titles = titles.join("\n"),
+        );
+        // Reasoning models burn budget on chain-of-thought before the JSON —
+        // a small cap yields empty text (observed live at 200 tokens).
+        let coherence_request = miniagent_provider::traits::CompletionRequest {
+            system: "You judge literature-retrieval quality. Output ONLY valid JSON.".into(),
+            messages: vec![miniagent_core::message::Message::user(&coherence_prompt)],
+            tools: vec![],
+            config: miniagent_core::config::InferenceConfig {
+                temperature: Some(0.0),
+                max_tokens: Some(16_384),
+                ..Default::default()
+            },
+        };
+        let mut coherent: Option<bool> = None;
+        let mut coherence_reason = String::new();
+        let mut coherence_providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+        coherence_providers.extend(
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into),
+        );
+        for provider in &coherence_providers {
+            if let Ok(resp) = provider.complete(&coherence_request, cancel.child_token()).await {
+                let text: String = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let repaired = miniagent_core::json_util::extract_and_repair(&text);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    coherent = Some(v["coherent"].as_bool().unwrap_or(false));
+                    coherence_reason = v["reason"].as_str().unwrap_or("").to_string();
+                    break;
+                }
+            }
+        }
+        let dur = phase_start.elapsed();
+        match coherent {
+            Some(true) => {
+                println!("   ✅ corpus coherent: {coherence_reason}");
+                manifest.record_stage(
+                    "corpus_coherence",
+                    crate::StageStatus::Completed,
+                    dur,
+                    vec![],
+                    Some(serde_json::json!({ "coherent": true })),
+                );
+            }
+            Some(false) => {
+                let reason = format!(
+                    "语料一致性门判定检索结果与研究问题不符：{coherence_reason}。为避免整条管线在错误语料上空转，管线中止；请调整研究问题表述后重试。"
+                );
+                manifest.record_stage(
+                    "corpus_coherence",
+                    crate::StageStatus::Failed,
+                    dur,
+                    vec![],
+                    Some(serde_json::json!({ "coherent": false, "reason": coherence_reason })),
+                );
+                manifest.log_event("corpus_incoherent", reason.clone());
+                eprintln!("\n❌ Pipeline aborted: {reason}");
+                return finish_partial(&mut manifest, query, &reason, "pipeline_aborted");
+            }
+            None => {
+                // Verdict unavailable (providers degraded) — fail CLOSED: an
+                // unjudgeable corpus is exactly when off-topic corpora slip
+                // through, so abort instead of continuing blindly.
+                let reason = "语料一致性门无法完成判定（LLM 不可用）。为保守起见管线中止；请稍后重试。";
+                manifest.record_stage(
+                    "corpus_coherence",
+                    crate::StageStatus::Failed,
+                    dur,
+                    vec![],
+                    Some(serde_json::json!({ "verdict": "unavailable" })),
+                );
+                manifest.log_event("corpus_coherence_unavailable", reason);
+                eprintln!("\n❌ Pipeline aborted: {reason}");
+                return finish_partial(&mut manifest, query, reason, "pipeline_aborted");
+            }
+        }
+        let _ = manifest.save();
+    }
+
     // ── Phase 2b: Relevance Filter ────────────────────────────────
     // PubMed keyword recall is broad; a single off-topic abstract can
     // dominate link prediction with hub entities unrelated to the query
     // (observed: one sarcopenia paper redirected every hypothesis away from
     // the queried disease). A cheap flash-model filter keeps the corpus
-    // on-topic; rejections are persisted for audit.
+    // on-topic; rejections are persisted for audit. Fail-CLOSED: papers the
+    // filter could not judge (provider error/empty) are rejected, not kept —
+    // the corpus-coherence gate above already guaranteed overall on-topicness
+    // before this per-paper pass.
     if !manifest.is_stage_done("relevance_filter") && !paper_texts.is_empty() {
         let phase_start = Instant::now();
         println!("\n━━━ Phase 2b: Relevance Filter ━━━");
-        let (kept, rejected) =
-            filter_irrelevant_papers(flash.clone(), query, &paper_texts, cancel.child_token()).await;
+        let mut filter_fallbacks: Vec<std::sync::Arc<dyn LlmProvider>> =
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        filter_fallbacks.push(flash.clone());
+        let n_in = paper_texts.len();
+        let (mut kept, rejected, unjudged) =
+            filter_irrelevant_papers(flash.clone(), filter_fallbacks, &pubmed_query, &paper_texts, cancel.child_token()).await;
+        // Corpus-level verdict (Phase 2a) already established on-topicness;
+        // the per-paper pass is best-effort trimming. Unjudged papers are
+        // retained (audited) rather than sinking a coherent corpus.
+        if !unjudged.is_empty() {
+            println!(
+                "      ⚠ {}/{} papers unjudged (provider degradation) — retained on the corpus-level verdict",
+                unjudged.len(), n_in
+            );
+            kept.extend(unjudged.iter().cloned());
+            manifest.log_event(
+                "relevance_filter_unjudged_retained",
+                format!("{}/{} retained on corpus-level coherence verdict", unjudged.len(), n_in),
+            );
+        }
         println!(
             "   kept {} / {} (rejected {} as off-topic)",
             kept.len(),
@@ -502,12 +786,29 @@ pub async fn run_research(
                 println!("      → {}", project_dir.join("papers_rejected.json").display());
             }
         }
-        if !kept.is_empty() {
-            paper_texts = kept;
-            // papers.json is the resume artifact — persist the filtered corpus.
-            if let Ok(json) = serde_json::to_vec(&paper_texts) {
-                let _ = std::fs::write(&papers_path, json);
-            }
+        if kept.is_empty() {
+            // Fail-closed filter emptied the corpus: either the corpus really
+            // is off-topic or the judging provider degraded mid-run. Either
+            // way, continuing on the UNFILTERED corpus would defeat the gate.
+            let reason = format!(
+                "相关性过滤后保留 0/{total} 篇（全部被判定不相关）。为避免在不可信语料上继续，管线中止。",
+                total = paper_texts.len(),
+            );
+            manifest.record_stage(
+                "relevance_filter",
+                crate::StageStatus::Failed,
+                phase_start.elapsed(),
+                vec![],
+                Some(serde_json::json!({ "kept": 0, "rejected": rejected.len() })),
+            );
+            manifest.log_event("relevance_filter_empty", reason.clone());
+            eprintln!("\n❌ Pipeline aborted: {reason}");
+            return finish_partial(&mut manifest, query, &reason, "pipeline_aborted");
+        }
+        paper_texts = kept;
+        // papers.json is the resume artifact — persist the filtered corpus.
+        if let Ok(json) = serde_json::to_vec(&paper_texts) {
+            let _ = std::fs::write(&papers_path, json);
         }
         manifest.record_stage(
             "relevance_filter",
@@ -520,6 +821,9 @@ pub async fn run_research(
             })),
         );
         let _ = manifest.save();
+        if let Some(out) = phase_stop("literature", &mut manifest, query) {
+            return out;
+        }
     }
 
     // ── Phase 3: KG Extraction (resumable, parallel) ──────────────
@@ -734,6 +1038,9 @@ pub async fn run_research(
         manifest.log_event("pipeline_complete_kg_only", format!("total_secs={:.1}", total.as_secs_f64()));
         return finish_partial(&mut manifest, query, "kg-only 模式：知识图谱构建完成后按参数停止", "pipeline_complete_kg_only");
     }
+    if let Some(out) = phase_stop("kg", &mut manifest, query) {
+        return out;
+    }
 
     // ── Phase 4: Embedding & Link Prediction (resumable) ──────────
     let phase_start = Instant::now();
@@ -826,7 +1133,11 @@ pub async fn run_research(
         // entities from a single off-topic paper (e.g. "mortality risk") soak
         // up the top scores and every hypothesis drifts away from the disease
         // the user asked about.
-        if let Some(anchor) = find_disease_anchor(&kg, query) {
+        // Anchor to the effective ENGLISH query: the original question may be
+        // in any language, while KG entity names come from English literature.
+        // Anchoring on the raw query made non-English runs unanchorable, so
+        // off-topic hub candidates won (the live plant-pathology incident).
+        if let Some(anchor) = find_disease_anchor(&kg, &pubmed_query) {
             let name = kg.get_entity(&anchor).map(|e| e.name.clone()).unwrap_or_default();
             let anchored: Vec<_> = cands
                 .iter()
@@ -870,6 +1181,9 @@ pub async fn run_research(
         vec![],
         None,
     );
+    if let Some(out) = phase_stop("prediction", &mut manifest, query) {
+        return out;
+    }
 
     // ── Phase 5: Hypothesis Generation (resumable, parallel) ──────
     // The KG is shared read-only across parallel generation jobs.
@@ -1020,6 +1334,9 @@ pub async fn run_research(
         vec![project_dir.join("hypotheses.json")],
         Some(serde_json::json!({ "count": ranked.len() })),
     );
+    if let Some(out) = phase_stop("hypotheses", &mut manifest, query) {
+        return out;
+    }
 
     // ── Phase 6b: Hypothesis Debate · Compare · Refine ─────────────
     // Stress-test each hypothesis on evidence vs. contradiction, cross-compare
@@ -1183,6 +1500,9 @@ pub async fn run_research(
         vec![],
         None,
     );
+    if let Some(out) = phase_stop("debate", &mut manifest, query) {
+        return out;
+    }
 
     // ── Phase 7: Validation Planning (resumable, parallel) ────────
     // Generate structured validation plans (data-analysis tasks + wet-lab
@@ -1333,6 +1653,9 @@ pub async fn run_research(
         manifest.validation_plans.clone(),
         Some(serde_json::json!({ "plans": validation_plans.len() })),
     );
+    if let Some(out) = phase_stop("validation", &mut manifest, query) {
+        return out;
+    }
 
     // ── Phase 8: Data Analysis Execution (resumable) ──────────────
     // Execute each data-analysis task end-to-end with full provenance. (Goal 4)
@@ -1529,6 +1852,9 @@ pub async fn run_research(
             "self_repair_rounds": repair_count,
         })),
     );
+    if let Some(out) = phase_stop("analysis", &mut manifest, query) {
+        return out;
+    }
 
     let total = start.elapsed();
     println!("\n╔══ Pipeline Complete ═════════════════════════════════════╗");
@@ -1596,6 +1922,7 @@ pub async fn run_research(
         println!("\n━━━ Phase 9: Report Review & Verification ━━━");
         let report_md = std::fs::read_to_string(&report_path).unwrap_or_default();
         let review_ctx = crate::review::ReviewContext {
+            question: query.to_string(),
             report_markdown: report_md,
             facts: crate::review::collect_facts(&manifest),
         };
@@ -2029,17 +2356,23 @@ fn first_geo_accession(content: &str) -> Option<String> {
 /// Score each paper's relevance to the research query (0-10) with the cheap
 /// flash model and keep papers scoring >= 5. Returns (kept, rejected-with-reason).
 /// Fails open (keeps the paper) when the LLM call errors.
+/// Returns (kept, genuinely_rejected, unjudged). Unjudged papers (every
+/// provider failed for that call) are separated so the caller can decide —
+/// with the corpus-coherence gate upstream, retaining them as "trimmed
+/// best-effort" is safer than aborting a coherent corpus.
 async fn filter_irrelevant_papers(
     flash: std::sync::Arc<dyn LlmProvider>,
+    fallbacks: Vec<std::sync::Arc<dyn LlmProvider>>,
     query: &str,
     papers: &[(String, String)],
     cancel: CancellationToken,
-) -> (Vec<(String, String)>, Vec<(String, String)>) {
+) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, String)>) {
     let concurrency = 6usize;
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut jobs = Vec::with_capacity(papers.len());
     for (pmid, text) in papers {
         let flash = flash.clone();
+        let fallbacks = fallbacks.clone();
         let sem = sem.clone();
         let cancel = cancel.child_token();
         let pmid = pmid.clone();
@@ -2060,44 +2393,63 @@ async fn filter_irrelevant_papers(
                 tools: vec![],
                 config: miniagent_core::config::InferenceConfig {
                     temperature: Some(0.0),
-                    max_tokens: Some(120),
+                    max_tokens: Some(2_048),
                     ..Default::default()
                 },
             };
-            let mut score = 10i64; // fail-open
+            // Walk primary + cross-family fallbacks until one returns a
+            // parseable verdict; reasoning models need headroom (a tiny
+            // max_tokens cap yields empty text — observed live).
+            let mut providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+            providers.extend(fallbacks.iter().cloned());
+            let mut score = -1i64; // unjudged unless some provider answers
             let mut reason = String::new();
-            if let Ok(resp) = flash.complete(&request, cancel).await {
-                let t: String = resp.content.iter()
-                    .filter_map(|b| match b {
-                        miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let cleaned = t.trim()
-                    .trim_start_matches("```json").trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim();
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
-                    score = v.get("score").and_then(|s| s.as_i64()).unwrap_or(10);
-                    reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            for provider in &providers {
+                if let Ok(resp) = provider.complete(&request, cancel.clone()).await {
+                    let t: String = resp.content.iter()
+                        .filter_map(|b| match b {
+                            miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let cleaned = t.trim()
+                        .trim_start_matches("```json").trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
+                        score = v.get("score").and_then(|s| s.as_i64()).unwrap_or(-1);
+                        reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        if score >= 0 {
+                            break;
+                        }
+                    }
                 }
+            }
+            if score == -1 {
+                reason = "unjudged (LLM unavailable or invalid output)".into();
             }
             (pmid, text, score, reason)
         }));
     }
     let mut kept = Vec::new();
     let mut rejected = Vec::new();
+    let mut unjudged = Vec::new();
     for job in jobs {
         if let Ok((pmid, text, score, reason)) = job.await {
             if score >= 5 {
                 kept.push((pmid, text));
+            } else if score == -1 {
+                // Unjudgeable: caller decides (retained on corpus-level
+                // coherence verdict, audited separately).
+                unjudged.push((pmid, text));
+                let _ = reason;
             } else {
                 rejected.push((pmid, reason));
             }
         }
     }
-    (kept, rejected)
+    (kept, rejected, unjudged)
 }
 
 /// Find the KG entity that best represents the queried disease: among

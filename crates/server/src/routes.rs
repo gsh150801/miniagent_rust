@@ -1076,14 +1076,31 @@ async fn handle_research_run(
     let run_opts = opts.clone();
     let run_config = state.config.clone();
     let run_cb = on_progress.clone();
+    // Interactive clarify channel: the loop orchestrator's Clarify step asks
+    // the user through the WS ask/reply protocol (5-min timeout ⇒ assumption
+    // noted, run continues — same semantics as workflow-mode asks).
+    let ask_socket = Arc::clone(socket);
+    let ask_state = state.clone();
+    let ask_task_id = task_id.clone();
+    let ask_hook: miniagent_loop_pipeline::ClarifyHook = Arc::new(move |question, options| {
+        let socket = Arc::clone(&ask_socket);
+        let state = ask_state.clone();
+        let task_id = ask_task_id.clone();
+        Box::pin(async move {
+            let opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+            ask_user(&socket, &state, &task_id, &question, &opts).await
+        })
+    });
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let join = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
-        let summary = rt.block_on(miniagent_research::run_research(
-            run_prompt, run_dir, run_opts, run_config, Some(run_cb),
+        // Research × Loop: every phase (文献检索/KG/链路预测/假说/辩论/验证/
+        // 分析/审核) runs as a loop subtask with three-way adjudication.
+        let summary = rt.block_on(miniagent_research::run_research_in_loop(
+            run_prompt, run_dir, run_opts, run_config, Some(run_cb), Some(ask_hook),
         ));
         let _ = tx.send(summary);
         Ok::<(), String>(())
