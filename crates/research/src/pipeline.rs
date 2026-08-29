@@ -1384,6 +1384,37 @@ pub async fn run_research(
             .filter_map(|a| a.hypothesis_id.map(|h| (h, a.task_id.clone())))
             .collect();
 
+        // Biomni-style know-how retrieval: match curated analysis skills to
+        // the plan's statistical methods/objectives and inject the top bodies
+        // as protocol hints into every generated script.
+        {
+            use miniagent_skill::discovery::SkillDiscovery;
+            use miniagent_skill::registry::SkillRegistry;
+            let mut registry = SkillRegistry::new();
+            for b in SkillDiscovery::new().discover() {
+                registry.register(b);
+            }
+            let query = validation_plans
+                .iter()
+                .flat_map(|p| {
+                    p.data_analysis_tasks
+                        .iter()
+                        .map(|t| format!("{} {}", t.statistical_method, t.objective))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let hints: Vec<String> = registry
+                .find_matching(&query, 2)
+                .into_iter()
+                .map(|b| b.body.clone())
+                .collect();
+            if !hints.is_empty() {
+                println!("   🧩 matched {} analysis skill(s) as protocol hints", hints.len());
+                manifest.log_event("skills_matched", format!("{} protocol hints injected into script generation", hints.len()));
+                opts.skill_hints = hints;
+            }
+        }
+
         for (plan_idx, plan) in validation_plans.iter().enumerate() {
             let work_dir = project_abs.join("analysis").join(format!("plan_{plan_idx}"));
             for task in &plan.data_analysis_tasks {
@@ -1551,6 +1582,80 @@ pub async fn run_research(
         Err(e) => println!("⚠️  failed to write user report: {e}"),
     }
 
+    // ── Phase 9: Final-Report Review & Verification (safety net) ─────
+    // Two-layer audit of the user-facing report against the audit manifest:
+    // (1) deterministic mechanical cross-checks (always run), (2) best-effort
+    // LLM structured review over the cross-family fallback list. The review
+    // is append-only: report_review.json + an appended 审核章节 in the
+    // report + a `review` event/stage in project.json.
+    phase_end(&on_progress, &mut prev_phase);
+    phase_begin(&on_progress, "review");
+    let review_start = std::time::Instant::now();
+    let report_path = project_dir.join(format!("{user_brief}.md"));
+    if report_path.exists() {
+        println!("\n━━━ Phase 9: Report Review & Verification ━━━");
+        let report_md = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let review_ctx = crate::review::ReviewContext {
+            report_markdown: report_md,
+            facts: crate::review::collect_facts(&manifest),
+        };
+        let checks = crate::review::mechanical_checks(&review_ctx);
+        let mut review_providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+        review_providers.extend(
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into),
+        );
+        let llm = crate::review::llm_review(&review_ctx, &review_providers, cancel.child_token()).await;
+        let review = crate::review::combine(checks, llm);
+        println!(
+            "   审核结论: {} ({} checks, {} issue(s), reviewer={})",
+            review.verdict,
+            review.checks.len(),
+            review.issues.len(),
+            review.reviewer
+        );
+        for i in review.issues.iter().take(3) {
+            println!("      【{}】{}", i.severity, i.description);
+        }
+        match crate::review::persist_review(&project_dir, &review) {
+            Ok(p) => {
+                println!("      → {}", p.display());
+                manifest.log_event(
+                    "report_review",
+                    format!(
+                        "verdict={} checks={} issues={} reviewer={}",
+                        review.verdict,
+                        review.checks.len(),
+                        review.issues.len(),
+                        review.reviewer
+                    ),
+                );
+            }
+            Err(e) => println!("   ⚠️ review persist failed: {e}"),
+        }
+        // Append the audit section to the report (append-only; never rewrites).
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&report_path) {
+            use std::io::Write as _;
+            let _ = f.write_all(crate::review::review_markdown_section(&review).as_bytes());
+        }
+        manifest.record_stage(
+            "review",
+            crate::StageStatus::Completed,
+            review_start.elapsed(),
+            vec![project_dir.join("report_review.json")],
+            Some(serde_json::json!({ "verdict": review.verdict, "issues": review.issues.len() })),
+        );
+        let _ = manifest.save();
+    } else {
+        manifest.record_stage(
+            "review",
+            crate::StageStatus::Skipped,
+            review_start.elapsed(),
+            vec![],
+            None,
+        );
+    }
     phase_end(&on_progress, &mut prev_phase);
     let plans_note = if validate {
         format!(" | validation plans: {}", validation_plans.len())

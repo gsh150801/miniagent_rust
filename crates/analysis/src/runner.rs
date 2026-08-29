@@ -39,6 +39,10 @@ pub struct RunOpts {
     pub extra_packages: Vec<String>,
     /// Path to a local data file (overrides task dataset_source when set).
     pub local_data: Option<PathBuf>,
+    /// Biomni-style know-how: bodies of the skills matched to this task
+    /// (analysis protocols, package traps, honesty rules). Injected into the
+    /// script-generation prompt so generated code follows curated practice.
+    pub skill_hints: Vec<String>,
 }
 
 impl Default for RunOpts {
@@ -55,6 +59,7 @@ impl Default for RunOpts {
                 "statsmodels".into(),
             ],
             local_data: None,
+            skill_hints: Vec::new(),
         }
     }
 }
@@ -534,6 +539,23 @@ impl AnalysisRunner {
             None => String::new(),
         };
 
+        // Biomni-style know-how retrieval: matched skill protocols (max 2,
+        // capped) are injected so generated code follows curated analysis
+        // practice (data layout, package traps, honesty rules).
+        let skill_block = if opts.skill_hints.is_empty() {
+            String::new()
+        } else {
+            let joined: String = opts
+                .skill_hints
+                .iter()
+                .map(|s| format!("---\n{}\n---\n", s.chars().take(3500).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n**ANALYSIS PROTOCOLS (curated best practice — follow them):**\n{joined}\n"
+            )
+        };
+
         let prompt = format!(
             r#"You are a bioinformatics engineer. Write ONE self-contained, reproducible Python script.
 
@@ -549,7 +571,7 @@ impl AnalysisRunner {
 
 OUTPUT_DIR = {output_dir}  # write all outputs here (absolute path)
 SEED = {seed}
-{repair}
+{skill_block}{repair}
 Requirements:
 1. Set seeds at the top: `import numpy as np, random; np.random.seed({seed}); random.seed({seed})`.
 2. Read the input data with pandas. Use robust parsing (delimiters, missing values).
@@ -574,6 +596,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             input = input_block,
             output_dir = python_str(&output_dir.to_string_lossy()),
             seed = opts.seed,
+            skill_block = skill_block,
             repair = repair_block,
         );
 

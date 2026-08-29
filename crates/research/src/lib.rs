@@ -12,6 +12,7 @@
 //! orchestrator) without pulling in the agent/kg/hypothesis crates.
 
 pub mod pipeline;
+pub mod review;
 pub use pipeline::{run_research, ResearchOptions, ResearchProgress};
 
 use anyhow::{Context, Result};

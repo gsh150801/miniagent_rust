@@ -15,6 +15,9 @@ mod kg_tools;
 mod ask_user;
 mod notebook_edit;
 mod geo_search;
+mod opentargets;
+mod enrichr;
+mod uniprot;
 
 pub use read::ReadTool;
 pub use write::WriteTool;
@@ -31,6 +34,9 @@ pub use patent_search::PatentSearchTool;
 pub use clinical_trials::ClinicalTrialsTool;
 pub use kg_tools::{KgHandle, KgQueryTool, KgAddTool, HypothesisSuggestTool};
 pub use geo_search::GeoSearchTool;
+pub use opentargets::OpenTargetsTool;
+pub use enrichr::EnrichrTool;
+pub use uniprot::UniprotTool;
 
 use crate::registry::ToolRegistry;
 use ask_user::AskUserTool;
@@ -54,7 +60,10 @@ pub fn defaults() -> ToolRegistry {
         .register(ClinicalTrialsTool::new())
         .register(AskUserTool::new())
         .register(NotebookEditTool::new())
-        .register(GeoSearchTool::new());
+        .register(GeoSearchTool::new())
+        .register(OpenTargetsTool::new())
+        .register(EnrichrTool::new())
+        .register(UniprotTool::new());
     registry
 }
 

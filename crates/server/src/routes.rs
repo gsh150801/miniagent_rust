@@ -1002,6 +1002,9 @@ async fn handle_research_run(
         serde_json::json!({ "name": "analysis", "handler": "research",
             "description": "端到端数据分析：GEO 下载 → 可复现 .ipynb 执行 + 溯源记录",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
+        serde_json::json!({ "name": "review", "handler": "research",
+            "description": "报告审核验证：机械校验 + LLM 结构化审核（report_review.json）",
+            "sub_tasks": [], "tools": serde_json::json!([]) }),
     ];
     if let Some(mut task) = state.tasks.get_mut(&task_id) {
         task.plan = Some(serde_json::json!({
