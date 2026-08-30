@@ -1308,6 +1308,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn record_analysis_dedups_loop_redispatch() {
+        // Loop-repair re-dispatches the same (hypothesis, task) pair; the
+        // manifest must keep only the LATEST record so success/fail metrics
+        // stay truthful (live bug: two rounds accumulated two entries).
+        let mut m = ProjectManifest::new("q", PathBuf::from("/tmp/x"));
+        let hyp = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let base = |success: bool| AnalysisRef {
+            task_id: "DA-3".into(),
+            hypothesis_id: Some(hyp),
+            notebook_path: Some("analysis.ipynb".into()),
+            provenance_path: None,
+            success,
+            execution_backend: if success { "jupyter".into() } else { "python".into() },
+        };
+        m.record_analysis(base(false)); // first attempt failed
+        m.record_analysis(base(true)); // repair round succeeded
+        assert_eq!(m.analyses.len(), 1, "re-dispatch must replace, not append");
+        assert!(m.analyses[0].success, "latest outcome wins");
+
+        // A DIFFERENT task keeps its own record.
+        m.record_analysis(AnalysisRef {
+            task_id: "DA-4".into(),
+            ..base(true)
+        });
+        assert_eq!(m.analyses.len(), 2);
+
+        // Same task under a DIFFERENT hypothesis is a distinct record.
+        let other_hyp = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        m.record_analysis(AnalysisRef {
+            hypothesis_id: Some(other_hyp),
+            ..base(true)
+        });
+        assert_eq!(m.analyses.len(), 3);
+    }
+
+    #[test]
     fn record_stage_replaces_by_name() {
         let mut m = ProjectManifest::new("q", PathBuf::from("/tmp/x"));
         m.record_stage("search", StageStatus::Running, std::time::Duration::from_secs(1), vec![], None);
