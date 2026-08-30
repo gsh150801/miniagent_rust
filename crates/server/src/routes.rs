@@ -1027,7 +1027,9 @@ async fn handle_research_run(
     // Web-mode defaults: the full goals-1-4 experience — debate + validation
     // plans + notebook analysis are all on.
     let opts = ResearchOptions {
-        max_papers: 10,
+        // No fixed corpus preset: the LLM requirement-extraction pass derives
+        // the size from the request's own scope language.
+        max_papers: None,
         validate: true,
         analyze: true,
         debate: true,
@@ -1040,17 +1042,21 @@ async fn handle_research_run(
     let state_cb = state.clone();
     let task_id_cb = task_id.clone();
     let main_rt = tokio::runtime::Handle::current();
-    let on_progress: ResearchProgress = Arc::new(move |stage: &str, status: &str| {
+    let on_progress: ResearchProgress = Arc::new(move |stage: &str, status: &str, detail: Option<&str>| {
         let payload = serde_json::json!({
             "type": "progress",
             "stage": stage,
             "status": status,
             "task_id": task_id_cb,
+            // Phase summary rides in `data` so the frontend can render an
+            // expandable per-subtask execution card (loop-mode parity).
+            "data": detail.map(|d| serde_json::json!({"summary": d})),
         });
         let socket = Arc::clone(&sink_cb);
         let state = state_cb.clone();
         let stage = stage.to_string();
         let status = status.to_string();
+        let detail = detail.map(|d| d.chars().take(400).collect::<String>());
         let task_id_key = task_id_cb.clone();
         // Spawn via the captured server-runtime handle: the callback runs on
         // the pipeline's dedicated thread, `Handle::current` there would fail.
@@ -1060,7 +1066,7 @@ async fn handle_research_run(
                 && let Some(mut task) = state.tasks.get_mut(&*task_id_key) {
                 task.stage_outputs.push(serde_json::json!({
                     "stage": stage,
-                    "summary": { "response_preview": format!("{stage} phase completed") },
+                    "summary": { "response_preview": detail.unwrap_or_else(|| format!("{stage} phase completed")) },
                 }));
             }
         });
@@ -1237,6 +1243,7 @@ async fn drain_progress_channel(
                 })).await;
                 if status == "completed"
                     && let Some(ref d) = data
+                    && name != "task"   // per-subtask events persist below, not as stage outputs
                 {
                     let summary = serde_json::json!({
                         "response_preview": d.get("summary").and_then(|v| v.as_str()).unwrap_or("").chars().take(200).collect::<String>(),
@@ -1249,6 +1256,28 @@ async fn drain_progress_channel(
                             "summary": summary,
                         }));
                     }
+                }
+                // Per-subtask events (stage == "task"): persist as "subtask"
+                // stage_outputs so the frontend can restore the todo list and
+                // per-subtask execution summaries after a page reload.
+                if name == "task"
+                    && (status == "completed" || status == "failed")
+                    && let Some(ref d) = data
+                    && let Some(mut task) = state.tasks.get_mut(&task_id)
+                {
+                    task.stage_outputs.push(serde_json::json!({
+                        "stage": "subtask",
+                        "summary": {
+                            "task_id": d.get("task_id").cloned().unwrap_or(serde_json::json!("")),
+                            "title": d.get("title").cloned().unwrap_or(serde_json::json!("")),
+                            "role": d.get("role").cloned().unwrap_or(serde_json::json!("")),
+                            "status": status,
+                            "reused": d.get("reused").cloned().unwrap_or(serde_json::json!(false)),
+                            "response_preview": d.get("output").and_then(|v| v.as_str()).unwrap_or("").chars().take(600).collect::<String>(),
+                            "error": d.get("error").cloned().unwrap_or(serde_json::json!(null)),
+                            "tokens_used": d.get("tokens_used").cloned().unwrap_or(serde_json::json!(0)),
+                        },
+                    }));
                 }
             }
             ProgressMsg::AgentEvent(event) => {

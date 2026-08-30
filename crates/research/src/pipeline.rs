@@ -39,7 +39,10 @@ fn phase_end(on_progress: &Option<ResearchProgress>, prev: &mut Option<&'static 
 /// Options mirroring the former CLI flags of `miniagent research`.
 #[derive(Debug, Clone)]
 pub struct ResearchOptions {
-    pub max_papers: usize,
+    /// Corpus size. None = derived from the request semantics by the LLM
+    /// requirement-extraction pass (no fixed preset anywhere); an explicit
+    /// value (CLI `-n`) overrides the extraction.
+    pub max_papers: Option<usize>,
     pub kg_only: bool,
     pub validate: bool,
     pub analyze: bool,
@@ -61,7 +64,7 @@ pub struct ResearchOptions {
 impl Default for ResearchOptions {
     fn default() -> Self {
         Self {
-            max_papers: 12,
+            max_papers: None,
             kg_only: false,
             validate: false,
             analyze: false,
@@ -133,7 +136,7 @@ pub async fn run_research(
     // Scope parameters; `min_year_owned`/`max_papers` may be refined by the
     // LLM requirement-extraction pass below (explicit option values are the
     // defaults the model fills from).
-    let mut max_papers = opts.max_papers;
+    let mut max_papers: usize = opts.max_papers.unwrap_or(0); // 0 = derive from the request
     let kg_only = opts.kg_only;
     let validate = opts.validate;
     let analyze = opts.analyze;
@@ -299,13 +302,13 @@ pub async fn run_research(
                 let y = v["year_from"].as_u64().filter(|y| (1900..=2100).contains(y));
                 let n = v["max_papers"].as_u64().filter(|n| (1..=500).contains(n));
                 let notes = v["notes"].as_str().unwrap_or("");
+                if let Some(n) = n {
+                    max_papers = n as usize;
+                }
                 if y.is_some() || n.is_some() {
                     let y_old = min_year_owned.clone();
                     if let Some(y) = y {
                         min_year_owned = y.to_string();
-                    }
-                    if let Some(n) = n {
-                        max_papers = n as usize;
                     }
                     println!(
                         "   🎯 requirement extraction: year_from={min_year_owned} (was {y_old}), max_papers={max_papers} — {notes}"
@@ -319,6 +322,15 @@ pub async fn run_research(
             }
         }
         }
+    }
+    if max_papers == 0 {
+        // Requirement extraction failed entirely (providers down) — fall back
+        // to a generous corpus rather than silently running tiny; audited.
+        max_papers = 24;
+        manifest.log_event(
+            "max_papers_fallback",
+            "requirement extraction unavailable; using fallback corpus size 24".to_string(),
+        );
     }
     let min_year: &str = &min_year_owned;
 
@@ -855,7 +867,9 @@ pub async fn run_research(
         // Bounded-concurrency LLM extraction (goal 1: performance): one shared
         // flash provider, several papers in flight at once. Cross-family
         // fallbacks absorb provider-level failures such as 429 token-cap
-        // exhaustion or an out-of-balance account.
+        // exhaustion or an out-of-balance account. Concurrency is kept low:
+        // reasoning models emit long thinking traces, and a wide fan-out
+        // trips the provider's tokens-per-minute cap instantly.
         let extraction_fallbacks: Vec<std::sync::Arc<dyn LlmProvider>> =
             miniagent_provider::factory::codegen_fallback_providers(config)
                 .into_iter()
@@ -871,7 +885,7 @@ pub async fn run_research(
                 format!("KG extraction using {} cross-family fallback provider(s)", extraction_fallbacks.len()),
             );
         }
-        let concurrency = 6usize;
+        let concurrency = 3usize;
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut jobs = Vec::with_capacity(paper_texts.len());
         for (i, (pmid, text)) in paper_texts.iter().enumerate() {
@@ -1367,10 +1381,17 @@ pub async fn run_research(
         // persisted for the audit trail.
         let ranked_hyps: Vec<miniagent_hypothesis::Hypothesis> =
             ranked.iter().map(|rh| rh.hypothesis.clone()).collect();
+        let mut evidence_providers: Vec<std::sync::Arc<dyn LlmProvider>> = vec![flash.clone()];
+        evidence_providers.extend(
+            miniagent_provider::factory::codegen_fallback_providers(config)
+                .into_iter()
+                .map(Into::into),
+        );
         let evidence = retrieve_debate_evidence(
             &ranked_hyps,
             // Every hypothesis gets evidence (was: first 4 only).
             ranked_hyps.len().min(8),
+            evidence_providers,
             cancel.child_token(),
         )
         .await;
@@ -2022,6 +2043,37 @@ pub async fn run_research(
 
 // ── Pipeline helpers ─────────────────────────────────────────
 
+/// Complete with exponential backoff on rate-limit (429/TPM) errors.
+///
+/// Parallel fan-out stages (KG extraction, relevance filter) can exceed the
+/// provider's tokens-per-minute cap even when the account is healthy; the
+/// provider's own 429 signal is the only portable trigger, so react to it
+/// instead of hardcoding quota numbers. Non-rate-limit errors return
+/// immediately (the caller's cross-family fallback takes over).
+async fn complete_with_backoff(
+    provider: &dyn LlmProvider,
+    request: &miniagent_provider::traits::CompletionRequest,
+    cancel: CancellationToken,
+) -> Result<miniagent_provider::traits::CompletionResponse, miniagent_core::error::AgentError> {
+    let mut delay_secs: u64 = 5;
+    loop {
+        match provider.complete(request, cancel.child_token()).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if is_rate_limit_error(&e) => {
+                tracing::warn!(delay_secs, error = %e, "rate limited — backing off before retry");
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                delay_secs = (delay_secs * 3).min(90);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_rate_limit_error(e: &miniagent_core::error::AgentError) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("429") || s.contains("rate limit") || s.contains("too many requests")
+}
+
 /// Extract entities/relations from one paper abstract. Runs inside a parallel
 /// task (goal 1: performance). When the primary flash provider errors (e.g.
 /// a 429 token-cap under concurrent pipelines), the cross-family fallbacks
@@ -2059,16 +2111,16 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
         },
     };
 
-    // Primary call with provider-level degradation recovery: walk the
-    // fallback list on any provider error.
-    let resp = match flash.complete(&request, cancel.clone()).await {
+    // Primary call with provider-level degradation recovery: backoff through
+    // 429 windows on the primary, then walk the fallback list on any error.
+    let resp = match complete_with_backoff(flash.as_ref(), &request, cancel.clone()).await {
         Ok(r) => r,
         Err(primary_err) => {
             let mut last = primary_err;
             let mut recovered = None;
             for fb in &fallbacks {
                 eprintln!("   ⚠ KG extraction primary provider failed for PMID {pmid} ({last}); retrying on fallback");
-                match fb.complete(&request, cancel.clone()).await {
+                match complete_with_backoff(fb.as_ref(), &request, cancel.clone()).await {
                     Ok(r) => {
                         recovered = Some(r);
                         break;
@@ -2521,6 +2573,7 @@ fn find_disease_anchor(
 async fn retrieve_debate_evidence(
     hypotheses: &[miniagent_hypothesis::Hypothesis],
     max_hypotheses: usize,
+    providers: Vec<std::sync::Arc<dyn LlmProvider>>,
     cancel: CancellationToken,
 ) -> Vec<(uuid::Uuid, String, String)> {
     use futures_util::stream::{self, StreamExt};
@@ -2532,6 +2585,7 @@ async fn retrieve_debate_evidence(
     // pipeline future stops being `Send` under `tokio::spawn`.
     let search = std::sync::Arc::new(WebSearchTool::new());
     let fetch = std::sync::Arc::new(WebFetchTool::new());
+    let providers_snapshot = std::sync::Arc::new(providers);
     let ctx = std::sync::Arc::new(ToolContext::new(
         std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
         "debate_evidence".to_string(),
@@ -2549,6 +2603,7 @@ async fn retrieve_debate_evidence(
             let search = search.clone();
             let fetch = fetch.clone();
             let ctx = ctx.clone();
+            let providers_snapshot = providers_snapshot.clone();
             async move {
                 let query = geo_query_from_parts(&statement, "");
                 let listing = match search
@@ -2566,10 +2621,14 @@ async fn retrieve_debate_evidence(
                     return None;
                 }
 
-                // Verify the top result URLs by fetching their pages: the
-                // debate must cite retrievable sources, not search-engine
-                // snippets (which can be stale or hallucination-prone).
-                let urls = extract_urls(&listing).into_iter().take(2).collect::<Vec<_>>();
+                // Relevance filter on the SEARCH RESULTS themselves (generic
+                // LLM judgment, no keyword lists): only results genuinely
+                // about the hypothesis topic survive to the fetch step, so
+                // off-topic hits cannot inject noise into the debate.
+                let urls = match filter_search_results(&statement, &query, &listing, &providers_snapshot).await {
+                    Some(urls) => urls,
+                    None => extract_urls(&listing).into_iter().take(2).collect::<Vec<_>>(),
+                };
                 let mut fetched = String::new();
                 for url in &urls {
                     if let Ok(res) = fetch
@@ -2600,6 +2659,73 @@ async fn retrieve_debate_evidence(
         .collect::<Vec<Option<(uuid::Uuid, String, String)>>>()
         .await;
     jobs.into_iter().flatten().collect()
+}
+
+/// Generic relevance filter over a web-search listing: the model picks the
+/// result indices genuinely about the topic (keywords/topic words + the
+/// hypothesis statement); the caller fetches only those URLs. No keyword
+/// dictionaries or numeric thresholds — relevance is a model judgment over
+/// the actual listing. Returns None when no provider can judge (caller falls
+/// back to the legacy top-2 behavior).
+async fn filter_search_results(
+    statement: &str,
+    query: &str,
+    listing: &str,
+    providers: &[std::sync::Arc<dyn LlmProvider>],
+) -> Option<Vec<String>> {
+    use miniagent_provider::traits::CompletionRequest;
+    let urls = extract_urls(listing);
+    if urls.is_empty() || providers.is_empty() {
+        return None;
+    }
+    let prompt = format!(
+        "Topic (hypothesis under debate): {statement}\nSearch query: {query}\n\n\
+         Search results with URLs:\n{listing}\n\n\
+         Which of these results genuinely address the topic? Exclude results that merely \
+         share a word but are about something else. Output ONLY JSON: \
+         {{\"relevant_urls\": [\"<url from the list above>\"]}}"
+    );
+    for provider in providers {
+        let request = CompletionRequest {
+            system: "You filter search results for topical relevance. Output ONLY valid JSON.".into(),
+            messages: vec![miniagent_core::message::Message::user(&prompt)],
+            tools: vec![],
+            config: miniagent_core::config::InferenceConfig {
+                temperature: Some(0.0),
+                max_tokens: Some(4_096),
+                ..Default::default()
+            },
+        };
+        if let Ok(resp) = provider.complete(&request, CancellationToken::new()).await {
+            let text: String = resp
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let repaired = miniagent_core::json_util::extract_and_repair(&text);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                let picked: Vec<String> = v["relevant_urls"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|u| u.as_str())
+                            .filter(|u| urls.iter().any(|raw| raw == u))
+                            .map(|u| u.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Only accept URLs that actually appeared in the listing.
+                if !picked.is_empty() {
+                    return Some(picked);
+                }
+                return Some(Vec::new()); // judged: none relevant — fetch nothing
+            }
+        }
+    }
+    None
 }
 
 /// Extract http(s) URLs from a markdown/plain-text search listing.

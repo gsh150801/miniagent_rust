@@ -77,9 +77,10 @@ enum Commands {
         #[arg(short = 'q', long)]
         query: String,
 
-        /// Max papers to retrieve and analyze (default 20, PubMed max 500)
-        #[arg(short = 'n', long, default_value = "20")]
-        max_papers: usize,
+        /// Max papers to retrieve and analyze (optional; derived from the
+        /// request semantics when omitted, PubMed max 500)
+        #[arg(short = 'n', long)]
+        max_papers: Option<usize>,
 
         /// Skip hypothesis generation (KG + link prediction only)
         #[arg(long)]
@@ -150,9 +151,10 @@ enum Commands {
         #[arg(short = 'q', long)]
         query: String,
 
-        /// Maximum papers to collect (PubMed max 500)
-        #[arg(short = 'n', long, default_value = "20")]
-        max_papers: usize,
+        /// Maximum papers to collect (optional; derived from the request
+        /// semantics when omitted, PubMed max 500)
+        #[arg(short = 'n', long)]
+        max_papers: Option<usize>,
 
         /// Enable hypothesis generation with KG
         #[arg(long)]
@@ -870,7 +872,7 @@ fn build_full_agent(
 
 async fn literature_review(
     query: &str,
-    max_papers: usize,
+    max_papers: Option<usize>,
     generate_hypotheses: bool,
     config: &Arc<AppConfig>,
 ) {

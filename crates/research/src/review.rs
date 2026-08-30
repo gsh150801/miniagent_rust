@@ -86,10 +86,12 @@ pub fn collect_facts(manifest: &crate::ProjectManifest) -> Vec<(String, String)>
         manifest.validation_plans.len().to_string(),
     ));
     facts.push(("analyses".into(), manifest.analyses.len().to_string()));
+    // Per-outcome counts are NOT free-text-audited: words like "failed in
+    // Phase 3" describe trial outcomes, not task counts, and keyword-window
+    // matching misfires on them (live: Riluzole "failed in Phase 3" ⇒ fake
+    // mismatch). Per-task delivery status is verified structurally instead.
     let ok = manifest.analyses.iter().filter(|a| a.success).count();
-    let failed = manifest.analyses.iter().filter(|a| !a.success).count();
     facts.push(("analyses_succeeded".into(), ok.to_string()));
-    facts.push(("analyses_failed".into(), failed.to_string()));
     facts.push((
         "debate_report_present".into(),
         manifest
@@ -153,7 +155,6 @@ pub fn mechanical_checks(ctx: &ReviewContext) -> Vec<ReviewCheck> {
             "validation_plans" => &["validation plan", "验证计划"],
             "analyses" => &["analyses", "数据分析任务", "数据分析"],
             "analyses_succeeded" => &["succeeded", "成功"],
-            "analyses_failed" => &["failed", "失败"],
             "debate_report_present" => &["debate", "辩论"],
             _ => &[key.as_str()],
         };
@@ -498,6 +499,22 @@ mod tests {
         );
         let checks = mechanical_checks(&ctx);
         assert_eq!(checks[0].status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn trial_failure_prose_is_not_a_count_mismatch() {
+        // Live false positive: "Riluzole (which failed in Phase 3 …)" matched
+        // the analyses_failed keyword window. Free-text outcome words must
+        // never be audited as task counts.
+        let ctx = ctx_with(
+            "Existing drugs: Riluzole (which failed in Phase 3 development) shows marginal benefit.",
+            vec![("analyses_failed", "0")],
+        );
+        let checks = mechanical_checks(&ctx);
+        assert!(
+            checks.iter().all(|c| c.status != CheckStatus::Mismatch),
+            "prose about drug-trial failure must not create a count mismatch"
+        );
     }
 
     #[test]

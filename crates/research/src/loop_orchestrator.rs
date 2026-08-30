@@ -75,7 +75,7 @@ pub async fn run_research_in_loop(
             println!("      [{phase}/{status}] {d}");
         }
         if let Some(cb) = on_progress.as_ref() {
-            cb(phase, status);
+            cb(phase, status, detail.as_deref());
         }
     };
 
@@ -163,7 +163,7 @@ pub async fn run_research_in_loop(
                 config.clone(),
                 on_progress.as_ref().map(|cb| {
                     let cb = Arc::clone(cb);
-                    Arc::new(move |stage: &str, status: &str| cb(stage, status)) as crate::ResearchProgress
+                    Arc::new(move |stage: &str, status: &str, detail: Option<&str>| cb(stage, status, detail)) as crate::ResearchProgress
                 }),
             )
             .await;

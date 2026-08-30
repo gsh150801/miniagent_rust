@@ -194,6 +194,12 @@ impl ProjectManifest {
     pub fn record_analysis(&mut self, analysis: AnalysisRef) {
         let task = analysis.task_id.clone();
         let ok = analysis.success;
+        // Loop-repair re-dispatches the same (hypothesis, task) pair; keep
+        // only the latest record so success/fail metrics stay truthful.
+        if let Some(h) = analysis.hypothesis_id {
+            self.analyses
+                .retain(|a| !(a.task_id == analysis.task_id && a.hypothesis_id == Some(h)));
+        }
         self.analyses.push(analysis);
         self.log_event(
             if ok { "analysis_succeeded" } else { "analysis_failed" },
