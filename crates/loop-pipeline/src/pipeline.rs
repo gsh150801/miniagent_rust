@@ -160,6 +160,21 @@ impl LoopPipeline {
         on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
+        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None).await
+    }
+
+    /// [`Self::run`] with an interactive clarify channel. The server wires
+    /// its WS ask/reply protocol here so the Clarify stage can ask the user;
+    /// CLI passes `None` and clarification self-skips.
+    pub async fn run_with_clarify(
+        task: impl Into<String>,
+        config: Arc<AppConfig>,
+        max_loops: usize,
+        cancel: CancellationToken,
+        on_progress: Option<ProgressFn>,
+        result_dir: Option<std::path::PathBuf>,
+        clarify_hook: Option<crate::clarify::ClarifyHook>,
+    ) -> Result<PipelineState, AgentError> {
         let result_base = result_dir
             .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
         if let Err(e) = std::fs::create_dir_all(&result_base) {
@@ -175,6 +190,9 @@ impl LoopPipeline {
         let mut ctx = StageContext::new(task, config)
             .with_max_loops(max_loops)
             .with_working_dir(result_base.to_string_lossy().to_string());
+        if let Some(hook) = clarify_hook {
+            ctx = ctx.with_clarify_hook(hook);
+        }
 
         // Stable lowercase stage names so the front-end `renderProgressView`
         // matches loop-pipeline pills with workflow pills without special-casing.

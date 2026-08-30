@@ -862,25 +862,49 @@ async fn handle_run_loop(
         .await;
     });
 
+    // Clarify channel: the loop pipeline's Clarify stage asks the user
+    // through the WS ask/reply protocol when the task has material ambiguity
+    // (timeout ⇒ assumption noted, run continues). Same semantics as
+    // research mode.
+    let ask_socket = Arc::clone(socket);
+    let ask_state = state.clone();
+    let ask_task_id = task_id.clone();
+    let ask_hook: miniagent_loop_pipeline::ClarifyHook = Arc::new(move |question, options| {
+        let socket = Arc::clone(&ask_socket);
+        let state = ask_state.clone();
+        let task_id = ask_task_id.clone();
+        Box::pin(async move {
+            let opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+            ask_user(&socket, &state, &task_id, &question, &opts).await
+        })
+    });
+
     // Anchor every pipeline artifact (dispatch outputs, checkpoints, tool
     // writes) inside the task's result directory.
-    let result = miniagent_loop_pipeline::LoopPipeline::run(
+    let result = miniagent_loop_pipeline::LoopPipeline::run_with_clarify(
         prompt.clone(),
         state.config.clone(),
         max_loops,
         cancel.clone(),
         Some(on_progress),
         Some(task_dir.clone()),
+        Some(ask_hook),
     ).await;
 
     state.cancels.remove(&task_id);
+    // Release the per-task event sender FIRST: dropping it closes the
+    // agent-event broadcast channel, which lets the forwarding task (holding
+    // a progress_tx clone) exit, which closes the progress channel so the
+    // drain task can finish. Awaiting the drain BEFORE dropping the guard
+    // deadlocks the three tasks in a cycle (drain ← forwarder ← guard) and
+    // the run hangs forever after the pipeline finishes: no stream/complete
+    // ever reaches the frontend and the task stays "running" (live-verified).
+    state.event_guards.remove(&task_id);
     // Drop the sender so the drain task exits when the channel empties.
     drop(progress_tx);
-    let _ = drain_handle.await;
-    // Release the per-task event sender: stops this task from receiving
-    // any further AgentEvents emitted by other concurrent runs that happen
-    // to still be alive in this server.
-    state.event_guards.remove(&task_id);
+    // Bounded wait: the drain normally drains in milliseconds once the
+    // channel closes; don't let a straggler block finalization.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain_handle).await;
 
     match result {
         Ok(pipeline_state) => {

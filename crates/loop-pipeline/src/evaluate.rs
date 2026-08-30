@@ -199,7 +199,19 @@ impl PipelineStage for EvaluateStage {
         // 裁决方依据双方陈述裁定 complete / needs_repair。裁决为
         // needs_repair 时强制继续下一轮修复循环，其建议进入 unmet_goals。
         // LLM 全部不可用时保持原判定（裁决是质量门，不是唯一信号）。
-        if !evaluation.should_continue {
+        //
+        // 强制继续最多一轮：进度 100% 时停滞保护不会触发（其条件含
+        // progress<100），若裁决每轮都判 needs_repair 会一直烧到
+        // max_loops。因此裁决强制的修复循环只允许一次——第二轮裁决
+        // 仅记录意见，不再覆盖 stop 决定（live: 100% 进度下裁决连续
+        // needs_repair，循环烧满 max_loops）。
+        let adjudication_forced_before = ctx
+            .state
+            .evaluations
+            .last()
+            .map(|e| e.adjudication.as_ref().is_some_and(|a| a["verdict"] == "needs_repair"))
+            .unwrap_or(false);
+        if !evaluation.should_continue && !adjudication_forced_before {
             let result_block: String = relevant_results.iter()
                 .map(|r| {
                     let status = if r.success { "✓" } else { "✗" };
@@ -228,6 +240,9 @@ impl PipelineStage for EvaluateStage {
                 Ok(adj) => {
                     evaluation.adjudication = Some(serde_json::to_value(&adj).unwrap_or(serde_json::Value::Null));
                     if adj.verdict == crate::adjudicate::AdjudicationVerdict::NeedsRepair {
+                        tracing::info!(
+                            "adjudication: needs_repair — forcing one repair round (subsequent rounds record-only)"
+                        );
                         tracing::info!(
                             unmet = ?adj.unmet,
                             "adjudication overrode stop: needs_repair — forcing continue"
