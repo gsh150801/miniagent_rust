@@ -1632,6 +1632,7 @@ async fn handle_run(
     file_ids: Vec<String>,
     existing_task_id: Option<String>,
 ) {
+    eprintln!("🔍 handle_run enter | follow_up={existing_task_id:?} | prompt={}", prompt.chars().take(40).collect::<String>());
     // Resolve the active model profile once per task; every stage provider
     // is built from it (no hardcoded model names anywhere).
     let active_profile = state.models.read().unwrap().active().clone();
@@ -1649,15 +1650,20 @@ async fn handle_run(
 
     let (task_id, task_brief, task_dir, task_workflow_dir) =
         if let Some(ref existing_id) = existing_task_id {
-            // Follow-up message in existing conversation
-            if let Some(ref task) = state.tasks.get(existing_id) {
-                let brief = task.brief.clone();
-                let dir = task.result_dir.clone();
+            // Follow-up message in existing conversation. Read-then-drop:
+            // DashMap shard guards must be released BEFORE the get_mut below —
+            // holding the read guard while requesting the write guard on the
+            // same shard self-deadlocks the task (live: follow-up hung forever
+            // with status stuck on the previous turn's value).
+            let reused = state.tasks.get(existing_id).map(|task| {
+                (task.brief.clone(), task.result_dir.clone())
+            });
+            if let Some((brief, dir)) = reused {
                 // Each follow-up gets its own timestamped sub-directory, keeping all history
                 let turn_ts = chrono::Utc::now().format("turn_%Y%m%d_%H%M%S").to_string();
                 let wf_dir = dir.join(&turn_ts);
                 let _ = std::fs::create_dir_all(&wf_dir);
-                // Append user message to history
+                // Append user message to history (guards dropped — safe to write)
                 if let Some(mut t) = state.tasks.get_mut(existing_id) {
                     t.status = "running".into();
                     t.messages.push(serde_json::json!({"role": "user", "content": &prompt}));
@@ -1674,7 +1680,30 @@ async fn handle_run(
     // Read and parse uploaded files
     let enriched_prompt = enrich_prompt_with_files(&prompt, &file_ids, &state.task_dir);
 
+    // P1 多轮交互：follow-up 时把上一轮交流与产物清单注入本轮上下文，
+    // 修复"逐轮失忆"断层（此前 task.messages 仅用于展示，agent 从零开始）。
+    // effective_prompt 随后贯穿 explore / planner / workflow / feedback。
+    let effective_prompt = if let Some(ref task) = state.tasks.get(&task_id)
+        && !task.messages.is_empty()
+    {
+        let prior = build_prior_context(&task.messages, &task.result_dir);
+        if prior.is_empty() {
+            enriched_prompt.clone()
+        } else {
+            println!("   💬 follow-up: prior context injected ({} chars)", prior.len());
+            format!("{prior}\n## 本轮请求\n{enriched_prompt}")
+        }
+    } else {
+        enriched_prompt.clone()
+    };
+
     // ── ExploreStage（需求1：明确问题+获取上下文）──────────────────
+    // task_started 与 loop/research 模式对齐：前端在 run 中途依赖它建立
+    // currentTaskId（缺失时 follow-up 无法携带 task_id，每轮变成独立任务
+    // ——live 复现的"逐轮失忆"直接诱因之一）。
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "task_started", "task_id": &task_id,
+    })).await;
     let _ = ws_send(socket, serde_json::json!({
         "type": "progress", "stage": "explore", "status": "running",
         "task_id": &task_id,
@@ -1698,7 +1727,7 @@ async fn handle_run(
                      IMPORTANT: When the user says 'this year' or 'today', they mean the year {today_year}. \
                      Respond concisely.",
                 today_year = chrono::Utc::now().format("%Y")),
-            messages: vec![miniagent_core::message::Message::user(&enriched_prompt)],
+            messages: vec![miniagent_core::message::Message::user(&effective_prompt)],
             tools: vec![],
             config: explore_ctx,
         },
@@ -1755,7 +1784,7 @@ async fn handle_run(
     let planner = PlannerStage::new(planner_flash);
     let plan_ctx = StageContext::new(
         StageId::new(),
-        serde_json::json!({ "prompt": enriched_prompt }),
+        serde_json::json!({ "prompt": effective_prompt }),
         HashMap::new(),
         CancellationToken::new(),
     );
@@ -1873,7 +1902,7 @@ async fn handle_run(
     // Use `match` (not `unwrap_or_else`) so the WS fallback send can be
     // awaited — a sync closure can't `.await`, which is what previously caused
     // the status future to be dropped silently.
-    let workflow = match builder.build(&spec, &enriched_prompt, &system_prompt) {
+    let workflow = match builder.build(&spec, &effective_prompt, &system_prompt) {
         Ok(w) => w,
         Err(e) => {
             let _ = ws_send(socket, serde_json::json!({
@@ -1898,7 +1927,7 @@ async fn handle_run(
             };
             WorkflowBuilder::new(agent_arc.clone(), state.config.clone())
                 .with_task_dir(task_workflow_dir.to_string_lossy())
-                .build(&fallback, &enriched_prompt, &system_prompt)
+                .build(&fallback, &effective_prompt, &system_prompt)
                 .expect("single-agent fallback should always build")
         }
     };
@@ -1999,7 +2028,7 @@ async fn handle_run(
 
     // 总评审（综合三角色结果 + 所有 stage 产物）
     let feedback_result = run_feedback_review(
-        &*feedback_provider, &enriched_prompt, &stage_outputs_snapshot,
+        &*feedback_provider, &effective_prompt, &stage_outputs_snapshot,
     ).await;
 
     // 如果三角色发现问题但总评审说 deliver，修正为 revise
@@ -2650,6 +2679,81 @@ fn extract_stage_summary(name: &str, data: &serde_json::Value) -> serde_json::Va
 // ── File parsing ──
 
 /// Read uploaded files, parse CSV/TSV into markdown tables, and append to prompt.
+
+/// Build a compact "prior turns" context block for a follow-up run in an
+/// existing conversation (workflow mode). Includes the last few exchanges
+/// and an artifact inventory from the task's result directory, so the new
+/// turn's planner and agent know what already exists — without this, every
+/// follow-up started from scratch and "forgot" prior work (live-verified).
+/// Bounded: recent exchanges capped, artifact walk depth-limited.
+fn build_prior_context(
+    messages: &[serde_json::Value],
+    result_dir: &StdPath,
+) -> String {
+    use std::fmt::Write as _;
+
+    // ── Recent exchanges (last ~3 turns, each capped) ──
+    let mut chat = String::new();
+    let mut shown = 0usize;
+    for msg in messages.iter().rev() {
+        let role = msg["role"].as_str().unwrap_or("");
+        let content = msg["content"].as_str().unwrap_or("");
+        if content.trim().is_empty() || (role != "user" && role != "assistant") {
+            continue;
+        }
+        let cap = if role == "assistant" { 1_200 } else { 600 };
+        let body: String = content.chars().take(cap).collect();
+        let body = if content.chars().count() > cap {
+            format!("{body}…[截断]")
+        } else {
+            body
+        };
+        let label = if role == "user" { "用户" } else { "AI" };
+        // Reverse order while collecting; assemble newest-first block below.
+        chat.insert_str(0, &format!("[{label}] {body}\n\n"));
+        shown += 1;
+        if shown >= 6 {
+            break;
+        }
+    }
+
+    // ── Artifact inventory (depth 2, cap 30 files) ──
+    let mut artifacts = String::new();
+    let mut count = 0usize;
+    fn walk(dir: &StdPath, depth: usize, out: &mut String, count: &mut usize) {
+        if depth > 2 || *count >= 30 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if name.starts_with('.') || name == "metadata.json" {
+                continue;
+            }
+            if p.is_dir() {
+                let _ = writeln!(out, "- {name}/");
+                *count += 1;
+                walk(&p, depth + 1, out, count);
+            } else {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let _ = writeln!(out, "- {name} ({} bytes)", size);
+                *count += 1;
+            }
+            if *count >= 30 {
+                let _ = writeln!(out, "- …（更多文件省略）");
+                return;
+            }
+        }
+    }
+    walk(result_dir, 0, &mut artifacts, &mut count);
+
+    format!(
+        "## 此前对话上下文（同一任务的延续；本轮请求见文末）\n\n### 最近的交流\n{chat}### 已有产物清单（相对任务目录）\n{artifacts}\n"
+    )
+}
+
+
 fn enrich_prompt_with_files(prompt: &str, file_ids: &[String], task_dir: &StdPath) -> String {
     if file_ids.is_empty() {
         return prompt.to_string();
