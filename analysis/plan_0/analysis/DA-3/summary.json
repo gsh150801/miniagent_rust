@@ -1,0 +1,8 @@
+{
+  "n_samples": 0,
+  "n_expression_rows": 0,
+  "objective_satisfied": false,
+  "data_organism": "Homo sapiens (hTert-HME1)",
+  "design_test": "n/a",
+  "note": "Requested analysis (DESeq2 NB-GLM on RIPK1 pathway in SOD1-G93A microglia vs astrocyte) is not executable on this input: the expression matrix contains 0 gene rows and the sample cohort is hTert-HME1 human mammary epithelial cells, not SOD1-G93A mouse spinal cord. Diagnostic and design-only outputs written."
+}

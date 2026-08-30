@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use miniagent_agent::Agent;
 use miniagent_core::error::AgentError;
 use miniagent_core::models::ModelRegistry;
+use miniagent_core::orchestration::ProgressFn;
 use miniagent_core::settings::AppConfig;
 use miniagent_tool::approval::AutoApprove;
 use miniagent_tool::executor::ToolExecutor;
@@ -27,6 +28,11 @@ pub struct StageContext {
     /// Optional interactive clarify channel (server wires the WS ask/reply
     /// protocol; CLI runs pass None so clarification is skipped).
     pub clarify_hook: Option<crate::clarify::ClarifyHook>,
+    /// Shared progress-callback slot. The pipeline run() moves the server's
+    /// `ProgressFn` in here so stages (notably Dispatch) can emit fine-grained
+    /// per-subtask events without the callback being borrowed elsewhere.
+    /// Wrapped in Arc<Mutex<Option<_>>> because stages only get `&StageContext`.
+    pub progress: Option<Arc<Mutex<Option<ProgressFn>>>>,
 }
 
 impl StageContext {
@@ -44,10 +50,27 @@ impl StageContext {
             config,
             agent,
             clarify_hook: None,
+            progress: None,
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".into()),
         }
+    }
+
+    /// Wire the progress callback so stages can emit fine-grained events.
+    pub fn with_progress(mut self, cb: Option<ProgressFn>) -> Self {
+        self.progress = cb.map(|c| Arc::new(Mutex::new(Some(c))));
+        self
+    }
+
+    /// Emit a progress event through the shared callback slot (no-op when
+    /// absent — CLI fire-and-forget runs).
+    pub fn emit_progress(&self, name: &str, status: &str, data: Option<&serde_json::Value>) {
+        if let Some(slot) = self.progress.as_ref()
+            && let Ok(mut guard) = slot.lock()
+            && let Some(cb) = guard.as_mut() {
+                cb(name, status, data);
+            }
     }
 
     /// Build the shared Agent once — reused by all stages and all dispatched tasks.

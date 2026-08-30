@@ -16,6 +16,19 @@ use crate::stage::{PipelineStage, StageContext, StageOutput};
 use crate::types::{TaskPlan, TaskUnit, TaskResult, StageMessage, CritiqueEntry};
 use crate::prompts::{role_system_prompt as new_role_system_prompt, tool_instruction_block, tools_for_role};
 
+/// Emit one per-subtask progress event through the shared callback slot.
+/// The server forwards these to the WebSocket as
+/// `{type:"progress", stage:"task", status, data}` so the frontend can render
+/// a live todo list and per-subtask execution summaries.
+fn emit_task(ctx: &StageContext, status: &str, data: &serde_json::Value) {
+    ctx.emit_progress("task", status, Some(data));
+}
+
+/// Truncate a string to at most `max` chars (char-boundary safe) for transport.
+fn preview_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Resolve dependency order: returns groups of task IDs that can run in parallel.
 ///
 /// Delegates to the canonical Kahn scheduler in
@@ -435,6 +448,16 @@ impl PipelineStage for DispatchStage {
                             task_id = %task.id,
                             "dispatch: skipping re-execution, reusing prior successful result"
                         );
+                        // 前端同步：复用旧结果的子任务以 reused 标记补一条
+                        // completed 事件，让 todo list 显示真实状态。
+                        emit_task(ctx, "completed", &serde_json::json!({
+                            "task_id": task.id,
+                            "title": task.description,
+                            "role": task.assigned_role,
+                            "wave": wave_idx + 1,
+                            "reused": true,
+                            "output": preview_chars(&prior.output, 2000),
+                        }));
                         // 已在 map 中，直接跳过
                         continue;
                     } else if !prior.success {
@@ -450,6 +473,16 @@ impl PipelineStage for DispatchStage {
                     }
                 }
                 // ──────────────────────────────────────────────────
+
+                // 前端同步：子任务开始执行（todo list 标记 running +
+                // 中部执行摘要卡出现）。
+                emit_task(ctx, "running", &serde_json::json!({
+                    "task_id": task.id,
+                    "title": task.description,
+                    "role": task.assigned_role,
+                    "difficulty": task.difficulty,
+                    "wave": wave_idx + 1,
+                }));
 
                 let task = (*task).clone();
                 let agent = ctx.agent.clone();
@@ -481,6 +514,18 @@ impl PipelineStage for DispatchStage {
                         } else {
                             tracing::warn!(task_id = %result.task_id, error = ?result.error.as_ref().map(|s| &s[..s.len().min(80)]), "task failed");
                         }
+                        // 前端同步：子任务完成/失败 + 输出摘要（中部执行
+                        // 摘要卡更新为最终状态，todo list 打勾）。
+                        let spec = plan.tasks.iter().find(|t| t.id == result.task_id);
+                        emit_task(ctx, if result.success { "completed" } else { "failed" }, &serde_json::json!({
+                            "task_id": result.task_id,
+                            "title": spec.map(|t| t.description.clone()).unwrap_or_else(|| result.task_id.clone()),
+                            "role": spec.map(|t| t.assigned_role.clone()).unwrap_or_default(),
+                            "wave": wave_idx + 1,
+                            "output": preview_chars(&result.output, 2000),
+                            "error": result.error.as_ref().map(|e| e.chars().take(300).collect::<String>()),
+                            "tokens_used": result.tokens_used,
+                        }));
                         // 按 task_id 去重覆盖：同一 task_id 只保留最新结果
                         result_map.insert(result.task_id.clone(), result);
                     }

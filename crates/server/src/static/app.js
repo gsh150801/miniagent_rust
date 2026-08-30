@@ -22,6 +22,13 @@ let stageStatus = {};                  // {stageName: 'running'|'completed'|'fai
 // Stage 3: real-time agent activity stream
 let activityFeed = [];                 // [{kind:'tool_start'|'tool_end'|'skill'|'subtask'|'run', ...}]
 let activityStats = { tools: 0, toolErrors: 0, skills: 0, subtasks: 0, iterations: 0 };
+// Subtask todo list + live pipeline phases (loop / research modes).
+// subtasks: task_id -> {id,title,role,difficulty,status,output,error,tokens,reused,ts}
+// phases: ordered [{name,label,status,summary,ts}] from progress events that
+// are NOT part of the plan's stage list (loop phases, research phases).
+let subtasks = {};
+let subtaskOrder = [];
+let phases = [];
 
 // ── WebSocket ──
 function connect() {
@@ -78,6 +85,25 @@ function handleMsg(msg) {
       // historical task mid-run shouldn't repaint its panel with a new run.
       if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       currentPlan = { workflow: msg.workflow, stages: msg.stages };
+      // If progress events arrived before the plan (workflow mode), drop any
+      // "phase" entries that are actually plan stages so they don't render
+      // twice (Pipeline Phases + Workflow Stages).
+      if (Array.isArray(msg.stages) && msg.stages.length) {
+        const names = new Set(msg.stages.map(s => s.name));
+        phases = phases.filter(p => !names.has(p.name));
+      }
+      // Loop pipeline: the "stages" are actually the decomposed subtask
+      // units (T1..Tn). Seed the todo list so the right panel shows the
+      // full checklist before the first `task` progress event arrives.
+      if (msg.workflow === 'loop_pipeline' && Array.isArray(msg.stages)) {
+        for (const s of msg.stages) {
+          if (!subtasks[s.name]) {
+            subtasks[s.name] = { id: s.name, title: s.description || s.name,
+              role: s.handler || '', status: 'pending' };
+            subtaskOrder.push(s.name);
+          }
+        }
+      }
       showPlan(msg.workflow, msg.stages);
       renderProgressView();
       // Middle panel: a "running" task now has a plan → make sure the status
@@ -87,10 +113,7 @@ function handleMsg(msg) {
     case 'progress':
       // Same task filter as plan: ignore progress for other tasks.
       if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
-      updateStagePill(msg.stage, msg.status);
-      stageStatus[msg.stage] = msg.status;
-      renderProgressView();
-      syncTaskMeta(msg.task_id, { status: msg.status === 'failed' ? 'failed' : 'running' });
+      handleProgressMsg(msg);
       break;
     case 'ask':
       // 双向 ws：后端反问用户，渲染输入框/选项卡
@@ -104,11 +127,13 @@ function handleMsg(msg) {
       stageStatus = {};
       finishStream(msg.task_id, msg.files);
       syncTaskMeta(msg.task_id, { status: 'completed' });
+      renderProgressView();
       break;
     case 'error':
       stopElapsed();
       finishStreamError(msg.message);
       syncTaskMeta(msg.task_id, { status: 'failed' });
+      renderProgressView();
       break;
     case 'tasks':
       tasks = msg.tasks;
@@ -217,10 +242,10 @@ function renderSkillList() {
     return haystack.includes(query);
   });
 
-  count.textContent = filtered.length;
+  if (count) count.textContent = filtered.length;
 
   if (filtered.length === 0) {
-    el.innerHTML = `<div style="padding:12px;font-size:12px;color:var(--text3);text-align:center">No skills found</div>`;
+    el.innerHTML = `<div class="mini-empty">No skills found</div>`;
     return;
   }
 
@@ -429,7 +454,7 @@ async function viewTrace(taskId, title) {
   overlay.style.alignItems = 'flex-start';
 
   const eventHtml = events.length === 0
-    ? '<p style="color:var(--text-muted);padding:12px">No events recorded for this task.</p>'
+    ? '<p class="mini-empty">No events recorded for this task.</p>'
     : events.map((entry, i) => {
         const ev = entry.event || {};
         const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString('zh-CN') : '';
@@ -438,7 +463,7 @@ async function viewTrace(taskId, title) {
         if (ev.tool_name) detail += `<div><b>Tool:</b> ${escHtml(ev.tool_name)}</div>`;
         if (ev.input) detail += `<div class="trace-input"><b>Input:</b> <pre>${escHtml(typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input, null, 2).slice(0, 500))}</pre></div>`;
         if (ev.output) detail += `<div class="trace-output"><b>Output:</b> <pre>${escHtml(typeof ev.output === 'string' ? ev.output.slice(0,500) : JSON.stringify(ev.output).slice(0,500))}</pre></div>`;
-        if (ev.is_error) detail += `<div style="color:var(--danger)">⚠ Error</div>`;
+        if (ev.is_error) detail += `<div style="color:var(--red)">⚠ Error</div>`;
         if (ev.duration_ms) detail += `<div><b>Duration:</b> ${ev.duration_ms}ms</div>`;
         return `<div class="trace-event ${ev.is_error ? 'trace-error' : ''}">
           <div class="trace-header"><span class="trace-kind">${escHtml(kind)}</span><span class="trace-ts">${ts}</span></div>
@@ -508,6 +533,7 @@ function selectTask(id) {
   currentPlan = null;
   activityFeed = [];
   activityStats = { tools: 0, toolErrors: 0, skills: 0, subtasks: 0, iterations: 0 };
+  resetSubtaskState();
   renderProgressView();
   renderFilesView();
   if (ws && ws.readyState === 1)
@@ -580,6 +606,7 @@ function renderHistory(msg) {
   const pills = document.getElementById('stagePills');
   el.innerHTML = '<div class="messages-inner"></div>';
   pills.innerHTML = '';
+  resetSubtaskState();
   const inner = el.querySelector('.messages-inner');
 
   // Sync the middle panel status from the freshly-loaded task snapshot. This
@@ -596,7 +623,7 @@ function renderHistory(msg) {
       } else if (m.role === 'assistant') {
         const div = document.createElement('div');
         div.className = 'msg msg-ai';
-        div.innerHTML = `<div class="msg-bubble">${md(m.content)}</div>`;
+        div.innerHTML = `<div class="msg-bubble rich">${md(m.content)}</div>`;
         inner.appendChild(div);
       }
     }
@@ -605,7 +632,7 @@ function renderHistory(msg) {
     if (msg.response) {
       const div = document.createElement('div');
       div.className = 'msg msg-ai';
-      div.innerHTML = `<div class="msg-bubble">${md(msg.response)}</div>`;
+      div.innerHTML = `<div class="msg-bubble rich">${md(msg.response)}</div>`;
       inner.appendChild(div);
     }
   }
@@ -622,10 +649,19 @@ function renderHistory(msg) {
     }
   }
 
-  // Restore stage output cards
+  // Restore stage output cards. Persisted per-subtask summaries
+  // (stage === 'subtask') rebuild the todo list + expandable execution cards;
+  // known loop/research pipeline phases go through trackPhase so the right
+  // panel's Pipeline Phases section survives reloads; everything else renders
+  // as the classic stage-output card.
   if (msg.stage_outputs && msg.stage_outputs.length > 0) {
+    const planStageNames = new Set((currentPlan?.stages || []).map(s => s.name));
     for (const so of msg.stage_outputs) {
-      if (so.stage && so.summary) {
+      if (so.stage === 'subtask' && so.summary) {
+        restoreSubtask(so.summary);
+      } else if (so.stage && so.summary && PIPELINE_PHASES[so.stage] && !planStageNames.has(so.stage)) {
+        trackPhase(so.stage, 'completed', { summary: so.summary.response_preview || '' });
+      } else if (so.stage && so.summary) {
         showStageOutput(so.stage, so.summary);
       }
     }
@@ -663,6 +699,7 @@ function newTask() {
   fileTree = [];
   stageStatus = {};
   currentPlan = null;
+  resetSubtaskState();
   renderProgressView();
   renderFilesView();
   showWelcome();
@@ -760,7 +797,7 @@ function ensureStreamEl() {
   ensureResultAnchor();
   const div = document.createElement('div');
   div.className = 'msg msg-ai';
-  div.innerHTML = `<div class="msg-bubble"><span class="cursor"></span></div>`;
+  div.innerHTML = `<div class="msg-bubble rich"><span class="cursor"></span></div>`;
   // Insert AFTER the anchor so the final answer is always last.
   if (resultAnchor.nextSibling) {
     resultAnchor.parentNode.insertBefore(div, resultAnchor.nextSibling);
@@ -795,9 +832,11 @@ function finishStream(taskId, files) {
   if (streamFlushTimer) { clearTimeout(streamFlushTimer); streamFlushTimer = null; }
   if (streamEl) {
     streamEl.innerHTML = md(streamRaw);
+    enhanceRichBody(streamEl);
   } else if (streamRaw) {
     ensureStreamEl();
     streamEl.innerHTML = md(streamRaw);
+    enhanceRichBody(streamEl);
   }
   streamEl = null; streamRaw = ''; streamPending = '';
   // Reset the result anchor so the next task starts fresh.
@@ -892,39 +931,39 @@ function showPlan(workflow, stages) {
       : s.handler === 'synthesizer' ? '&#9997;'
       : s.handler === 'critic' ? '&#128270;'
       : '&#9881;';
-    const tierBadge = s.tier ? `<span style="font-size:10px;background:var(--bg3);padding:2px 6px;border-radius:4px;color:var(--text3)">${escHtml(s.tier)}</span>` : '';
+    const tierBadge = s.tier ? `<span class="tag-mini">${escHtml(s.tier)}</span>` : '';
     let descHtml = '';
     if (s.description) {
-      descHtml = `<div style="font-size:12px;color:var(--text2);margin:2px 0 2px 22px;line-height:1.4">${escHtml(s.description)}</div>`;
+      descHtml = `<div class="pl-desc">${escHtml(s.description)}</div>`;
     }
     let subTasksHtml = '';
     if (s.sub_tasks && s.sub_tasks.length > 0) {
       const items = s.sub_tasks.map(t => `<li>${escHtml(t)}</li>`).join('');
-      subTasksHtml = `<ul style="margin:3px 0 2px 22px;padding-left:16px;font-size:11px;color:var(--text2);line-height:1.5">${items}</ul>`;
+      subTasksHtml = `<ul class="pl-sublist">${items}</ul>`;
     }
     let toolsHtml = '';
     if (s.tools && s.tools.length > 0) {
-      const badges = s.tools.map(t => `<span style="font-size:10px;background:var(--bg3);padding:1px 5px;border-radius:3px;color:var(--text3);margin-right:3px">${escHtml(t)}</span>`).join('');
-      toolsHtml = `<div style="margin:3px 0 0 22px;display:flex;flex-wrap:wrap;gap:2px">${badges}</div>`;
+      const badges = s.tools.map(t => `<span class="tag-mini">${escHtml(t)}</span>`).join('');
+      toolsHtml = `<div class="pl-tools">${badges}</div>`;
     }
     const arrow = i < stages.length - 1
-      ? '<div style="text-align:center;color:var(--text3);font-size:14px;margin:2px 0">&#8595;</div>'
+      ? '<div class="pl-arrow">&#8595;</div>'
       : '';
-    return `<div style="padding:6px 0">
-      <div style="display:flex;align-items:center;gap:8px">
-        <span style="font-size:14px">${handlerIcon}</span>
-        <span style="font-weight:600;font-size:13px">${escHtml(s.name)}</span>
+    return `<div class="pl-stage">
+      <div class="pl-head">
+        <span class="pl-stage-icon">${handlerIcon}</span>
+        <span class="pl-name">${escHtml(s.name)}</span>
         ${tierBadge}
-        <span style="font-size:10px;color:var(--text3);font-style:italic">${escHtml(s.handler)}</span>
+        <span class="pl-handler">${escHtml(s.handler)}</span>
       </div>
       ${descHtml}${subTasksHtml}${toolsHtml}
     </div>${arrow}`;
   }).join('');
 
-  card.innerHTML = `<div class="exec-card" style="border-left:3px solid var(--accent)">
+  card.innerHTML = `<div class="exec-card">
     <div class="exec-card-header">
       <span class="icon">${typeIcon}</span> Task Plan
-      <span style="font-weight:400;color:var(--text3);font-size:11px;margin-left:auto">${escHtml(workflow || 'auto')}</span>
+      <span class="meta-note" style="margin-left:auto">${escHtml(workflow || 'auto')}</span>
     </div>
     <div style="margin-top:6px">${stagesHtml}</div>
   </div>`;
@@ -981,10 +1020,10 @@ function showStageOutput(stage, summary) {
   let headerHtml = `<div class="exec-card"><div class="exec-card-header">`;
   headerHtml += `<span class="icon">${icon}</span> ${escHtml(stage)} complete`;
   if (tokensIn || tokensOut) {
-    headerHtml += ` <span style="font-weight:400;color:var(--text3);font-size:11px">${(tokensIn/1000).toFixed(1)}k in / ${(tokensOut/1000).toFixed(1)}k out</span>`;
+    headerHtml += ` <span class="meta-note">${(tokensIn/1000).toFixed(1)}k in / ${(tokensOut/1000).toFixed(1)}k out</span>`;
   }
   if (toolCount) {
-    headerHtml += ` <span style="font-weight:400;color:var(--text3);font-size:11px">&#128295; ${toolCount} tool calls</span>`;
+    headerHtml += ` <span class="meta-note">&#128295; ${toolCount} tool calls</span>`;
   }
   headerHtml += `</div>`;
   if (summary.response_preview) headerHtml += `<div class="exec-preview">${escHtml(summary.response_preview)}...</div>`;
@@ -1008,15 +1047,15 @@ function showStageOutput(stage, summary) {
       : nameStr.includes('read') || nameStr.includes('glob') || nameStr.includes('grep') ? '&#128196;'
       : nameStr.includes('write') || nameStr.includes('edit') ? '&#9997;'
       : '&#128295;';
-    const errorCls = entry.is_error ? ' style="border-left:3px solid var(--red)"' : ' style="border-left:3px solid var(--green)"';
+    const errorCls = entry.is_error ? ' is-error' : ' is-ok';
     const uid = 'tool_' + Math.random().toString(36).slice(2, 8);
-    let toolHtml = `<div class="exec-card"${errorCls}>`;
-    toolHtml += `<div class="exec-card-header" style="font-size:12px">`;
-    toolHtml += `<span class="icon">${nameIcon}</span> <span style="font-family:var(--mono);font-size:11px;background:var(--bg3);padding:2px 6px;border-radius:4px">${escHtml(nameStr)}</span>`;
+    let toolHtml = `<div class="exec-card${errorCls}">`;
+    toolHtml += `<div class="exec-card-header">`;
+    toolHtml += `<span class="icon">${nameIcon}</span> <span class="mono-chip">${escHtml(nameStr)}</span>`;
     if (isFetch && entry.input_url) {
-      toolHtml += ` <a href="${escHtml(entry.input_url)}" target="_blank" rel="noopener" style="color:var(--accent);font-size:11px;text-decoration:none;max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle">${escHtml(entry.input_url)}</a>`;
+      toolHtml += ` <a href="${escHtml(entry.input_url)}" target="_blank" rel="noopener" class="link-inline">${escHtml(entry.input_url)}</a>`;
     } else if (entry.input_preview) {
-      toolHtml += `<span style="font-weight:400;color:var(--text3);font-size:11px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"> ${escHtml(entry.input_preview)}</span>`;
+      toolHtml += `<span class="meta-note" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"> ${escHtml(entry.input_preview)}</span>`;
     }
     if (entry.result_expanded || (entry.urls && entry.urls.length > 0)) {
       toolHtml += ` <span class="tool-expand-toggle" onclick="toggleToolDetail('${uid}')" id="${uid}_toggle" title="Expand">&#9660;</span>`;
@@ -1186,23 +1225,249 @@ function switchRightTab(tab) {
   if (tab === 'progress') renderProgressView();
 }
 
+// ── Progress / subtask event handling ─────────────────────
+// Chinese labels for the known loop-pipeline and research pipeline phases.
+const PIPELINE_PHASES = {
+  explore: '探索', clarify: '澄清', plan: '规划', dispatch: '执行',
+  repair: '修复', evaluate: '评估',
+  literature: '文献检索', kg: '知识图谱', prediction: '链路预测',
+  hypotheses: '假说生成', debate: '证据辩论', validation: '验证计划',
+  analysis: '数据分析', review: '报告审核',
+};
+
+// Route one `progress` WS envelope: per-subtask events (stage === 'task')
+// drive the todo list + execution cards; everything else is a phase/stage
+// status update.
+function handleProgressMsg(msg) {
+  const stage = msg.stage || '';
+  const status = msg.status || '';
+  const data = msg.data || null;
+
+  if (stage === 'task') {
+    if (data && data.task_id) {
+      upsertSubtask({ ...data, status });
+      stageStatus[data.task_id] = status;
+      updateStagePill(data.task_id, status);
+    }
+    renderProgressView();
+    return;
+  }
+
+  // Phase / workflow stage event.
+  updateStagePill(stage, status);
+  stageStatus[stage] = status;
+  trackPhase(stage, status, data);
+  syncTaskMeta(msg.task_id, { status: status === 'failed' ? 'failed' : 'running' });
+  renderProgressView();
+}
+
+// Track a live pipeline phase (loop phases / research phases). Stages that
+// belong to the current plan's stage list (workflow mode) are NOT tracked as
+// phases — they render in the Workflow Stages tree instead.
+function trackPhase(stage, status, data) {
+  const planStageNames = new Set((currentPlan?.stages || []).map(s => s.name));
+  if (planStageNames.has(stage)) return;
+  const summary = data && typeof data.summary === 'string' ? data.summary : null;
+  let p = phases.find(x => x.name === stage);
+  if (!p) {
+    p = { name: stage, label: PIPELINE_PHASES[stage] || stage, status, summary: null, ts: Date.now() };
+    phases.push(p);
+  }
+  p.status = status;
+  p.ts = Date.now();
+  if (summary) p.summary = summary;
+  // Execution summary card in the middle panel (expandable).
+  upsertExecCard('ph-' + stage, {
+    title: `${p.label || stage}`,
+    role: stage,
+    status,
+    preview: mdPlain(summary || '', 140),
+    bodyHtml: summary ? md(summary) : '',
+    meta: '',
+  });
+}
+
+// Insert-or-update one subtask in the todo list + its execution card.
+function upsertSubtask(d) {
+  const id = d.task_id;
+  if (!subtasks[id]) {
+    subtasks[id] = { id, status: 'pending' };
+    subtaskOrder.push(id);
+  }
+  const st = subtasks[id];
+  if (d.title) st.title = d.title;
+  if (d.role) st.role = d.role;
+  if (d.difficulty) st.difficulty = d.difficulty;
+  st.status = d.status || st.status;
+  st.reused = !!d.reused;
+  if (d.output != null) st.output = d.output;
+  if (d.error != null) st.error = d.error;
+  if (d.tokens_used != null) st.tokens = d.tokens_used;
+  st.ts = Date.now();
+  upsertExecCard('st-' + id, {
+    title: st.title || id,
+    role: st.role,
+    status: st.status,
+    reused: st.reused,
+    preview: mdPlain(st.status === 'failed' ? (st.error || '子任务执行失败') : (st.output || ''), 140),
+    bodyHtml: st.status === 'failed'
+      ? `<div class="sub-exec-error">${escHtml(st.error || '子任务执行失败')}</div>${st.output ? md(st.output) : ''}`
+      : md(st.output || ''),
+    meta: st.tokens ? `${st.tokens} tokens` : '',
+  });
+}
+
+// Restore one persisted subtask summary (from task.stage_outputs) after a
+// page reload / task switch.
+function restoreSubtask(summary) {
+  const id = summary.task_id || 'T' + (subtaskOrder.length + 1);
+  if (!subtasks[id]) {
+    subtasks[id] = { id, status: summary.status || 'completed' };
+    subtaskOrder.push(id);
+  }
+  const st = subtasks[id];
+  st.title = summary.title || st.title || id;
+  st.role = summary.role || st.role || '';
+  st.status = summary.status || st.status || 'completed';
+  st.output = summary.response_preview || st.output || '';
+  st.error = summary.error || null;
+  st.tokens = summary.tokens_used || st.tokens || 0;
+  st.reused = !!summary.reused;
+  upsertExecCard('st-' + id, {
+    title: st.title || id,
+    role: st.role,
+    status: st.status,
+    reused: st.reused,
+    preview: mdPlain(st.status === 'failed' ? (st.error || '') : (st.output || ''), 140),
+    bodyHtml: st.status === 'failed'
+      ? `<div class="sub-exec-error">${escHtml(st.error || '子任务执行失败')}</div>${st.output ? md(st.output) : ''}`
+      : md(st.output || ''),
+    meta: st.tokens ? `${st.tokens} tokens` : '',
+  });
+}
+
+// ── Middle panel: expandable subtask execution summary cards ──
+// Each card keeps its DOM node (id = key) so status updates replace content
+// in place instead of appending duplicates.
+function upsertExecCard(key, info) {
+  let card = document.getElementById(key);
+  const isNew = !card;
+  if (isNew) {
+    card = document.createElement('div');
+    card.className = 'exec-panel';
+    card.id = key;
+    insertCardBeforeResult(card);
+  }
+  const icon = info.status === 'completed' ? '&#10003;'
+    : info.status === 'failed' ? '&#10007;'
+    : '<span class="check-spin"></span>';
+  const cls = info.status === 'failed' ? 'is-error'
+    : info.status === 'completed' ? 'is-ok' : '';
+  // Running/failed cards start expanded; completed ones collapse to a
+  // one-line preview (click to expand the full markdown-rendered output).
+  const open = info.status !== 'completed';
+  const preview = (info.preview || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+  const badgeTxt = info.status === 'completed' ? '完成'
+    : info.status === 'failed' ? '失败' : '执行中';
+  const badgeCls = info.status === 'completed' ? 'completed'
+    : info.status === 'failed' ? 'failed' : 'running';
+  card.innerHTML = `<div class="exec-card sub-exec ${cls}${open ? ' open' : ''}">
+    <div class="exec-card-header sub-exec-head" onclick="toggleSubExec('${key}')">
+      <span class="icon">${icon}</span>
+      <span class="sub-exec-title">${escHtml(info.title || key)}</span>
+      ${info.role ? `<span class="tag-mini">${escHtml(info.role)}</span>` : ''}
+      ${info.reused ? '<span class="tag-mini">复用</span>' : ''}
+      ${info.meta ? `<span class="meta-note">${escHtml(info.meta)}</span>` : ''}
+      <span class="stage-badge ${badgeCls}">${badgeTxt}</span>
+      <span class="tool-expand-toggle">&#9660;</span>
+    </div>
+    ${preview ? `<div class="sub-exec-preview">${escHtml(preview)}${(info.preview||'').length > preview.length ? '…' : ''}</div>` : ''}
+    <div class="sub-exec-body">${info.bodyHtml || ''}</div>
+  </div>`;
+  if (isNew && isStreaming) scrollBottom();
+}
+
+function toggleSubExec(key) {
+  const card = document.getElementById(key);
+  if (!card) return;
+  card.querySelector('.sub-exec')?.classList.toggle('open');
+  // Do NOT scroll — preserve the user's reading position.
+}
+
+// Drop all per-task subtask/phase state (task switch / new task).
+function resetSubtaskState() {
+  subtasks = {};
+  subtaskOrder = [];
+  phases = [];
+}
+
+// One-line plain-text preview of a markdown blob (right-panel todo list):
+// strips heading markers, emphasis, table pipes and links so it reads cleanly.
+function mdPlain(s, max = 160) {
+  if (!s) return '';
+  const text = s
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\|/g, ' ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^[-*]\s*\[[ xX]\]\s*/gm, '')
+    .replace(/^[-*]\s+/gm, '')
+    .replace(/^>\s?/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text.slice(0, max);
+}
+
 // ── Right panel: progress view ──
 function renderProgressView() {
   const el = document.getElementById('rpProgress');
   if (!el) return;
 
-  // Progress card
   const stages = currentPlan?.stages || [];
-  const total = stages.length;
-  const done = stages.filter(s => stageStatus[s.name] === 'completed').length;
-  const running = stages.some(s => stageStatus[s.name] === 'running');
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  const currentStage = stages.find(s => stageStatus[s.name] === 'running')?.name || (done === total && total > 0 ? 'Completed' : 'Idle');
+  const isLoop = currentPlan?.workflow === 'loop_pipeline';
+  const runningPhase = [...phases].reverse().find(p => p.status === 'running');
+
+  // ── Header progress card ──
+  // Prefer the REAL subtask todo list (loop mode); fall back to plan stages
+  // (workflow), then to live phases (research without a plan).
+  let done = 0, total = 0, running = false, pct = 0;
+  let currentLabel = 'Idle', currentStatus = '';
+  if (subtaskOrder.length) {
+    total = subtaskOrder.length;
+    done = subtaskOrder.filter(id => subtasks[id]?.status === 'completed').length;
+    running = subtaskOrder.some(id => subtasks[id]?.status === 'running');
+    pct = total ? Math.round((done / total) * 100) : 0;
+  } else if (stages.length) {
+    total = stages.length;
+    done = stages.filter(s => stageStatus[s.name] === 'completed').length;
+    running = stages.some(s => stageStatus[s.name] === 'running');
+    pct = total ? Math.round((done / total) * 100) : 0;
+  } else if (phases.length) {
+    total = phases.length;
+    done = phases.filter(p => p.status === 'completed').length;
+    running = phases.some(p => p.status === 'running');
+    pct = total ? Math.round((done / total) * 100) : 0;
+  }
+  if (runningPhase) {
+    currentLabel = runningPhase.label || runningPhase.name;
+    currentStatus = 'running';
+  } else if (running) {
+    const runningSub = subtaskOrder.map(id => subtasks[id]).find(s => s.status === 'running');
+    currentLabel = runningSub ? (runningSub.title || runningSub.id) : '执行中';
+    currentStatus = 'running';
+  } else if (total > 0 && done === total) {
+    currentLabel = 'Completed';
+    currentStatus = 'completed';
+  } else if (total > 0) {
+    currentLabel = 'Pending';
+  }
+  const doneLabel = total ? `${done}/${total}` : '';
 
   let html = `<div class="progress-card">
-    <div class="progress-stage">${escHtml(currentStage)} <span class="stage-status ${running?'running':(done===total&&total>0?'completed':'')}">${running?'running':(done===total&&total>0?'done':'')}</span></div>
+    <div class="progress-stage">${escHtml(currentLabel)} <span class="stage-status ${currentStatus}">${currentStatus === 'running' ? 'running' : currentStatus === 'completed' ? 'done' : ''}</span></div>
     <div class="progress-bar-wrap"><div class="progress-bar" style="width:${pct}%"></div></div>
-    <div class="progress-meta"><span>${done}/${total} stages &middot; ${pct}%</span><span>&#9201; ${elapsedStr()}</span></div>
+    <div class="progress-meta"><span>${doneLabel ? doneLabel + ' ' + (isLoop || (!stages.length && phases.length) ? '子任务' : 'stages') + ' &middot; ' : ''}${pct}%</span><span>&#9201; ${elapsedStr()}</span></div>
     <div class="activity-summary">
       <span class="act-stat" title="Tool calls">&#128295; ${activityStats.tools}</span>
       ${activityStats.toolErrors ? `<span class="act-stat err" title="Tool errors">&#9888; ${activityStats.toolErrors}</span>` : ''}
@@ -1212,52 +1477,74 @@ function renderProgressView() {
     </div>
   </div>`;
 
-  // Subtask tree — show each stage with its role, sub-tasks, tools, and live status
+  // ── Live pipeline phases (loop / research modes) ──
+  if (phases.length) {
+    html += `<div class="stree-section-title">Pipeline Phases</div>`;
+    for (const p of phases) {
+      const icon = p.status === 'completed' ? '&#10003;'
+        : p.status === 'running' ? '<span class="check-spin"></span>'
+        : p.status === 'failed' ? '&#10007;'
+        : '&#9675;';
+      html += `<div class="stree-stage ${p.status} ${p.summary ? 'expanded' : ''}">
+        <div class="stree-stage-head" onclick="this.parentElement.classList.toggle('expanded')">
+          <span class="check ${p.status}">${icon}</span>
+          <span class="name">${escHtml(p.label || p.name)}</span>
+          <span class="mono-chip">${escHtml(p.name)}</span>
+          <span class="stage-badge ${p.status}">${p.status}</span>
+          <span class="chevron">&#9654;</span>
+        </div>
+        ${p.summary ? `<div class="stree-stage-body"><div class="stree-stage-desc">${escHtml(p.summary)}</div></div>` : ''}
+      </div>`;
+    }
+  }
+
+  // ── Plan stages: workflow stages OR the loop-mode subtask todo list ──
   if (stages.length) {
-    html += `<div class="stree-section-title">Workflow Stages</div>`;
+    html += `<div class="stree-section-title">${isLoop ? 'Subtasks · Todo' : 'Workflow Stages'}</div>`;
     for (let si = 0; si < stages.length; si++) {
       const s = stages[si];
-      const status = stageStatus[s.name] || 'pending';
-      // Determine stage completion icon
+      // Loop mode: real per-subtask status from progress events. Workflow
+      // mode: derive from the stage status as before.
+      let status, subStatusNote = '';
+      if (isLoop) {
+        status = subtasks[s.name]?.status || 'pending';
+        const st = subtasks[s.name];
+        if (st && (st.output || st.error)) {
+          subStatusNote = `<div class="stree-stage-desc">${escHtml(mdPlain(st.status === 'failed' ? '✗ ' + (st.error || '') : (st.output || '')))}</div>`;
+        }
+      } else {
+        status = stageStatus[s.name] || 'pending';
+      }
       const stageIcon = status === 'completed' ? '&#10003;'
         : status === 'running' ? '<span class="check-spin"></span>'
         : status === 'failed' ? '&#10007;'
-        : '&#9675;';  // empty circle for pending
-      const stageCls = status; // 'pending' | 'running' | 'completed' | 'failed'
+        : '&#9675;';
+      const stageCls = status;
 
-      // Sub-task status: derive from stage status.
-      // If stage completed → all sub-tasks done.
-      // If stage running → show first sub-task as active, rest pending.
-      // If stage pending → all pending.
+      // Sub-task status (workflow mode only): derive from stage status.
       const subTasks = s.sub_tasks || [];
       let subItemsHtml = '';
-      for (let ti = 0; ti < subTasks.length; ti++) {
-        let subStatus = 'pending';
-        let subIcon = '&#9675;'; // empty circle
-        if (status === 'completed') {
-          subStatus = 'done'; subIcon = '&#10003;';
-        } else if (status === 'failed') {
-          subStatus = 'failed'; subIcon = '&#10007;';
-        } else if (status === 'running') {
-          // First sub-task is "in progress"
-          if (ti === 0) { subStatus = 'active'; subIcon = '<span class="check-spin"></span>'; }
+      if (!isLoop) {
+        for (let ti = 0; ti < subTasks.length; ti++) {
+          let subStatus = 'pending';
+          let subIcon = '&#9675;';
+          if (status === 'completed') {
+            subStatus = 'done'; subIcon = '&#10003;';
+          } else if (status === 'failed') {
+            subStatus = 'failed'; subIcon = '&#10007;';
+          } else if (status === 'running') {
+            if (ti === 0) { subStatus = 'active'; subIcon = '<span class="check-spin"></span>'; }
+          }
+          subItemsHtml += `<div class="stree-subtask ${subStatus}">
+            <span class="check">${subIcon}</span>
+            <span>${escHtml(subTasks[ti])}</span>
+          </div>`;
         }
-        subItemsHtml += `<div class="stree-subtask ${subStatus}">
-          <span class="check">${subIcon}</span>
-          <span>${escHtml(subTasks[ti])}</span>
-        </div>`;
       }
 
-      // Tools badges
       const toolBadges = (s.tools || []).map(t => `<span class="stree-tool">${escHtml(t)}</span>`).join('');
-
-      // Role / handler badge
       const roleLabel = s.handler ? `<span class="role">${escHtml(s.handler)}</span>` : '';
-
-      // Description
       const descHtml = s.description ? `<div class="stree-stage-desc">${escHtml(s.description)}</div>` : '';
-
-      // Tier badge (model tier)
       const tierBadge = s.tier ? `<span class="stree-tier">${escHtml(s.tier)}</span>` : '';
 
       html += `<div class="stree-stage ${stageCls} expanded" data-stage="${escHtml(s.name)}">
@@ -1271,12 +1558,13 @@ function renderProgressView() {
         </div>
         <div class="stree-stage-body">
           ${descHtml}
+          ${subStatusNote}
           ${subItemsHtml}
           ${toolBadges ? `<div class="stree-tool-list">${toolBadges}</div>` : ''}
         </div>
       </div>`;
     }
-  } else {
+  } else if (!phases.length) {
     html += `<div class="rp-empty"><div class="icon">&#128202;</div><div>No workflow yet. Run a task to see its stages.</div></div>`;
   }
 
@@ -1381,7 +1669,7 @@ function renderFilesView() {
   }
   const tree = renderFileNodes(fileTree);
   el.innerHTML = `<div class="file-toolbar">
-      <span style="font-size:12px;color:var(--text2);font-weight:600">Output files</span>
+      <span>Output files</span>
       <span class="count"></span>
       <button class="btn-refresh" onclick="loadFileTree(currentTaskId)" title="Refresh">&#8635;</button>
     </div>
@@ -1435,7 +1723,7 @@ async function openPreview(path) {
   dl.onclick = () => downloadFile(path);
   body.className = 'preview-body';
   body.innerHTML = `<div class="preview-loading"><span class="cursor"></span> Loading…</div>`;
-  overlay.classList.add('show');
+  overlay.classList.add('active');
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/preview/${encodeURIComponent(path)}`);
     const data = await resp.json();
@@ -1446,13 +1734,14 @@ async function openPreview(path) {
     }
     const ext = (data.ext || '').toLowerCase();
     if (ext === 'md') {
-      body.className = 'preview-body';
+      body.className = 'preview-body rich md-preview';
       body.innerHTML = md(data.content);
+      enhanceRichBody(body);
     } else if (ext === 'json') {
       body.className = 'preview-body pv-text';
       body.textContent = prettyJson(data.content);
     } else if (ext === 'csv' || ext === 'tsv') {
-      body.className = 'preview-body';
+      body.className = 'preview-body rich';
       body.innerHTML = csvToTable(data.content, ext === 'tsv' ? '\t' : ',');
     } else {
       body.className = 'preview-body pv-text';
@@ -1469,7 +1758,7 @@ async function openPreview(path) {
     body.innerHTML = `Failed to load preview: ${escHtml(err.message)}`;
   }
 }
-function closePreview() { document.getElementById('previewOverlay').classList.remove('show'); }
+function closePreview() { document.getElementById('previewOverlay').classList.remove('active'); }
 
 function prettyJson(s) {
   try { return JSON.stringify(JSON.parse(s), null, 2); }
@@ -1482,7 +1771,7 @@ function csvToTable(text, sep) {
   const rows = lines.map(l => l.split(sep));
   const head = rows[0].map(c => `<th>${escHtml(c)}</th>`).join('');
   const body = rows.slice(1, 200).map(r => `<tr>${r.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`).join('');
-  return `<table style="border-collapse:collapse;width:100%;font-size:12px"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
 // ── Helpers ──
@@ -1504,6 +1793,15 @@ function md(text) {
   }
   // Fallback if marked is not loaded
   return escHtml(text).replace(/\n/g, '<br>');
+}
+
+// Post-process rendered markdown: external links open in a new tab safely.
+function enhanceRichBody(root) {
+  if (!root) return;
+  root.querySelectorAll('a[href^="http"]').forEach(a => {
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+  });
 }
 
 // ── Init ──
@@ -1692,11 +1990,11 @@ function renderModelCard(m, isActive) {
     <div class="card ${isActive ? 'active' : ''}">
       <div class="card-head">
         <div class="card-icon">${esc(m.kind_icon || '🤖')}</div>
-        <div style="flex:1;min-width:0">
+        <div class="grow">
           <div class="card-title">${esc(m.display_name)}
-            ${isActive ? '<span class="status-tag ok" style="margin-left:6px">使用中</span>' : ''}
-            ${m.builtin ? '<span class="status-tag muted" style="margin-left:6px">内置</span>' : '<span class="status-tag muted" style="margin-left:6px">自定义</span>'}
-            ${!m.has_key ? '<span class="status-tag warn" style="margin-left:6px">无 Key</span>' : ''}
+            ${isActive ? '<span class="status-tag ok">使用中</span>' : ''}
+            ${m.builtin ? '<span class="status-tag muted">内置</span>' : '<span class="status-tag muted">自定义</span>'}
+            ${!m.has_key ? '<span class="status-tag warn">无 Key</span>' : ''}
           </div>
           <div class="card-sub">${esc(m.kind_label)} · ${esc(m.base_url || '(无 base url)')}</div>
         </div>
@@ -1853,7 +2151,7 @@ function renderSettingsAbout(body) {
       <div class="card">
         <div class="card-head">
           <div class="card-icon">🤖</div>
-          <div style="flex:1;min-width:0">
+          <div class="grow">
             <div class="card-title">${active ? esc(active.display_name) : '未选择'}</div>
             <div class="card-sub">${active ? esc(active.kind_label) + ' · ' + esc(active.base_url) : '—'}</div>
           </div>
@@ -1873,7 +2171,7 @@ function renderSettingsAbout(body) {
         <div class="card" style="padding:8px 12px">
           <div style="display:flex;align-items:center;gap:8px">
             <span style="font-size:16px">${esc(m.kind_icon || '🤖')}</span>
-            <span style="flex:1;font-weight:600">${esc(m.display_name)}</span>
+            <span class="grow" style="font-weight:600">${esc(m.display_name)}</span>
             <span class="status-tag ${m.has_key ? 'ok' : 'warn'}">${m.has_key ? 'Key OK' : 'No Key'}</span>
             ${m.builtin ? '<span class="status-tag muted">内置</span>' : '<span class="status-tag muted">自定义</span>'}
           </div>
@@ -1885,7 +2183,7 @@ function renderSettingsAbout(body) {
       <div class="card">
         <div class="card-head">
           <div class="card-icon">🧪</div>
-          <div style="flex:1;min-width:0">
+          <div class="grow">
             <div class="card-title">Miniagent · Round 36</div>
             <div class="card-sub">统一设置中心 + 主题重构</div>
           </div>

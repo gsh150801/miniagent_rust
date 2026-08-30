@@ -157,17 +157,9 @@ impl LoopPipeline {
         config: Arc<AppConfig>,
         max_loops: usize,
         cancel: CancellationToken,
-        mut on_progress: Option<ProgressFn>,
+        on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
-        // Stable lowercase stage names so the front-end `renderProgressView`
-        // matches loop-pipeline pills with workflow pills without special-casing.
-        let mut emit = |name: &str, status: &str, data: Option<&serde_json::Value>| {
-            if let Some(cb) = on_progress.as_mut() {
-                cb(name, status, data);
-            }
-        };
-
         let result_base = result_dir
             .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
         if let Err(e) = std::fs::create_dir_all(&result_base) {
@@ -183,6 +175,21 @@ impl LoopPipeline {
         let mut ctx = StageContext::new(task, config)
             .with_max_loops(max_loops)
             .with_working_dir(result_base.to_string_lossy().to_string());
+
+        // Stable lowercase stage names so the front-end `renderProgressView`
+        // matches loop-pipeline pills with workflow pills without special-casing.
+        // The callback lives in `ctx.progress` (shared with stages) so both the
+        // coarse phase events here and Dispatch's per-subtask events flow
+        // through the same channel.
+        ctx = ctx.with_progress(on_progress);
+        let phase_slot = ctx.progress.clone();
+        let emit = move |name: &str, status: &str, data: Option<&serde_json::Value>| {
+            if let Some(slot) = phase_slot.as_ref()
+                && let Ok(mut guard) = slot.lock()
+                && let Some(cb) = guard.as_mut() {
+                    cb(name, status, data);
+                }
+        };
 
         // ── P0 #7: Attempt to resume from a previous checkpoint ──
         // If a checkpoint exists for this task, restore its state so a crashed

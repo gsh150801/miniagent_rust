@@ -1,0 +1,20 @@
+{
+  "input_file": "/Users/Apple/projs/miniagent_rust-main/result/e2e_no_fixed_n/data/GSE107121_series_matrix.tsv",
+  "n_samples": 0,
+  "n_expression_rows": 0,
+  "data_organism": "Homo sapiens (hTert-HME1 cell line)",
+  "data_treatment": "siRNA (control/BRCA2) + EGF (+/-)",
+  "objective_satisfied": false,
+  "objective_keywords_found": {
+    "sod1": false,
+    "g93a": false,
+    "microglia": false,
+    "astrocyte": false,
+    "motor neuron": false,
+    "spinal cord": false,
+    "cd11b": false,
+    "gfap": false,
+    "mouse": false,
+    "mus musculus": false
+  }
+}
