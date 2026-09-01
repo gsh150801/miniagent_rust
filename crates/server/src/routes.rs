@@ -1900,7 +1900,7 @@ async fn handle_run(
 
     // Build workflow
     let builder = WorkflowBuilder::new(agent_arc.clone(), state.config.clone())
-        .with_task_dir(task_workflow_dir.to_string_lossy());
+        .with_task_dir(task_dir.to_string_lossy());
 
     let system_prompt = format!("You are an AI agent with direct access to system tools. You MUST use tools for actions — NEVER simulate or describe tool output.\n\
          Available tools: pubmed_search, web_search, web_fetch, patent_search, clinical_trials_search, \
@@ -1921,8 +1921,8 @@ async fn handle_run(
          - Record important tool results in your response — they may be cleared from context later.\n\
          - If you can say it in one sentence, don't use three.\n\n\
          {}{}",
-        miniagent_core::context_info::env_block(&task_workflow_dir.to_string_lossy()),
-        miniagent_core::context_info::project_md_block(&task_workflow_dir.to_string_lossy())
+        miniagent_core::context_info::env_block(&task_dir.to_string_lossy()),
+        miniagent_core::context_info::project_md_block(&task_dir.to_string_lossy())
             .map(|s| format!("\n\n{s}")).unwrap_or_default()
     );
 
@@ -1953,7 +1953,7 @@ async fn handle_run(
                 edges: vec![],
             };
             WorkflowBuilder::new(agent_arc.clone(), state.config.clone())
-                .with_task_dir(task_workflow_dir.to_string_lossy())
+                .with_task_dir(task_dir.to_string_lossy())
                 .build(&fallback, &effective_prompt, &system_prompt)
                 .expect("single-agent fallback should always build")
         }

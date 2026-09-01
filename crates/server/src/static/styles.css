@@ -60,6 +60,10 @@ input,select,textarea{font-family:inherit;color:inherit}
 /* ── Sidebar ────────────────────────────────────────────────── */
 .sidebar{width:260px;background:var(--sidebar-bg);border-right:1px solid var(--border);
   display:flex;flex-direction:column;flex-shrink:0;transition:width .18s ease}
+.ftree-dir.collapsed>.ftree-children{display:none}
+.ftree-dir .chevron{display:inline-block;transition:transform .15s ease}
+.ftree-dir.collapsed>.ftree-dir-head .chevron{transform:rotate(-90deg)}
+.ftree-dir-head{cursor:pointer;user-select:none}
 .sidebar.collapsed{width:0;border-right:none;overflow:hidden}
 .sidebar-header{padding:14px 14px 10px;display:flex;align-items:center;gap:8px;
   border-bottom:1px solid var(--border)}

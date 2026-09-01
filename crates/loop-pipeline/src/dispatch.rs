@@ -697,7 +697,8 @@ impl PipelineStage for DispatchStage {
                 tracing::error!(path = %task_dir.display(), error = %e, "failed to create dispatch task dir");
             }
 
-            let filename = format!("{}.md", if result.success { "ok" } else { "failed" });
+            // Semantic names: result.md / failed.md (was the opaque ok.md).
+            let filename = format!("{}.md", if result.success { "result" } else { "failed" });
             let path = task_dir.join(&filename);
             let content = if result.success {
                 result.output.clone()
@@ -728,8 +729,12 @@ impl PipelineStage for DispatchStage {
                 "preview": r.output.chars().take(500).collect::<String>(),
             })).collect::<Vec<_>>(),
         });
-        let summary_path = std::path::PathBuf::from(&ctx.working_dir)
-            .join(format!("dispatch_{}_summary.json", ts));
+        // Archive under dispatch/ with a loop-numbered name instead of flat
+        // epoch-timestamped files in the task root.
+        let dispatch_dir = std::path::PathBuf::from(&ctx.working_dir).join("dispatch");
+        let _ = std::fs::create_dir_all(&dispatch_dir);
+        let summary_path = dispatch_dir
+            .join(format!("loop{}_{}.json", ctx.state.loop_count + 1, ts));
         if let Ok(json) = serde_json::to_string_pretty(&summary_data)
             && let Err(e) = std::fs::write(&summary_path, &json) {
                 tracing::error!(path = %summary_path.display(), error = %e, "failed to persist dispatch summary");

@@ -81,18 +81,32 @@ impl LoopPipeline {
 
     // ── P0 #7: Crash recovery via per-loop checkpoint ──────────────
 
-    /// Deterministic checkpoint path derived from the task description slug.
-    fn checkpoint_path(base: &std::path::Path, current_task: &str) -> std::path::PathBuf {
-        let slug: String = current_task
-            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-            .filter(|w| !w.is_empty())
-            .take(4)
-            .map(|w| w.to_lowercase())
-            .collect::<Vec<_>>()
-            .join("_");
-        let slug = if slug.is_empty() { "task" } else { slug.as_str() };
-        base.join(format!("checkpoint_{}", slug))
-            .join("_checkpoint.json")
+    /// Fixed checkpoint path: one checkpoint per task directory. (Previously
+    /// the slug was derived from the per-turn task description, so every
+    /// follow-up turn created a NEW checkpoint dir and the stale ones were
+    /// never cleaned — the duplicated `checkpoint_*` dirs in the Files panel.)
+    fn checkpoint_path(base: &std::path::Path, _current_task: &str) -> std::path::PathBuf {
+        base.join("checkpoint").join("state.json")
+    }
+
+    /// Legacy per-slug checkpoint dirs (pre-fix runs) for resume, so an
+    /// interrupted old run can still be picked up.
+    fn legacy_checkpoint_dirs(base: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("checkpoint_"))
+                    && p.join("_checkpoint.json").exists()
+                {
+                    out.push(p.join("_checkpoint.json"));
+                }
+            }
+        }
+        out
     }
 
     /// Persist pipeline state so a crashed run can be resumed.
@@ -117,7 +131,14 @@ impl LoopPipeline {
     /// Attempt to load a previous checkpoint for the given task.
     fn load_checkpoint(base: &std::path::Path, current_task: &str) -> Option<crate::types::PipelineState> {
         let path = Self::checkpoint_path(base, current_task);
-        let data = std::fs::read_to_string(&path).ok()?;
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                // Legacy per-slug checkpoint from a pre-fix run.
+                let legacy = Self::legacy_checkpoint_dirs(base).into_iter().next()?;
+                std::fs::read_to_string(legacy).ok()?
+            }
+        };
         match serde_json::from_str::<crate::types::PipelineState>(&data) {
             Ok(state) => {
                 tracing::info!(
@@ -440,6 +461,13 @@ impl LoopPipeline {
             let _ = std::fs::remove_file(&cp_path);
             tracing::debug!("Checkpoint cleaned up: {:?}", cp_path);
         }
+        // Also remove legacy per-slug checkpoint dirs left by older runs.
+        for legacy in Self::legacy_checkpoint_dirs(&result_base) {
+            if let Some(dir) = legacy.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+                tracing::debug!("Legacy checkpoint dir removed: {:?}", dir);
+            }
+        }
 
         let summary = ctx.state.evaluations.last()
             .map(|e| format!(
@@ -453,6 +481,41 @@ impl LoopPipeline {
             .unwrap_or_else(|| "Pipeline completed with unknown status".into());
 
         tracing::info!("Pipeline complete: {summary}");
+
+        // 执行摘要: a semantically-named top-level deliverable (alongside the
+        // main report {brief}.md) so the Files panel reads by purpose, not by
+        // timestamp. Contains the goal, loop outcomes, and per-task results.
+        {
+            use std::fmt::Write as _;
+            let mut md = String::new();
+            let _ = writeln!(md, "# 执行摘要 / Executive Summary\n");
+            let _ = writeln!(md, "- **任务**: {}\n- **结果**: {}\n- **循环轮次**: {}\n",
+                ctx.state.original_task, summary, ctx.state.loop_count);
+            if let Some(adj) = ctx.state.evaluations.last().and_then(|e| e.adjudication.as_ref()) {
+                let _ = writeln!(md, "- **三方裁决**: {} — {}\n",
+                    adj.get("verdict").and_then(|v| v.as_str()).unwrap_or("?"),
+                    adj.get("summary").and_then(|v| v.as_str()).unwrap_or("")); 
+            }
+            if !ctx.state.task_results.is_empty() {
+                let _ = writeln!(md, "## 子任务结果\n\n| 任务 | 状态 | 输出摘要 |\n|---|---|---|");
+                for r in &ctx.state.task_results {
+                    let _ = writeln!(md, "| {} | {} | {} |",
+                        r.task_id,
+                        if r.success { "✅" } else { "❌" },
+                        r.output.chars().take(120).collect::<String>().replace('\n', " "));
+                }
+                writeln!(md).ok();
+            }
+            let clar: Vec<String> = ctx.state.clarifications.iter()
+                .map(|c| format!("- **Q**: {}\n  **A**: {}{}", c.question, 
+                    if c.answered { &c.answer } else { "（未回答，按默认假设执行）" },
+                    ""))
+                .collect();
+            if !clar.is_empty() {
+                let _ = writeln!(md, "## 澄清记录\n\n{}\n", clar.join("\n"));
+            }
+            let _ = std::fs::write(result_base.join("执行摘要.md"), md);
+        }
 
         Ok(ctx.state)
     }

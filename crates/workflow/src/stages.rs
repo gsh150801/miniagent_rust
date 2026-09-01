@@ -17,7 +17,27 @@ pub fn default_workflow_dir() -> String {
 
 /// Resolve the task-specific workflow directory.
 /// Reads `task_dir` from the input JSON; falls back to the anchored default.
+/// Engine-internal artifacts directory (.workflow under the task root).
+/// User-facing deliverables live at the task root (agents of every mode —
+/// workflow/loop/research — share that anchor so multi-turn work on the same
+/// files never splits across mode-specific directories, the live
+/// "两个 note.txt" bug); only engine bookkeeping (stage outputs, synthesis)
+/// stays hidden here.
 fn task_workflow_dir(ctx: &StageContext) -> std::path::PathBuf {
+    let base = ctx
+        .input["task_dir"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_workflow_dir);
+    let dir = std::path::PathBuf::from(base).join(".workflow");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// The task root where user-facing deliverables live — the SAME anchor the
+/// loop pipeline and research pipeline use, so a follow-up turn in any mode
+/// sees the files produced by earlier turns.
+fn task_root_dir(ctx: &StageContext) -> std::path::PathBuf {
     let base = ctx
         .input["task_dir"]
         .as_str()
@@ -170,7 +190,7 @@ impl StageHandler for AgentStage {
         let mut context = RunContext::new(augmented_system)
             .with_complexity(complexity)
             .with_provider(provider)
-            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
+            .with_working_dir(task_root_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -435,7 +455,7 @@ impl StageHandler for ResearcherStage {
             .with_complexity(complexity)
             .with_provider(provider)
             .with_allowed_tools(allowed)
-            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
+            .with_working_dir(task_root_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -701,7 +721,7 @@ impl StageHandler for AnalystStage {
             .with_complexity(complexity)
             .with_provider(provider)
             .with_allowed_tools(allowed)
-            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
+            .with_working_dir(task_root_dir(ctx).to_string_lossy().to_string());
         context.max_tool_iterations = self.max_iterations;
         context.max_tokens = self.max_tokens;
 
@@ -1298,7 +1318,7 @@ Do NOT just list the worker outputs — combine them meaningfully.
         let mut context = RunContext::new("You are an orchestrator that synthesizes worker outputs into a unified result.")
             .with_complexity(TaskComplexity::Complex)
             .with_provider(ProviderChoice::Pro)
-            .with_working_dir(task_workflow_dir(ctx).to_string_lossy().to_string());
+            .with_working_dir(task_root_dir(ctx).to_string_lossy().to_string());
 
         if let Some(mt) = self.max_tokens {
             context.max_tokens = Some(mt.min(393216));
