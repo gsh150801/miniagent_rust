@@ -744,3 +744,13 @@ input,select,textarea{font-family:inherit;color:inherit}
   .model-chip .mc-name{max-width:80px}
   .stage-pills{max-width:35%}
 }
+
+/* ── P2: 会话约束 goal_state 卡片 ── */
+#rpGoal{margin:10px 10px 0}
+.goal-card{background:var(--bg-tertiary,rgba(127,127,127,.08));border:1px solid var(--border,#8884);border-radius:8px;padding:8px 10px;font-size:12px}
+.goal-title{font-weight:600;margin-bottom:4px}
+.goal-ver{font-weight:400;opacity:.6;font-size:11px}
+.goal-obj{opacity:.85;margin-bottom:6px;line-height:1.4}
+.goal-row{display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-top:1px dashed var(--border,#8883)}
+.goal-text{flex:1;line-height:1.4}
+.goal-src{opacity:.55;font-size:11px;white-space:nowrap}

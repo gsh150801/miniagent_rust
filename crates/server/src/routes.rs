@@ -295,9 +295,17 @@ async fn tasks_handler(State(state): State<AppState>) -> Json<serde_json::Value>
 async fn get_task_handler(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<Json<TaskInfo>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let task = state.tasks.get(&task_id).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(task.value().clone()))
+    // P2: include the session goal_state (session.json) so REST consumers see
+    // the accumulated constraints, same as the WS get_task payload.
+    let mut v = serde_json::to_value(task.value().clone())
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(gs) = load_goal_state(&task.result_dir)
+        && let Ok(gsv) = serde_json::to_value(&gs) {
+            v["goal_state"] = gsv;
+        }
+    Ok(Json(v))
 }
 
 async fn delete_task_handler(
@@ -713,6 +721,12 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                         if !task.messages.is_empty() {
                             response["messages"] = serde_json::json!(task.messages);
                         }
+                        // P2: expose the session goal_state for the frontend
+                        // constraints panel.
+                        if let Some(gs) = load_goal_state(&task.result_dir)
+                            && let Ok(v) = serde_json::to_value(&gs) {
+                                response["goal_state"] = v;
+                            }
                         ws_send(&sink, response).await;
                     }
                 }
@@ -1710,16 +1724,61 @@ async fn handle_run(
     // P1 多轮交互：follow-up 时把上一轮交流与产物清单注入本轮上下文，
     // 修复"逐轮失忆"断层（此前 task.messages 仅用于展示，agent 从零开始）。
     // effective_prompt 随后贯穿 explore / planner / workflow / feedback。
+    // P2: 会话级 goal_state —— LLM 提取本轮约束增量 → 合并持久化 →
+    // 注入本轮执行上下文（跨轮继承；"改成只看 2024 年"这类转向无需复述）。
+    let goal_block = {
+        let providers: Vec<std::sync::Arc<dyn LlmProvider>> = {
+            let (f, p) = match build_provider_pair(&active_profile) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = ws_send(socket, serde_json::json!({
+                        "type": "error",
+                        "message": format!("当前模型配置不可用: {e}"),
+                    })).await;
+                    return;
+                }
+            };
+            vec![f, p]
+        };
+        let prev = load_goal_state(&task_dir);
+        let prev_list: Vec<String> = prev.as_ref()
+            .map(|g| g.constraints.iter().map(|c| c.text.clone()).collect())
+            .unwrap_or_default();
+        let extracted = extract_goal_constraints(&prev_list, &prompt, &providers, tokio_util::sync::CancellationToken::new()).await;
+        let turn_source = format!("turn_{}", state.tasks.get(&task_id).map(|t| t.messages.len()).unwrap_or(1).max(1));
+        let gs = merge_goal_state(prev, &prompt, extracted, &turn_source);
+        match persist_goal_state(&task_dir, &gs) {
+            Ok(block) => {
+                manifest_log_goal_state(state, &task_id, &gs);
+                println!("   🎯 goal_state v{}: {} constraint(s)", gs.version, gs.constraints.len());
+                block
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "session.json persist failed — continuing without goal_state");
+                String::new()
+            }
+        }
+    };
+
     let effective_prompt = if let Some(ref task) = state.tasks.get(&task_id)
         && !task.messages.is_empty()
     {
         let prior = build_prior_context(&task.messages, &task.result_dir);
-        if prior.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        if !goal_block.is_empty() {
+            parts.push(goal_block.clone());
+        }
+        if !prior.is_empty() {
+            parts.push(prior);
+        }
+        if parts.is_empty() {
             enriched_prompt.clone()
         } else {
-            println!("   💬 follow-up: prior context injected ({} chars)", prior.len());
-            format!("{prior}\n## 本轮请求\n{enriched_prompt}")
+            println!("   💬 follow-up: prior context injected");
+            format!("{}\n## 本轮请求\n{}", parts.join("\n"), enriched_prompt)
         }
+    } else if !goal_block.is_empty() {
+        format!("{goal_block}\n## 本轮请求\n{enriched_prompt}")
     } else {
         enriched_prompt.clone()
     };
@@ -2707,12 +2766,175 @@ fn extract_stage_summary(name: &str, data: &serde_json::Value) -> serde_json::Va
 
 /// Read uploaded files, parse CSV/TSV into markdown tables, and append to prompt.
 
+/// Append a goal_state change event to the task's audit log.
+fn manifest_log_goal_state(state: &AppState, task_id: &str, gs: &GoalState) {
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.event_log.push(serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "event": {
+                "type": "goal_state_updated",
+                "version": gs.version,
+                "constraints": gs.constraints.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+            }
+        }));
+    }
+}
+
 /// Build a compact "prior turns" context block for a follow-up run in an
 /// existing conversation (workflow mode). Includes the last few exchanges
 /// and an artifact inventory from the task's result directory, so the new
 /// turn's planner and agent know what already exists — without this, every
 /// follow-up started from scratch and "forgot" prior work (live-verified).
 /// Bounded: recent exchanges capped, artifact walk depth-limited.
+
+/// P2 多轮交互：会话级结构化约束（goal_state）。
+///
+/// 每轮运行前，用 LLM 从本轮请求 + 现有 goal_state 中提取约束增量
+/// （时间窗/范围/数量/质量要求/方向决策等），合并后持久化到任务目录的
+/// `session.json`。合并可审计：版本号 + 来源轮次，并写入任务事件日志。
+/// goal_state 整体注入本轮执行上下文——后续轮次自动继承此前确认过的
+/// 约束（"改成只看 2024 年"这类转向无需用户复述历史）。
+///
+/// 通用性：无关键词表、无语言假设——约束识别完全是模型判断；提取
+/// 失败（LLM 不可用）时保留现有 goal_state 并继续（约束是渐进资产，
+/// 不因单轮故障丢失）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GoalState {
+    objective: String,
+    #[serde(default)]
+    constraints: Vec<GoalConstraint>,
+    #[serde(default)]
+    version: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GoalConstraint {
+    text: String,
+    source: String,
+}
+
+/// Load session.json goal_state if present.
+fn load_goal_state(task_dir: &StdPath) -> Option<GoalState> {
+    let raw = std::fs::read_to_string(task_dir.join("session.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Persist goal_state; returns the rendered injection block.
+fn persist_goal_state(task_dir: &StdPath, gs: &GoalState) -> std::io::Result<String> {
+    let json = serde_json::to_string_pretty(gs)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(task_dir.join("session.json"), json)?;
+    Ok(render_goal_state(gs))
+}
+
+fn render_goal_state(gs: &GoalState) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "## 会话累积约束（goal_state v{}）\n", gs.version);
+    let _ = writeln!(s, "**目标**: {}\n", gs.objective);
+    if gs.constraints.is_empty() {
+        s.push_str("（尚无累积约束）\n");
+    } else {
+        let _ = writeln!(s, "| 约束 | 来源 |\n|---|---|");
+        for c in &gs.constraints {
+            let _ = writeln!(s, "| {} | {} |", c.text, c.source);
+        }
+    }
+    s
+}
+
+fn norm_constraint(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Merge this turn's extracted constraints into the goal_state (dedup by
+/// normalized text; version bump per merge).
+fn merge_goal_state(
+    prev: Option<GoalState>,
+    objective: &str,
+    extracted: Vec<String>,
+    turn_source: &str,
+) -> GoalState {
+    let mut gs = prev.unwrap_or(GoalState {
+        objective: objective.to_string(),
+        constraints: Vec::new(),
+        version: 0,
+    });
+    gs.objective = objective.to_string();
+    for text in extracted {
+        let t = text.trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        let nt = norm_constraint(&t);
+        if !gs.constraints.iter().any(|c| norm_constraint(&c.text) == nt) {
+            gs.constraints.push(GoalConstraint { text: t, source: turn_source.into() });
+        }
+    }
+    gs.version += 1;
+    gs
+}
+
+/// LLM extraction of constraint deltas for this turn.
+async fn extract_goal_constraints(
+    prev_constraints: &[String],
+    prompt: &str,
+    providers: &[std::sync::Arc<dyn LlmProvider>],
+    cancel: tokio_util::sync::CancellationToken,
+) -> Vec<String> {
+    use miniagent_core::config::InferenceConfig;
+    let prev = if prev_constraints.is_empty() {
+        "（无）".to_string()
+    } else {
+        prev_constraints.join("; ")
+    };
+    let prompt = format!(
+        "Existing accumulated constraints for this ongoing task:\n{prev}\n\n\
+         New user message for this turn:\n{prompt}\n\n\
+         Extract NEW or CHANGED constraints from the message (time window, scope, \
+         quantity, quality bar, direction decisions, exclusions). Only constraints that \
+         should persist across the rest of this task. Do not restate existing ones. \
+         Output ONLY JSON: {{\"constraints\": [\"...\"]}}"
+    );
+    for provider in providers {
+        let request = CompletionRequest {
+            system: "You extract durable task constraints. Output ONLY valid JSON.".into(),
+            messages: vec![miniagent_core::message::Message::user(&prompt)],
+            tools: vec![],
+            config: InferenceConfig {
+                temperature: Some(0.0),
+                max_tokens: Some(4_096),
+                ..Default::default()
+            },
+        };
+        if let Ok(resp) = provider.complete(&request, cancel.child_token()).await {
+            let text: String = resp
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let repaired = miniagent_core::json_util::extract_and_repair(&text);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                return v["constraints"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str())
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        }
+    }
+    Vec::new()
+}
+
+
 fn build_prior_context(
     messages: &[serde_json::Value],
     result_dir: &StdPath,

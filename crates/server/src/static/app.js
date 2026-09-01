@@ -615,6 +615,9 @@ function renderHistory(msg) {
   if (msg.task_id && msg.status && tasks[msg.task_id]) {
     tasks[msg.task_id].status = msg.status;
   }
+  // P2: session goal_state (accumulated constraints) → right panel.
+  currentGoalState = msg.goal_state || null;
+  renderGoalState();
 
   if (msg.messages && msg.messages.length > 0) {
     for (const m of msg.messages) {
@@ -764,6 +767,25 @@ let streamEl = null, streamRaw = '', streamPending = '', streamFlushTimer = null
 // Plan cards and stage-output cards are inserted BEFORE this anchor, so the
 // final result (stream text) + file downloads always appear last.
 let resultAnchor = null;
+// P2: session goal_state (accumulated cross-turn constraints).
+let currentGoalState = null;
+
+function renderGoalState() {
+  const el = document.getElementById('rpGoal');
+  if (!el) return;
+  if (!currentGoalState || !currentGoalState.constraints || !currentGoalState.constraints.length) {
+    el.innerHTML = '';
+    el.style.display = 'none';
+    return;
+  }
+  const rows = currentGoalState.constraints.map(c =>
+    `<div class="goal-row"><span class="goal-text">${escHtml(c.text)}</span><span class="goal-src">${escHtml(c.source)}</span></div>`).join('');
+  el.style.display = '';
+  el.innerHTML = `<div class="goal-card">
+    <div class="goal-title">&#127919; 会话约束 <span class="goal-ver">v${currentGoalState.version || 1}</span></div>
+    <div class="goal-obj">${escHtml(currentGoalState.objective || '')}</div>
+    ${rows}</div>`;
+}
 
 function ensureResultAnchor() {
   const inner = getInner();
