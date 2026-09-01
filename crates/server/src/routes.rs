@@ -786,12 +786,22 @@ async fn handle_run_loop(
     // restart-restore scan picks loop tasks up too.
     let (task_id, task_brief, task_dir, _task_workflow_dir) =
         if let Some(ref existing_id) = existing_task_id {
-            if let Some(ref task) = state.tasks.get(existing_id) {
-                let brief = task.brief.clone();
-                let dir = task.result_dir.clone();
+            // Read-then-drop before the get_mut below (same-shard guard rules).
+            let reused = state.tasks.get(existing_id).map(|task| {
+                (task.brief.clone(), task.result_dir.clone())
+            });
+            if let Some((brief, dir)) = reused {
                 let wf_dir = dir.join(".workflow");
                 let _ = std::fs::create_dir_all(&wf_dir);
-                (existing_id.clone(), brief, dir.clone(), wf_dir)
+                // Record the user's message in the multi-turn history — loop
+                // follow-ups previously skipped this, so redraws (task click /
+                // page refresh) lost the user's message while the reply
+                // remained (live-reported "对话消息被吞").
+                if let Some(mut t) = state.tasks.get_mut(existing_id) {
+                    t.status = "running".into();
+                    t.messages.push(serde_json::json!({"role": "user", "content": &prompt}));
+                }
+                (existing_id.clone(), brief, dir, wf_dir)
             } else {
                 create_new_task(state, &prompt)
             }
@@ -985,16 +995,25 @@ async fn handle_research_run(
     }
 
     let (task_id, task_brief, task_dir, _task_workflow_dir) =
-        if let Some(ref existing_id) = existing_task_id
-            && let Some(ref task) = state.tasks.get(existing_id)
-        {
-            (existing_id.clone(), task.brief.clone(), task.result_dir.clone(), task.result_dir.clone())
+        if let Some(ref existing_id) = existing_task_id {
+            // Read-then-drop before the get_mut below (same-shard guard rules).
+            let reused = state.tasks.get(existing_id).map(|task| {
+                (task.brief.clone(), task.result_dir.clone())
+            });
+            if let Some((brief, dir)) = reused {
+                if let Some(mut t) = state.tasks.get_mut(existing_id) {
+                    t.status = "running".into();
+                    // Follow-up: record the user message (workflow mode did
+                    // this; research previously lost it on redraws).
+                    t.messages.push(serde_json::json!({"role": "user", "content": &prompt}));
+                }
+                (existing_id.clone(), brief, dir.clone(), dir)
+            } else {
+                create_new_task(state, &prompt)
+            }
         } else {
             create_new_task(state, &prompt)
         };
-    if let Some(mut t) = state.tasks.get_mut(&task_id) {
-        t.status = "running".into();
-    }
 
     let _ = ws_send(socket, serde_json::json!({
         "type": "task_started", "task_id": &task_id,
@@ -1489,22 +1508,30 @@ async fn handle_debate_run(
         };
 
     let (task_id, task_brief, _task_dir, task_workflow_dir) =
-        if let Some(ref existing_id) = existing_task_id
-            && let Some(ref task) = state.tasks.get(existing_id)
-        {
-            // Follow-up rounds reuse the task's result dir but keep artifacts
-            // under `.workflow` — same layout as a fresh task (previously the
-            // first round wrote into `.workflow/` and follow-ups dumped
-            // proposer/judge files straight into the result dir root).
-            let wf_dir = task.result_dir.join(".workflow");
-            let _ = std::fs::create_dir_all(&wf_dir);
-            (existing_id.clone(), task.brief.clone(), task.result_dir.clone(), wf_dir)
+        if let Some(ref existing_id) = existing_task_id {
+            // Read-then-drop before the get_mut below (same-shard guard rules).
+            let reused = state.tasks.get(existing_id).map(|task| {
+                (task.brief.clone(), task.result_dir.clone())
+            });
+            if let Some((brief, dir)) = reused {
+                // Follow-up rounds reuse the task's result dir but keep artifacts
+                // under `.workflow` — same layout as a fresh task (previously the
+                // first round wrote into `.workflow/` and follow-ups dumped
+                // proposer/judge files straight into the result dir root).
+                let wf_dir = dir.join(".workflow");
+                let _ = std::fs::create_dir_all(&wf_dir);
+                if let Some(mut t) = state.tasks.get_mut(existing_id) {
+                    t.status = "running".into();
+                    // Follow-up: record the user message (was lost on redraws).
+                    t.messages.push(serde_json::json!({"role": "user", "content": &prompt}));
+                }
+                (existing_id.clone(), brief, dir.clone(), wf_dir)
+            } else {
+                create_new_task(state, &prompt)
+            }
         } else {
             create_new_task(state, &prompt)
         };
-    if let Some(mut t) = state.tasks.get_mut(&task_id) {
-        t.status = "running".into();
-    }
     let _ = ws_send(socket, serde_json::json!({
         "type": "task_started", "task_id": &task_id,
     })).await;
