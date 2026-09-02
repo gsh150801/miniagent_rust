@@ -103,6 +103,9 @@ pub struct PipelineState {
     /// Whether the Clarify stage already ran for this pipeline run.
     #[serde(default)]
     pub clarified: bool,
+    /// P3 执行中转向：用户在运行期间插入的指令（审计记录）。
+    #[serde(default)]
+    pub steerings: Vec<String>,
 }
 
 /// A lightweight record of a stage output for history replay.
@@ -132,6 +135,7 @@ impl PipelineState {
             stage_outputs: Vec::new(),
             clarifications: Vec::new(),
             clarified: false,
+            steerings: Vec::new(),
         }
     }
 

@@ -5,6 +5,7 @@ let tasks = {};
 let currentTaskId = null;
 let uploadedFiles = [];
 let isStreaming = false;
+let isRunning = false;   // P3: a pipeline is actively executing (steer window open)
 // Skills state
 let skills = [];                    // [{name, description, triggers, tools_needed, ...}]
 let selectedSkills = new Set();     // user-selected skill names
@@ -71,6 +72,7 @@ function handleMsg(msg) {
     case 'status': addSystemMsg(msg.message); break;
     case 'task_started':
       currentTaskId = msg.task_id;
+      isRunning = true;
       // Backend may have attached a status/brief snapshot — apply it so the
       // middle panel list-item doesn't briefly show "—" before the next list
       // refresh.
@@ -865,6 +867,7 @@ function finishStream(taskId, files) {
   resultAnchor = null;
   if (taskId) {
     currentTaskId = taskId;
+    isRunning = false;   // P3: run finished — steer window closes
     if (files && files.length) getInner().appendChild(makeDownloads(taskId, files));
     loadTasks();
     loadFileTree(taskId);   // refresh directory after completion
@@ -1166,6 +1169,14 @@ function sendMessage() {
   const fileIds = uploadedFiles.map(f => f.id);
   uploadedFiles = [];
   document.getElementById('fileChips').innerHTML = '';
+  // P3 执行中转向：任务运行中（非流式输出间隙）再次发送 = 转向指令，
+  // 不打断当前执行——server 入队，在下一个阶段边界生效。
+  if (isRunning && currentTaskId) {
+    ws.send(JSON.stringify({ type: 'steer', task_id: currentTaskId, prompt: text }));
+    input.value = '';
+    autoResize(input);
+    return;
+  }
   startStream();
   const payload = { type: 'run', prompt: text, files: fileIds };
   // Always send the chosen mode so the server can route to the right driver.

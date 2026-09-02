@@ -28,6 +28,9 @@ pub struct StageContext {
     /// Optional interactive clarify channel (server wires the WS ask/reply
     /// protocol; CLI runs pass None so clarification is skipped).
     pub clarify_hook: Option<crate::clarify::ClarifyHook>,
+    /// P3 执行中转向：pipeline 在每轮循环开始时拉取待处理的 steering
+    /// 指令（server 实现从 steers 队列取；CLI 为 None）。
+    pub steer_hook: Option<crate::clarify::SteerHook>,
     /// Shared progress-callback slot. The pipeline run() moves the server's
     /// `ProgressFn` in here so stages (notably Dispatch) can emit fine-grained
     /// per-subtask events without the callback being borrowed elsewhere.
@@ -50,6 +53,7 @@ impl StageContext {
             config,
             agent,
             clarify_hook: None,
+            steer_hook: None,
             progress: None,
             working_dir: std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -118,6 +122,12 @@ impl StageContext {
     /// Wire the interactive clarify channel (server ask/reply protocol).
     pub fn with_clarify_hook(mut self, hook: crate::clarify::ClarifyHook) -> Self {
         self.clarify_hook = Some(hook);
+        self
+    }
+
+    /// Wire the steering pull (P3 执行中转向).
+    pub fn with_steer_hook(mut self, hook: crate::clarify::SteerHook) -> Self {
+        self.steer_hook = Some(hook);
         self
     }
 

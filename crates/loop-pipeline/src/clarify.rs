@@ -28,6 +28,10 @@ pub type ClarifyHook = std::sync::Arc<
         + Sync,
 >;
 
+/// P3 执行中转向：pull pending steering instructions at a stage boundary.
+/// Sync + cheap — the server reads its queue; returns any pending texts.
+pub type SteerHook = std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// One asked-and-answered clarification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Clarification {

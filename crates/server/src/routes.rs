@@ -699,6 +699,24 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                             let _ = sender.send(answer);
                         }
                     }
+                "steer"
+                    // P3 执行中转向：运行中用户插入指令。入队等待阶段边界
+                    // 消费；同时记入对话历史（用户消息在重绘后不丢），并
+                    // 立即回执让用户知道指令已受理。
+                    if !req.task_id.is_empty() => {
+                        state.steers.entry(req.task_id.clone()).or_default().push(req.prompt.clone());
+                        if let Some(mut t) = state.tasks.get_mut(&req.task_id) {
+                            t.messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!("➡️ [转向] {}", req.prompt),
+                            }));
+                        }
+                        let _ = ws_send(&sink, serde_json::json!({
+                            "type": "status",
+                            "task_id": &req.task_id,
+                            "message": "✅ 转向指令已受理：将在当前阶段完成后生效",
+                        })).await;
+                    }
                 "get_task" => {
                     if let Some(task) = state.tasks.get(&req.task_id) {
                         let file_tree = if task.result_dir.is_dir() {
@@ -903,6 +921,13 @@ async fn handle_run_loop(
         })
     });
 
+    // P3 执行中转向：pipeline 在每轮循环边界拉取待处理指令。
+    let steer_state = state.clone();
+    let steer_task_id = task_id.clone();
+    let steer_hook: miniagent_loop_pipeline::SteerHook = Arc::new(move || {
+        take_steers(&steer_state, &steer_task_id)
+    });
+
     // Anchor every pipeline artifact (dispatch outputs, checkpoints, tool
     // writes) inside the task's result directory.
     let result = miniagent_loop_pipeline::LoopPipeline::run_with_clarify(
@@ -913,6 +938,7 @@ async fn handle_run_loop(
         Some(on_progress),
         Some(task_dir.clone()),
         Some(ask_hook),
+        Some(steer_hook),
     ).await;
 
     state.cancels.remove(&task_id);
@@ -1154,6 +1180,12 @@ async fn handle_research_run(
             ask_user(&socket, &state, &task_id, &question, &opts).await
         })
     });
+    let steer_state2 = state.clone();
+    let steer_task_id2 = task_id.clone();
+    let steer_hook: miniagent_loop_pipeline::SteerHook = Arc::new(move || {
+        take_steers(&steer_state2, &steer_task_id2)
+    });
+
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let join = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1163,7 +1195,7 @@ async fn handle_research_run(
         // Research × Loop: every phase (文献检索/KG/链路预测/假说/辩论/验证/
         // 分析/审核) runs as a loop subtask with three-way adjudication.
         let summary = rt.block_on(miniagent_research::run_research_in_loop(
-            run_prompt, run_dir, run_opts, run_config, Some(run_cb), Some(ask_hook),
+            run_prompt, run_dir, run_opts, run_config, Some(run_cb), Some(ask_hook), Some(steer_hook),
         ));
         let _ = tx.send(summary);
         Ok::<(), String>(())
@@ -2765,6 +2797,15 @@ fn extract_stage_summary(name: &str, data: &serde_json::Value) -> serde_json::Va
 // ── File parsing ──
 
 /// Read uploaded files, parse CSV/TSV into markdown tables, and append to prompt.
+
+/// P3: take all pending steering instructions for a task (drain the queue).
+pub fn take_steers(state: &AppState, task_id: &str) -> Vec<String> {
+    state
+        .steers
+        .remove(task_id)
+        .map(|(_, v)| v)
+        .unwrap_or_default()
+}
 
 /// Append a goal_state change event to the task's audit log.
 fn manifest_log_goal_state(state: &AppState, task_id: &str, gs: &GoalState) {

@@ -403,6 +403,12 @@ impl PipelineStage for DispatchStage {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // P3: snapshot steerings for injection into every subtask prompt.
+        let steerings: Vec<String> = ctx.state.steerings.clone();
+        // 有待处理转向时，旧结果不再代表"完成"（转向改变了验收标准），
+        // 禁用本轮的跳过重跑优化——否则转向永远到不了执行层（live 实测：
+        // 转向已入规划目标，但 loop 2 直接复用了 loop 1 缺风险章节的结果）。
+        let steerings_pending = !steerings.is_empty();
         let waves = resolve_execution_order(&plan.tasks);
         // 按 task_id 去重：每个 task_id 只保留最新的一条结果（解决 #2 结果无界累积）
         let mut result_map: std::collections::HashMap<String, TaskResult> = ctx.state.task_results
@@ -443,7 +449,7 @@ impl PipelineStage for DispatchStage {
                 // 文件产物仍存在，则跳过重跑，直接复用旧结果。
                 // 这依赖 plan 的 merge_plan 保留了成功任务的 id（层 1 修复）。
                 if let Some(prior) = result_map.get(&task.id) {
-                    if prior.success && crate::dispatch::outputs_still_exist(&task.expected_output, &ctx.working_dir) {
+                    if prior.success && !steerings_pending && crate::dispatch::outputs_still_exist(&task.expected_output, &ctx.working_dir) {
                         tracing::info!(
                             task_id = %task.id,
                             "dispatch: skipping re-execution, reusing prior successful result"
@@ -491,6 +497,7 @@ impl PipelineStage for DispatchStage {
                 let max_tool_iters = ctx.config.loop_dispatch_max_iterations;
                 let working_dir = ctx.working_dir.clone();
                 let semaphore = semaphore.clone();
+                let steerings = steerings.clone();
 
                 handles.push(tokio::spawn(async move {
                     // Acquire a permit before touching the provider; the
@@ -500,7 +507,8 @@ impl PipelineStage for DispatchStage {
                         .await
                         .expect("dispatch semaphore closed");
                     execute_single_task(
-                        task, agent, cancel, wave_ctx, max_tool_iters, working_dir,
+                        task, agent, cancel, wave_ctx.clone(), max_tool_iters, working_dir.clone(),
+                        steerings.clone(),
                     ).await
                 }));
             }
@@ -743,6 +751,13 @@ impl PipelineStage for DispatchStage {
         let success_count = all_results.iter().filter(|r| r.success).count();
         let fail_count = all_results.iter().filter(|r| !r.success).count();
 
+        // 转向指令已注入本轮全部子任务提示（steerings_pending 时还禁用了
+        // 跳过重跑），清除已应用标记——后续循环仅在新转向到达时再次触发。
+        let mut state = state;
+        if steerings_pending {
+            state.steerings.clear();
+        }
+
         Ok(StageOutput {
             updated_state: state,
             new_messages: messages,
@@ -763,6 +778,7 @@ async fn execute_single_task(
     wave_ctx: String,
     max_tool_iters: usize,
     working_dir: String,
+    steerings: Vec<String>,
 ) -> TaskResult {
     let system = new_role_system_prompt(
         &task.assigned_role,
@@ -776,12 +792,28 @@ async fn execute_single_task(
         format!("\n\n## Repair Context (apply if relevant)\n{wave_ctx}")
     };
 
+    // P3 执行中转向：用户运行中插入的指令直接进入每个子任务的执行提示，
+    // 不依赖规划器转述（保证转向要求到达执行层）。
+    let steer_block = if steerings.is_empty() {
+        String::new()
+    } else {
+        let items: Vec<String> = steerings
+            .iter()
+            .map(|s| format!("- {}", s))
+            .collect();
+        format!(
+            "\n## 用户转向要求（必须遵守）\n{}\n",
+            items.join("\n")
+        )
+    };
+
     let prompt = format!(
         "{repair_context}\n\n\
          ## Task\n{description}\n\
          ## Expected Output\n{expected}\n\n\
          {tool_instructions}\n\
          {env_info}\n\
+         {steer_block}\
          ## Output Location\n\
          Write every file artifact into the working directory above (relative paths). \
          Do NOT create `result/…` or `../…` paths — they end up outside this task's directory.",
@@ -789,6 +821,7 @@ async fn execute_single_task(
         expected = task.expected_output,
         tool_instructions = tool_instruction_block(),
         env_info = crate::prompts::env_info_block(&working_dir),
+        steer_block = steer_block,
     );
 
     let mut history = vec![Message::user(&prompt)];
@@ -801,14 +834,93 @@ async fn execute_single_task(
         .with_working_dir(working_dir.clone());
     context.max_tool_iterations = max_tool_iters;
 
-    let result = agent.run_with_loop(&mut history, &context, cancel).await;
+    let result = agent.run_with_loop(&mut history, &context, cancel.child_token()).await;
     match result {
         Ok(delta) => {
-            let output: String = history.iter()
+            // 通用截断信号：模型仍想继续（ToolUse）但迭代预算耗尽——输出
+            // 停留在调研中途，交付物从未写出。触发收尾合成兜底。
+            let cut_off = !matches!(delta.stop_reason, miniagent_core::event::StopReason::EndTurn);
+            let mut output: String = history.iter()
                 .filter(|m| m.role == miniagent_core::message::MessageRole::Assistant)
                 .map(|m| m.text_content())
                 .collect::<Vec<_>>()
                 .join("\n\n");
+
+            // ── 收尾合成兜底 ─────────────────────────────────────────
+            // 工具迭代上限触顶时，agent 的输出常停留在思维链中途（结尾是
+            // 未闭合的 <think> 段，交付物从未写出——live 实测）。检测这种
+            // 截断并追加一次无工具的合成调用："基于已有调研立即产出最终
+            // 交付物"，保证任务总有可用的结果文本。合成文本同时替换输出
+            // 中的思维链噪声（<think> 段不进入交付物与下游流式）。
+            // 最可靠的完成信号是客观的：expected_output 声称会产出文件，
+            // 而文件不存在（模型以纯文本叙述结束——"Let me search..."——
+            // 从未写出交付物，live 反复出现）。三种信号任一命中即收尾：
+            // 截断（stop_reason）、思维链未闭合、产物缺失。
+            let deliverable_missing =
+                !crate::dispatch::outputs_still_exist(&task.expected_output, &working_dir);
+            let ends_mid_think = cut_off
+                || deliverable_missing
+                || {
+                    let t = output.trim_end();
+                    t.ends_with("</think>")
+                        || (output.contains("<think>") && !output.contains("</think>"))
+                };
+            if ends_mid_think {
+                let _ = deliverable_missing;
+                tracing::warn!(
+                    task_id = %task.id,
+                    "output truncated mid-thinking (tool-iteration cap) — running wrap-up synthesis"
+                );
+                let research_so_far: String = history.iter()
+                    .filter(|m| m.role == miniagent_core::message::MessageRole::Tool)
+                    .map(|m| m.text_content())
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
+                let steer_items: Vec<String> = steerings
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect();
+                let steer_note = if steer_items.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n## 用户转向要求（必须遵守）\n{}\n", steer_items.join("\n"))
+                };
+                let wrap_prompt = format!(
+                    "You hit your tool-iteration limit mid-research. Based on ALL the tool \
+                     results you already gathered, produce the FINAL DELIVERABLE for the task \
+                     NOW — no more tool calls, no thinking, output the complete answer text \
+                     directly (if the deliverable is a file's content, output that content).\n\n\
+                     ## Task\n{}\n\n## Expected Output\n{}\n{steer_note}\n\
+                     ## Research gathered so far (truncated)\n{}",
+                    task.description,
+                    task.expected_output,
+                    research_so_far.chars().take(24_000).collect::<String>(),
+                );
+                let wrap_request = CompletionRequest {
+                    system: "You produce final deliverables. Skip thinking; output the complete answer directly.".into(),
+                    messages: vec![Message::user(&wrap_prompt)],
+                    tools: vec![],
+                    config: InferenceConfig {
+                        temperature: Some(0.2),
+                        max_tokens: Some(16_384),
+                        ..Default::default()
+                    },
+                };
+                if let Ok(resp) = agent.flash_provider().complete(&wrap_request, cancel.child_token()).await {
+                    let wrap_text: String = resp.content.iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let wrap_text = miniagent_core::json_util::strip_reasoning_tags(&wrap_text);
+                    if wrap_text.trim().len() > 50 {
+                        output = format!("{}\n\n{}", wrap_text, output);
+                    }
+                }
+            }
+            // 思维链噪声不进入交付物/下游流式（保留正文）。
+            output = miniagent_core::json_util::strip_reasoning_tags(&output);
 
             let has_tool_calls = history.iter()
                 .filter(|m| m.role == miniagent_core::message::MessageRole::Tool)

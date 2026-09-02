@@ -23,6 +23,9 @@ pub struct AppState {
     /// Per-task ask reply channels: 当 task 执行需要向用户提问时，注册一个 oneshot::Sender；
     /// 前端回复 {type:'ask_reply'} 时，handle_ws 取出 Sender 并 send(answer) 唤醒 task。
     pub asks: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// P3 执行中转向：运行中任务的待处理 steering 指令。前端发
+    /// {type:'steer'} 入队；管线在阶段边界取出并注入后续执行上下文。
+    pub steers: Arc<DashMap<String, Vec<String>>>,
     /// Per-task event-sender RAII guards. Each running task registers its
     /// own broadcast sender via `Agent::register_event_sender`; the guard
     /// is stored here and removed (dropped) on completion / cancel so the
@@ -71,6 +74,7 @@ impl AppState {
             models: Arc::new(std::sync::RwLock::new(models)),
             cancels: Arc::new(DashMap::new()),
             asks: Arc::new(DashMap::new()),
+            steers: Arc::new(DashMap::new()),
             event_guards: Arc::new(DashMap::new()),
         }
     }

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use miniagent_core::settings::AppConfig;
-use miniagent_loop_pipeline::{adjudicate, ClarifyHook};
+use miniagent_loop_pipeline::{adjudicate, ClarifyHook, SteerHook};
 use miniagent_provider::traits::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +69,7 @@ pub async fn run_research_in_loop(
     config: Arc<AppConfig>,
     on_progress: Option<ResearchProgress>,
     ask_hook: Option<ClarifyHook>,
+    steer_hook: Option<SteerHook>,
 ) -> String {
     let emit = |phase: &str, status: &str, detail: Option<String>| {
         if let Some(d) = &detail {
@@ -94,6 +95,16 @@ pub async fn run_research_in_loop(
         let phase_start = std::time::Instant::now();
         emit(phase, "running", Some(format!("{label}: loop subtask start")));
         println!("\n┏━━ Loop subtask ▸ {label} [{phase}]");
+
+        // ── P3 执行中转向：阶段边界拉取用户插入的指令，并入工作请求 ──
+        if let Some(hook) = steer_hook.as_ref() {
+            let steers = hook();
+            for st in steers {
+                working_query.push_str(&format!("\n[用户转向] {}", st));
+                println!("   ➡️  steering: {st}");
+                emit("steer", "completed", Some(format!("转向指令已并入后续阶段: {st}")));
+            }
+        }
 
         // ── Explore: what does the manifest say already exists? ─────
         let manifest_path = project_dir.join("project.json");

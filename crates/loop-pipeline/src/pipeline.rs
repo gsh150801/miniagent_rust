@@ -181,7 +181,7 @@ impl LoopPipeline {
         on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
-        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None).await
+        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None, None).await
     }
 
     /// [`Self::run`] with an interactive clarify channel. The server wires
@@ -195,6 +195,7 @@ impl LoopPipeline {
         on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
         clarify_hook: Option<crate::clarify::ClarifyHook>,
+        steer_hook: Option<crate::clarify::SteerHook>,
     ) -> Result<PipelineState, AgentError> {
         let result_base = result_dir
             .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
@@ -213,6 +214,9 @@ impl LoopPipeline {
             .with_working_dir(result_base.to_string_lossy().to_string());
         if let Some(hook) = clarify_hook {
             ctx = ctx.with_clarify_hook(hook);
+        }
+        if let Some(hook) = steer_hook {
+            ctx = ctx.with_steer_hook(hook);
         }
 
         // Stable lowercase stage names so the front-end `renderProgressView`
@@ -271,6 +275,26 @@ impl LoopPipeline {
 
             let loop_num = ctx.state.loop_count + 1;
             tracing::info!("Loop {}/{}", loop_num, ctx.state.max_loops);
+
+            // ── P3 执行中转向：阶段边界拉取用户插入的指令 ──
+            if let Some(hook) = ctx.steer_hook.as_ref() {
+                let steers = hook();
+                for st in steers {
+                    tracing::info!(steer = %st, "steering received at loop boundary");
+                    ctx.state
+                        .current_task
+                        .push_str(&format!("\n[用户转向] {}", st));
+                    ctx.state.steerings.push(st.clone());
+                    let steer_summary = serde_json::json!({
+                        "summary": { "response_preview": format!("转向指令已注入下一轮规划: {st}") },
+                    });
+                    ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
+                        stage: "steer".into(),
+                        summary: steer_summary.clone(),
+                    });
+                    emit("steer", "completed", Some(&steer_summary));
+                }
+            }
 
             // Phase 1: Explore (isolated — fallback to default exploration)
             tracing::info!("Explore phase");
@@ -447,6 +471,25 @@ impl LoopPipeline {
                     loop_tokens, progress,
                 );
                 ctx.state.completed = true;
+            }
+
+            // ── P3: 评估决定停止后，先消费待处理的用户转向 ──
+            // 转向改变"完成"的定义。此处必须"就地消费并注入"（附加到
+            // current_task + steerings），只检查不消费会让下一轮顶部的
+            // 拉取拿到空队列——转向永远进不了规划（live 复现：loop 2
+            // 重规划含澄清答案但丢转向要求）。
+            if ctx.state.completed
+                && let Some(hook) = ctx.steer_hook.as_ref()
+            {
+                let steers = hook();
+                for st in steers {
+                    tracing::info!(steer = %st, "pending steering after completion — forcing one more loop");
+                    ctx.state
+                        .current_task
+                        .push_str(&format!("\n[用户转向] {}", st));
+                    ctx.state.steerings.push(st);
+                    ctx.state.completed = false;
+                }
             }
 
             // ── P0 #7: Persist state at end of each loop for crash recovery.

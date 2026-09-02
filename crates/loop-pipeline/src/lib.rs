@@ -14,5 +14,5 @@ pub mod runner;
 
 pub use pipeline::LoopPipeline;
 pub use adjudicate::{adjudicate, Adjudication, AdjudicationVerdict};
-pub use clarify::{ClarifyHook, Clarification};
+pub use clarify::{ClarifyHook, Clarification, SteerHook};
 pub use runner::LoopRunner;
