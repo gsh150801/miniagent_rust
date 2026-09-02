@@ -2,16 +2,17 @@
 /// Get a role-filtered subset of tool names.
 pub fn tools_for_role(role: &str) -> &'static [&'static str] {
     match role {
-        "researcher" => &["web_search", "web_fetch", "pubmed_search", "patent_search", "clinical_trials_search", "read"],
+        "researcher" => &["web_search", "web_fetch", "pubmed_search", "patent_search", "clinical_trials_search", "citation_check", "read"],
         "explorer"   => &["web_search", "web_fetch", "pubmed_search", "patent_search", "clinical_trials_search"],
         "executor"   => &["bash", "read", "write", "edit", "glob", "grep", "git", "conda"],
         "writer"     => &["read", "write", "edit"],
-        "critic"     => &["read", "web_search", "web_fetch"],
+        "critic"     => &["read", "web_search", "web_fetch", "citation_check"],
         "synthesizer"=> &["read"],
         "analyst"    => &["read", "grep", "glob"],
         _            => &["web_search", "web_fetch", "bash", "read", "write",
                           "edit", "glob", "grep", "pubmed_search",
-                          "patent_search", "clinical_trials_search", "git", "conda"],
+                          "patent_search", "clinical_trials_search", "citation_check",
+                          "git", "conda"],
     }
 }
 

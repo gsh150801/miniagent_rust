@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 miniagent-core = { path = "../core" }
 miniagent-provider = { path = "../provider" }
+miniagent-skill = { path = "../skill" }
 miniagent-agent = { path = "../agent" }
 miniagent-tool = { path = "../tool" }
 miniagent-workflow = { path = "../workflow" }

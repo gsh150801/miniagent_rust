@@ -780,11 +780,52 @@ async fn execute_single_task(
     working_dir: String,
     steerings: Vec<String>,
 ) -> TaskResult {
-    let system = new_role_system_prompt(
+    let mut system = new_role_system_prompt(
         &task.assigned_role,
         &task.description,
         &task.expected_output,
     );
+
+    // ── 本地技能注入（workflow AgentStage 同款能力）────────────────
+    // 修复 live 问题：loop worker 不知道本地技能库，被要求
+    // "用 bioinf-verify-report 技能校验报告"时幻觉出外部技能库。
+    // 按任务描述匹配技能；无匹配时附上完整本地技能名册（仅名称+
+    // 描述首行），让 agent 至少知道本地有什么可用。
+    {
+        use miniagent_skill::discovery::SkillDiscovery;
+        use miniagent_skill::registry::SkillRegistry;
+        let discovery = SkillDiscovery::new();
+        let bundles = discovery.discover();
+        if !bundles.is_empty() {
+            let mut registry = SkillRegistry::new();
+            for b in bundles {
+                registry.register(b);
+            }
+            let query = format!("{} {}", task.description, task.expected_output);
+            let matched = registry.find_matching(&query, 2);
+            if matched.is_empty() {
+                let catalog: Vec<String> = registry.all().iter()
+                    .filter(|b| b.metadata.priority >= 8)
+                    .map(|b| format!("- {}（{}）", b.metadata.name,
+                        b.metadata.description.lines().next().unwrap_or("").chars().take(90).collect::<String>()))
+                    .collect();
+                if !catalog.is_empty() {
+                    system.push_str(&format!(
+                        "\n\n## 本地可用技能（不存在外部技能库；需要时按名称使用）\n{}\n",
+                        catalog.join("\n")
+                    ));
+                }
+            } else {
+                for skill in matched {
+                    let body: String = skill.body.lines().take(40).collect::<Vec<_>>().join("\n");
+                    system.push_str(&format!(
+                        "\n## 技能: {}（用户/规划器要求使用时必须遵循其工作流）\n{}\n",
+                        skill.metadata.name, body
+                    ));
+                }
+            }
+        }
+    }
 
     let repair_context = if wave_ctx.is_empty() {
         String::new()

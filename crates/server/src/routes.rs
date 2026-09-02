@@ -921,6 +921,27 @@ async fn handle_run_loop(
         })
     });
 
+    // P5 跨模式会话记忆：新 loop 任务也能检索相关历史经验（含此前
+    // 任务的报告位置），修复"新开 loop 任务找不到之前的报告"。
+    let memory_block = {
+        let recalled = state.recall_related(&prompt, 2);
+        if recalled.is_empty() {
+            String::new()
+        } else {
+            println!("   🧠 loop recalled {} related memory item(s)", recalled.len());
+            format!(
+                "## 相关历史经验（来自以往任务；其中 [task_id] 可用于定位 result/{task_id}_{brief} 目录下的产物）\n{}\n",
+                recalled.join("\n"),
+                brief = task_brief
+            )
+        }
+    };
+    let run_prompt = if memory_block.is_empty() {
+        prompt.clone()
+    } else {
+        format!("{memory_block}\n## 本轮任务\n{}", prompt.clone())
+    };
+
     // P3 执行中转向：pipeline 在每轮循环边界拉取待处理指令。
     let steer_state = state.clone();
     let steer_task_id = task_id.clone();
@@ -931,7 +952,7 @@ async fn handle_run_loop(
     // Anchor every pipeline artifact (dispatch outputs, checkpoints, tool
     // writes) inside the task's result directory.
     let result = miniagent_loop_pipeline::LoopPipeline::run_with_clarify(
-        prompt.clone(),
+        run_prompt,
         state.config.clone(),
         max_loops,
         cancel.clone(),
@@ -1160,7 +1181,6 @@ async fn handle_research_run(
     // (rustc's higher-ranked Send check rejects parts of the pipeline chain),
     // thread panics surface through the JoinHandle, and the outer timeout
     // bounds a stalled run.
-    let run_prompt = prompt.clone();
     let run_dir = task_dir.clone();
     let run_opts = opts.clone();
     let run_config = state.config.clone();
@@ -1185,6 +1205,22 @@ async fn handle_research_run(
     let steer_hook: miniagent_loop_pipeline::SteerHook = Arc::new(move || {
         take_steers(&steer_state2, &steer_task_id2)
     });
+
+    // P5 跨模式会话记忆：research 新任务注入相关历史经验。
+    let research_memory = {
+        let recalled = state.recall_related(&prompt, 2);
+        if recalled.is_empty() {
+            String::new()
+        } else {
+            println!("   🧠 research recalled {} related memory item(s)", recalled.len());
+            format!("## 相关历史经验\n{}\n\n", recalled.join("\n"))
+        }
+    };
+    let run_prompt = if research_memory.is_empty() {
+        prompt.clone()
+    } else {
+        format!("{research_memory}## 本轮任务\n{prompt}")
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let join = tokio::task::spawn_blocking(move || {
