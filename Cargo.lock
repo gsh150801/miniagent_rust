@@ -1097,6 +1097,7 @@ dependencies = [
  "miniagent-agent",
  "miniagent-core",
  "miniagent-provider",
+ "miniagent-skill",
  "miniagent-tool",
  "miniagent-workflow",
  "serde",
