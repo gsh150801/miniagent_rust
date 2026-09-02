@@ -645,26 +645,7 @@ impl Agent {
             );
         }
 
-        // P-记忆机制 Layer A：压缩记录持久化到任务工作目录（append 列表，
-        // 可审计/可回放）。working_dir 缺失（如部分测试）时静默跳过。
-        if !context.working_dir.is_empty() {
-            let dir = std::path::PathBuf::from(&context.working_dir);
-            if dir.is_dir() {
-                let path = dir.join("compaction_history.json");
-                let mut list: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str(&raw).ok())
-                    .unwrap_or_default();
-                list.push(serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                    "discarded_messages": discard_count,
-                    "summary": summary,
-                }));
-                if let Ok(json) = serde_json::to_string_pretty(&list) {
-                    let _ = std::fs::write(&path, json);
-                }
-            }
-        }
+
 
         // Rebuild: prompt + summary + last 5 messages
         let first = history.first().cloned();
@@ -961,4 +942,65 @@ mod compaction_tests {
         assert_eq!(list[1]["summary"], "第二轮压缩摘要");
         std::fs::remove_file(&path).ok();
     }
+
+    /// 集成测试：超预算历史触发压缩闭环。
+    /// 断言：①历史缩减为 首条+摘要+近5条；②摘要含四段式结构；
+    /// ③compaction_history.json 持久化到 working_dir 且记录丢弃条数；
+    /// ④喂给摘要器的文本包含早期关键约束（首条消息原样保留，天然不丢）。
+    #[tokio::test]
+    async fn compaction_triggers_on_oversized_history_and_persists() {
+        let provider = CapturingProvider::new();
+        let agent = Agent::new(
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+        );
+
+        let work_dir = std::env::temp_dir().join("miniagent_compaction_integration");
+        let _ = std::fs::remove_dir_all(&work_dir); // fresh dir per run (records accumulate otherwise)
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // 首条消息带任务约束（压缩后原样保留，不进摘要器）
+        let mut history = vec![Message::user(
+            "任务：分析 dataset_X。约束：只使用 python3，输出 result.csv，随机种子 42。",
+        )];
+        // 60 条 × 7KB 长消息 → 估算 token ≈ 105k > 96k 预算
+        let filler = format!("analysis step with detailed reasoning and numbers: {}", "x".repeat(7_000));
+        for i in 0..60 {
+            history.push(Message::assistant_text(format!("step {i}: {filler}")));
+        }
+        let before = history.len();
+
+        let ctx = RunContext::new("system").with_working_dir(work_dir.to_string_lossy().to_string());
+        agent
+            .trim_and_summarize_history(&mut history, &ctx, CancellationToken::new())
+            .await;
+
+        // ① 历史缩减：首条 + 摘要 + 近 N 条（N=keep_recent 配置，.env 可调）
+        assert!(history.len() < before, "history must shrink: {} -> {}", before, history.len());
+        assert!(history.len() >= 3, "at least first + summary + 1 recent");
+        // ② 首条原样保留（约束不丢）
+        assert!(history[0].text_content().contains("随机种子 42"));
+        // ③ 摘要消息含四段式结构（来自 stub 的固定四段输出）
+        let summary_msg = history[1].text_content();
+        assert!(summary_msg.contains("### 约束"), "summary must be structured");
+
+        // ④ 持久化：compaction_history.json 记录丢弃条数 60
+        let rec_path = work_dir.join("compaction_history.json");
+        let list: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&rec_path).unwrap()).unwrap();
+        assert_eq!(list.len(), 1);
+        // discarded = before - 1(first kept) - keep_recent，keep_recent =
+        // after - 2（first + summary）
+        let expected_discard = 61 - history.len() as i64 + 2 - 1;
+        assert_eq!(list[0]["discarded_messages"], expected_discard);
+
+        // ⑤ 摘要器收到的丢弃文本包含早期 step 内容（输入层保留率保证）
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("step 0:"), "discarded steps fed to summarizer");
+
+        std::fs::remove_dir_all(&work_dir).ok();
+        let _ = before;
+    }
+
 }
