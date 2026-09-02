@@ -1792,19 +1792,8 @@ async fn handle_run(
     // P1 多轮交互：follow-up 时把上一轮交流与产物清单注入本轮上下文，
     // 修复"逐轮失忆"断层（此前 task.messages 仅用于展示，agent 从零开始）。
     // effective_prompt 随后贯穿 explore / planner / workflow / feedback。
-    // P5 跨会话记忆：follow-up 时检索相关历史经验注入上下文。
-    let memory_block = {
-        let recalled = state.recall_related(&enriched_prompt, 2);
-        if recalled.is_empty() {
-            String::new()
-        } else {
-            println!("   🧠 recalled {} related memory item(s)", recalled.len());
-            format!(
-                "## 相关历史经验（来自以往任务，供参考）\n{}\n",
-                recalled.join("\n")
-            )
-        }
-    };
+    let (followup_context, _goal_only) = build_followup_context(state, &task_id, &task_dir, &prompt);
+    let memory_block = String::new();
 
     // P2: 会话级 goal_state —— LLM 提取本轮约束增量 → 合并持久化 →
     // 注入本轮执行上下文（跨轮继承；"改成只看 2024 年"这类转向无需复述）。
@@ -1842,30 +1831,29 @@ async fn handle_run(
         }
     };
 
-    let effective_prompt = if let Some(ref task) = state.tasks.get(&task_id)
-        && !task.messages.is_empty()
-    {
-        let prior = build_prior_context(&task.messages, &task.result_dir);
-        let mut parts: Vec<String> = Vec::new();
-        if !goal_block.is_empty() {
-            parts.push(goal_block.clone());
-        }
-        if !prior.is_empty() {
-            parts.push(prior);
-        }
-        if !memory_block.is_empty() {
-            parts.push(memory_block.clone());
-        }
-        if parts.is_empty() {
-            enriched_prompt.clone()
-        } else {
-            println!("   💬 follow-up: prior context injected");
-            format!("{}\n## 本轮请求\n{}", parts.join("\n"), enriched_prompt)
-        }
-    } else if !goal_block.is_empty() {
-        format!("{goal_block}\n## 本轮请求\n{enriched_prompt}")
-    } else {
+    let mut context_parts: Vec<String> = Vec::new();
+    if !goal_block.is_empty() {
+        context_parts.push(goal_block.clone());
+    }
+    if !followup_context.is_empty() {
+        context_parts.push(followup_context.clone());
+    }
+    if !memory_block.is_empty() {
+        context_parts.push(memory_block.clone());
+    }
+    let effective_prompt = if context_parts.is_empty() {
         enriched_prompt.clone()
+    } else {
+        println!(
+            "   💬 follow-up: context rebuilt ({} block(s), {} chars)",
+            context_parts.len(),
+            context_parts.iter().map(|s| s.len()).sum::<usize>()
+        );
+        format!(
+            "{}\n## 本轮请求\n{}",
+            context_parts.join("\n"),
+            enriched_prompt
+        )
     };
 
     // ── ExploreStage（需求1：明确问题+获取上下文）──────────────────
@@ -2863,6 +2851,20 @@ pub fn take_steers(state: &AppState, task_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Record a goal_state read (context rebuild) in the task audit log.
+fn manifest_log_goal_state_read(state: &AppState, task_id: &str, gs: &GoalState) {
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.event_log.push(serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "event": {
+                "type": "goal_state_recalled",
+                "version": gs.version,
+                "constraints": gs.constraints.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+            }
+        }));
+    }
+}
+
 /// Append a goal_state change event to the task's audit log.
 fn manifest_log_goal_state(state: &AppState, task_id: &str, gs: &GoalState) {
     if let Some(mut t) = state.tasks.get_mut(task_id) {
@@ -2877,6 +2879,64 @@ fn manifest_log_goal_state(state: &AppState, task_id: &str, gs: &GoalState) {
     }
 }
 
+
+/// P-记忆机制 Layer C：上下文重建器。
+///
+/// 复杂任务的多轮延续不再由各 handler 手工拼块，而是统一从这里按需
+/// 重建执行上下文。四块内容全部来自结构化外存（session.json 的
+/// goal_state、task.messages 的最近交流、task.result_dir 的产物清单、
+/// memory.db 的历史经验），符合"状态即数据、轨迹是源数据"的审计原则。
+///
+/// 返回 None 表示无可注入内容（全新任务且无记忆命中）。
+fn build_followup_context(
+    state: &AppState,
+    task_id: &str,
+    task_dir: &StdPath,
+    prompt: &str,
+) -> (String, String) {
+    // (injection_block, goal_state_only_block) —— 后者供不需要完整
+    // 上下文的调用方（如仅注入约束）使用。
+    let mut parts: Vec<String> = Vec::new();
+
+    // ── 1. goal_state（P2）──
+    let goal_block = match load_goal_state(task_dir) {
+        Some(gs) => {
+            manifest_log_goal_state_read(state, task_id, &gs);
+            render_goal_state(&gs)
+        }
+        None => String::new(),
+    };
+    if !goal_block.is_empty() {
+        parts.push(goal_block);
+    }
+
+    // ── 2. 最近交流 + 产物清单（P1）──
+    if let Some(task) = state.tasks.get(task_id)
+        && !task.messages.is_empty()
+    {
+        let prior = build_prior_context(&task.messages, task_dir);
+        if !prior.is_empty() {
+            parts.push(prior);
+        }
+    }
+
+    // ── 3. 跨会话记忆召回（P5）──
+    let recalled = state.recall_related(prompt, 2);
+    if !recalled.is_empty() {
+        parts.push(format!(
+            "## 相关历史经验（来自以往任务，供参考）\n{}\n",
+            recalled.join("\n")
+        ));
+    }
+
+    if parts.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (parts.join("\n"), parts.join("\n"))
+    }
+}
+
+/// Build a compact "prior turns" context block for a follow-up run in an
 /// Build a compact "prior turns" context block for a follow-up run in an
 /// existing conversation (workflow mode). Includes the last few exchanges
 /// and an artifact inventory from the task's result directory, so the new

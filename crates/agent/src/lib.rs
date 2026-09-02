@@ -635,6 +635,37 @@ impl Agent {
         // Persist to disk file
         Self::save_context_file(&summary);
 
+        // P-记忆机制 Layer A：压缩记录持久化到任务工作目录（append 列表，
+        // 可审计/可回放）。working_dir 缺失（如部分测试）时静默跳过。
+        if !context.working_dir.is_empty() {
+            Self::append_compaction_record(
+                &context.working_dir,
+                discard_count,
+                &summary,
+            );
+        }
+
+        // P-记忆机制 Layer A：压缩记录持久化到任务工作目录（append 列表，
+        // 可审计/可回放）。working_dir 缺失（如部分测试）时静默跳过。
+        if !context.working_dir.is_empty() {
+            let dir = std::path::PathBuf::from(&context.working_dir);
+            if dir.is_dir() {
+                let path = dir.join("compaction_history.json");
+                let mut list: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default();
+                list.push(serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "discarded_messages": discard_count,
+                    "summary": summary,
+                }));
+                if let Ok(json) = serde_json::to_string_pretty(&list) {
+                    let _ = std::fs::write(&path, json);
+                }
+            }
+        }
+
         // Rebuild: prompt + summary + last 5 messages
         let first = history.first().cloned();
         let recent: Vec<Message> = history
@@ -678,15 +709,13 @@ impl Agent {
             .unwrap()
             .select_arc(TaskComplexity::Simple, None);
 
+        // P-记忆机制 Layer A：结构化压缩（方案 D / A 部分）。过程性叙述
+        // 折叠，四类结构化信息必须保留——约束、关键决策与结论、产物清单、
+        // 待办。丢失前两类会导致后续轮次违反用户要求（live 事故），丢失
+        // 产物清单会导致重复劳动，丢失待办会导致任务静默缩水。
         let request = CompletionRequest {
-            system: "You are a context summarizer. Extract key findings, tool results, \
-                     decisions, and progress into a concise summary. Use the same \
-                     language as the input. Keep it under 500 words. Focus on what \
-                     was accomplished and what information was gathered."
-                .into(),
-            messages: vec![Message::user(format!(
-                "Summarize the key points from this conversation history:\n\n{truncated}"
-            ))],
+            system: Self::compaction_system_prompt().into(),
+            messages: vec![Message::user(Self::compaction_user_prompt(&truncated))],
             tools: vec![],
             config: InferenceConfig {
                 max_tokens: Some(2048),
@@ -713,6 +742,47 @@ impl Agent {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+        }
+    }
+
+    /// P-记忆机制 Layer A：四段式结构化压缩的提示词（约束/决策/产物/待办）。
+    fn compaction_system_prompt() -> &'static str {
+        "You are a context compactor for a long-running agent. \
+         Compress the discarded conversation into FOUR structured sections, \
+         keeping durable information and dropping process narration. Use the same \
+         language as the input. Be precise: file paths, numbers, names, and \
+         constraints must be preserved verbatim. Total under 600 words."
+    }
+
+    fn compaction_user_prompt(truncated: &str) -> String {
+        format!(
+            "Compress this conversation history into:\n\
+             ### 约束（用户提出的要求与限制）\n- ...\n\
+             ### 关键决策与结论\n- ...\n\
+             ### 产物清单（文件路径/数据集/关键数字）\n- ...\n\
+             ### 待办/未完成\n- ...\n\n\
+             Conversation history:\n\n{truncated}"
+        )
+    }
+
+    /// Append a compaction record to <working_dir>/compaction_history.json.
+    fn append_compaction_record(working_dir: &str, discarded: usize, summary: &str) {
+        let dir = std::path::PathBuf::from(working_dir);
+        if !dir.is_dir() {
+            return;
+        }
+        let path = dir.join("compaction_history.json");
+        let mut list: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        list.push(serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "discarded_messages": discarded,
+            "summary": summary,
+        }));
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(&path, json);
         }
     }
 
@@ -784,5 +854,111 @@ impl Drop for EventSenderGuard {
                 });
             }
         }
+    }
+}
+
+// ── P-记忆机制 Layer A 测试：结构化压缩 ─────────────────────────
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use miniagent_core::config::InferenceConfig;
+    use miniagent_core::error::AgentError;
+    use miniagent_core::event::{ContentBlock, StopReason};
+    use miniagent_provider::traits::{CompletionResponse, LlmProvider, StreamResponse};
+
+    /// 捕获 prompt 的 stub provider：返回固定的四段式结构化压缩结果。
+    #[derive(Clone)]
+    struct CapturingProvider(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturingProvider {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn prompts(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturingProvider {
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionResponse, AgentError> {
+            let user_text = req
+                .messages
+                .last()
+                .map(|m| m.text_content())
+                .unwrap_or_default();
+            self.0.lock().unwrap().push(user_text);
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "### 约束（用户提出的要求与限制）\n- 只使用 python3\n\n\
+                           ### 关键决策与结论\n- fib(30)=832040\n\n\
+                           ### 产物清单（文件路径/数据集/关键数字）\n- fib.py\n\n\
+                           ### 待办/未完成\n- 无"
+                        .into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            })
+        }
+
+        async fn stream(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<StreamResponse, AgentError> {
+            Err(AgentError::internal("stub does not support stream"))
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_compaction_returns_four_section_summary() {
+        let provider = CapturingProvider::new();
+        let agent = Agent::new(
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+        );
+
+        let summary = agent
+            .summarize_discarded(
+                "用户要求只使用 python3。agent 创建了 fib.py 并验证 fib(30)=832040。剩余：统计 miss 数。",
+                &RunContext::new("system"),
+                &CancellationToken::new(),
+            )
+            .await;
+
+        for section in ["约束", "关键决策与结论", "产物清单", "待办"] {
+            assert!(summary.contains(section), "summary must contain {section}");
+        }
+        let prompts = provider.prompts();
+        assert_eq!(prompts.len(), 1, "exactly one summarizer call");
+        assert!(prompts[0].contains("fib(30)=832040"), "source text was sent");
+    }
+
+    #[test]
+    fn compaction_prompts_request_four_sections() {
+        let p = Agent::compaction_user_prompt("some long history");
+        for section in ["约束", "关键决策与结论", "产物清单", "待办/未完成"] {
+            assert!(p.contains(section), "prompt must contain {section}");
+        }
+        assert!(Agent::compaction_system_prompt().contains("FOUR structured sections"));
+    }
+
+    #[test]
+    fn append_compaction_record_persists_versioned_list() {
+        let dir = std::env::temp_dir().join("miniagent_compaction_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        Agent::append_compaction_record(&dir.to_string_lossy(), 12, "第一轮压缩摘要");
+        Agent::append_compaction_record(&dir.to_string_lossy(), 8, "第二轮压缩摘要");
+        let path = dir.join("compaction_history.json");
+        let list: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["discarded_messages"], 12);
+        assert_eq!(list[1]["summary"], "第二轮压缩摘要");
+        std::fs::remove_file(&path).ok();
     }
 }
