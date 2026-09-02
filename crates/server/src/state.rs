@@ -84,6 +84,58 @@ impl AppState {
         self
     }
 
+    /// P5 跨会话记忆：任务完成时把摘要写入 L1 情景记忆（持久 SQLite），
+    /// 供后续任务检索复用（biomni know-how 思路：经验作为可检索资产）。
+    pub fn remember_task(&self, task_id: &str, brief: &str, response: &str) {
+        let Some(mem) = self.memory.as_ref() else { return };
+        let summary = miniagent_memory::types::StructuredSummary {
+            background: brief.to_string(),
+            method: String::new(),
+            key_findings: vec![response.chars().take(600).collect()],
+            limitations: vec![],
+            contributions: vec![],
+            raw_summary: response.chars().take(2_000).collect(),
+        };
+        let record = miniagent_memory::types::EpisodicRecord {
+            id: uuid::Uuid::new_v4(),
+            title: format!("[{task_id}] {brief}"),
+            content: summary,
+            tags: vec!["task".into()],
+            source: Some(task_id.to_string()),
+            importance: 0.6,
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            access_count: 1,
+            decay_rate: 0.02,
+            retention_floor: 0.2,
+            current_strength: 0.8,
+        };
+        if let Err(e) = mem.store(&record) {
+            tracing::warn!(error = %e, "memory store failed");
+        }
+    }
+
+    /// P5 跨会话记忆：新任务创建时检索相关历史经验（FTS5 全文匹配），
+    /// 返回 top-k 摘要文本供上下文注入。
+    pub fn recall_related(&self, prompt: &str, top_k: usize) -> Vec<String> {
+        let Some(mem) = self.memory.as_ref() else { return Vec::new() };
+        let cfg = miniagent_memory::types::SearchConfig {
+            query: prompt.to_string(),
+            max_results: top_k,
+            importance_threshold: 0.0,
+            strength_threshold: 0.0,
+            tags: vec![],
+            use_fts: true,
+            use_vector: false,
+            use_graph: false,
+        };
+        mem.search(&cfg)
+            .unwrap_or_default()
+            .iter()
+            .map(|r| format!("[过往经验] {}: {}", r.title, r.snippet))
+            .collect()
+    }
+
     pub fn with_limits(self, max_iterations: usize, max_tokens: u32) -> Self {
         // Limits now come from AppConfig; this method is kept for backward compat
         // but values are sourced from config at the call site.

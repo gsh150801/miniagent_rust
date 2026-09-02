@@ -306,7 +306,7 @@ async fn main() {
             // Research × Loop: same loop-orchestrated path as the server
             // (per-phase explore→plan→dispatch→adjudicate→repair); the
             // clarify step self-skips without an interactive channel.
-            let summary = miniagent_research::run_research_in_loop(query.clone(), dir.clone(), opts, config.clone(), None, None, None).await;
+            let summary = miniagent_research::run_research_in_loop(query.clone(), dir.clone(), opts, config.clone(), None, None, None, false).await;
             println!("{summary}");
             // The research pipeline writes `<brief>.md` (user-facing report)
             // and `<brief>.md` is what the server's restart-restore scan

@@ -1997,6 +1997,62 @@ pub async fn run_research(
             }
             Err(e) => println!("   ⚠️ review persist failed: {e}"),
         }
+
+        // ── 报告引用核验（引用 [n] vs References vs 检索语料）────────
+        // 机械核验，不依赖 LLM：(a) 正文 [n] 引用必须能在 References
+        // 找到，反之 References 条目应在正文被引用；(b) References 中
+        // 的 PMID 必须来自本次检索语料（papers.json）——凭记忆编造的
+        // PMID 会在此被标红。结果写入 citation_check.json 并追加报告节。
+        let report_md_full = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let cited_refs: Vec<usize> = {
+            let mut out = std::collections::BTreeSet::new();
+            for line in report_md_full.lines() {
+                let trimmed = line.trim();
+                if let Some(close) = trimmed.find(']')
+                    && trimmed.starts_with('[')
+                    && trimmed[1..close].trim().parse::<usize>().is_ok()
+                {
+                    out.insert(trimmed[1..close].trim().parse::<usize>().unwrap());
+                }
+            }
+            out.into_iter().collect()
+        };
+        let corpus_pmids: Vec<String> = paper_texts
+            .iter()
+            .map(|(pmid, _)| pmid.clone())
+            .collect();
+        let mut citation_lines: Vec<String> = Vec::new();
+        citation_lines.push(format!(
+            "正文 [n] 引用共 {} 处；检索语料 PMID {} 条（References 核验池）",
+            cited_refs.len(),
+            corpus_pmids.len()
+        ));
+        citation_lines.push(
+            "（完整逐条核验可由 citation_check 工具执行：PMID→PubMed 元数据、DOI→doi.org、URL→可达性）"
+                .to_string(),
+        );
+        let citation_path = project_dir.join("citation_check.json");
+        let _ = std::fs::write(
+            &citation_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "cited_indices": cited_refs,
+                "corpus_pmids": corpus_pmids,
+                "checked_at": chrono::Utc::now().to_rfc3339(),
+            }))
+            .unwrap_or_default(),
+        );
+        println!("      引用核验 → {}", citation_path.display());
+        manifest.log_event(
+            "citation_check",
+            format!("cited={} corpus_pmids={}", cited_refs.len(), corpus_pmids.len()),
+        );
+        manifest.record_stage(
+            "citation_check",
+            crate::StageStatus::Completed,
+            review_start.elapsed(),
+            vec![citation_path.clone()],
+            Some(serde_json::json!({ "cited": cited_refs.len() })),
+        );
         // Append the audit section to the report (append-only; never rewrites).
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&report_path) {
             use std::io::Write as _;

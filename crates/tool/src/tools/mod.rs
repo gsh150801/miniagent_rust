@@ -18,6 +18,7 @@ mod geo_search;
 mod opentargets;
 mod enrichr;
 mod uniprot;
+mod citation_check;
 
 pub use read::ReadTool;
 pub use write::WriteTool;
@@ -37,6 +38,7 @@ pub use geo_search::GeoSearchTool;
 pub use opentargets::OpenTargetsTool;
 pub use enrichr::EnrichrTool;
 pub use uniprot::UniprotTool;
+pub use citation_check::CitationCheckTool;
 
 use crate::registry::ToolRegistry;
 use ask_user::AskUserTool;
@@ -63,7 +65,8 @@ pub fn defaults() -> ToolRegistry {
         .register(GeoSearchTool::new())
         .register(OpenTargetsTool::new())
         .register(EnrichrTool::new())
-        .register(UniprotTool::new());
+        .register(UniprotTool::new())
+        .register(CitationCheckTool::new());
     registry
 }
 

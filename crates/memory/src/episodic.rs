@@ -179,7 +179,48 @@ impl EpisodicMemory {
         let mut results = Vec::new();
 
         if config.use_fts && !config.query.is_empty() {
-            let query = config.query.replace('\'', "''");
+            // Sanitize free-text queries into FTS5 terms: raw prompts contain
+            // punctuation (":", "。", "_") that MATCH parses as syntax and
+            // errors out (live: recall returned empty). Strategy: latin/number
+            // runs become AND-ed prefix terms ("p5*" "marker*"); CJK runs are
+            // OR-ed separately (unicode61 keeps contiguous CJK as single
+            // tokens, so per-char prefixes never match).
+            let mut latin_terms: Vec<String> = Vec::new();
+            let mut cjk_terms: Vec<String> = Vec::new();
+            let mut run = String::new();
+            let mut run_has_cjk = false;
+            let flush = |run: &mut String, has_cjk: &mut bool,
+                             latin: &mut Vec<String>, cjk: &mut Vec<String>| {
+                if run.is_empty() {
+                    return;
+                }
+                if *has_cjk {
+                    cjk.push(format!("{run}*"));
+                } else {
+                    latin.push(format!("{run}*"));
+                }
+                run.clear();
+                *has_cjk = false;
+            };
+            for c in config.query.chars() {
+                if c.is_alphanumeric() {
+                    if (c as u32) >= 0x2E80 {
+                        run_has_cjk = true;
+                    }
+                    run.push(c);
+                } else {
+                    flush(&mut run, &mut run_has_cjk, &mut latin_terms, &mut cjk_terms);
+                }
+            }
+            flush(&mut run, &mut run_has_cjk, &mut latin_terms, &mut cjk_terms);
+            let mut query = latin_terms.join(" ");
+            if !cjk_terms.is_empty() {
+                if !query.is_empty() {
+                    query.push_str(" OR ");
+                }
+                query.push_str(&cjk_terms.join(" OR "));
+            }
+            query = query.replace('\'', "''");
             let fts_sql = "SELECT r.id, r.title, snippet(episodic_fts, 1, '<b>', '</b>', '...', 32) as snippet,
                         r.importance, r.current_strength
                  FROM episodic_fts f

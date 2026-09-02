@@ -70,6 +70,7 @@ pub async fn run_research_in_loop(
     on_progress: Option<ResearchProgress>,
     ask_hook: Option<ClarifyHook>,
     steer_hook: Option<SteerHook>,
+    interactive_gate: bool,
 ) -> String {
     let emit = |phase: &str, status: &str, detail: Option<String>| {
         if let Some(d) = &detail {
@@ -248,6 +249,50 @@ pub async fn run_research_in_loop(
             println!("┗━━ {label} BLOCKED after {dur:.1}s — stopping the loop sequence\n");
             emit(phase, "failed", Some(msg.clone()));
             return msg;
+        }
+
+        // ── P4 阶段产物审查门：关键阶段完成后请用户 accept/reject ──
+        // 仅 gate 假说与验证计划（科研判断密度最高的两个产物）。ask 通道
+        // 超时（用户离开）自动视为接受——不阻塞无人值守运行。
+        let gated = interactive_gate
+            && ask_hook.is_some()
+            && matches!(*phase, "hypotheses" | "validation");
+        if gated {
+            let question = format!(
+                "阶段『{label}』已完成。接受并继续下一阶段，还是打回重做（可在下一条消息附修改意见）？"
+            );
+            let opts = vec![
+                "接受，继续".to_string(),
+                "打回重做（请补充修改意见）".to_string(),
+            ];
+            let answer = (ask_hook.as_ref().unwrap())(question, opts).await;
+            let accept = answer.is_empty() || answer.contains("接受");
+            if accept {
+                println!("   ✅ 审查门：用户接受，继续");
+                summary_log.push(format!("{phase}: accepted"));
+            } else {
+                println!("   ↩️ 审查门：用户打回——{answer}");
+                summary_log.push(format!("{phase}: rejected ({answer})"));
+                // 打回：重置该阶段与其上游产物阶段，强制重派（resume 语义）
+                let manifest_path = project_dir.join("project.json");
+                if let Ok(raw) = std::fs::read_to_string(&manifest_path)
+                    && let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(raw.as_bytes())
+                {
+                    let stages: Vec<&str> = stages_of(phase).to_vec();
+                    if let Some(arr) = v["stages"].as_array_mut() {
+                        arr.retain(|st| {
+                            !(stages.contains(&st["name"].as_str().unwrap_or(""))
+                                && st["status"] == "completed")
+                        });
+                    }
+                    if let Ok(json) = serde_json::to_vec_pretty(&v) {
+                        let _ = std::fs::write(&manifest_path, json);
+                    }
+                }
+                // 用户意见并入工作请求，下一轮重派吸收
+                working_query.push_str(&format!("\n[用户打回意见] {answer}"));
+                // 该阶段重跑后再次请求审查（gated 阶段重新进入）
+            }
         }
 
         let dur = phase_start.elapsed().as_secs_f64();

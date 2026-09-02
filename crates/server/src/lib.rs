@@ -36,14 +36,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // P5 跨会话记忆：持久化 L1 情景记忆（SQLite FTS5）。任务完成时写入
+    // 摘要；新任务创建时检索相关经验注入上下文。
+    let memory = miniagent_memory::manager::MemoryManager::new(
+        &miniagent_core::paths::result_root().join("memory.db").to_string_lossy(),
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "memory.db init failed — falling back to in-memory");
+        miniagent_memory::manager::MemoryManager::new_in_memory().expect("in-memory sqlite")
+    });
     let state = AppState::new(config.agent, config.config.clone())
-        .with_limits(config.config.max_iterations, config.config.max_tokens);
-
-    let state = if let Some(mem) = config.memory {
-        state.with_memory(mem)
-    } else {
-        state
-    };
+        .with_limits(config.config.max_iterations, config.config.max_tokens)
+        .with_memory(memory);
 
     // Ensure result directory exists
     let _ = std::fs::create_dir_all(&state.task_dir);

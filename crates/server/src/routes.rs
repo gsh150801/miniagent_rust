@@ -1195,7 +1195,7 @@ async fn handle_research_run(
         // Research × Loop: every phase (文献检索/KG/链路预测/假说/辩论/验证/
         // 分析/审核) runs as a loop subtask with three-way adjudication.
         let summary = rt.block_on(miniagent_research::run_research_in_loop(
-            run_prompt, run_dir, run_opts, run_config, Some(run_cb), Some(ask_hook), Some(steer_hook),
+            run_prompt, run_dir, run_opts, run_config, Some(run_cb), Some(ask_hook), Some(steer_hook), true,
         ));
         let _ = tx.send(summary);
         Ok::<(), String>(())
@@ -1756,6 +1756,20 @@ async fn handle_run(
     // P1 多轮交互：follow-up 时把上一轮交流与产物清单注入本轮上下文，
     // 修复"逐轮失忆"断层（此前 task.messages 仅用于展示，agent 从零开始）。
     // effective_prompt 随后贯穿 explore / planner / workflow / feedback。
+    // P5 跨会话记忆：follow-up 时检索相关历史经验注入上下文。
+    let memory_block = {
+        let recalled = state.recall_related(&enriched_prompt, 2);
+        if recalled.is_empty() {
+            String::new()
+        } else {
+            println!("   🧠 recalled {} related memory item(s)", recalled.len());
+            format!(
+                "## 相关历史经验（来自以往任务，供参考）\n{}\n",
+                recalled.join("\n")
+            )
+        }
+    };
+
     // P2: 会话级 goal_state —— LLM 提取本轮约束增量 → 合并持久化 →
     // 注入本轮执行上下文（跨轮继承；"改成只看 2024 年"这类转向无需复述）。
     let goal_block = {
@@ -1802,6 +1816,9 @@ async fn handle_run(
         }
         if !prior.is_empty() {
             parts.push(prior);
+        }
+        if !memory_block.is_empty() {
+            parts.push(memory_block.clone());
         }
         if parts.is_empty() {
             enriched_prompt.clone()
@@ -2718,6 +2735,9 @@ async fn finalize_task(
                 tracing::error!(task_id = %task_id, error = %e, "failed to persist metadata.json — task history may be lost on restart");
         }
     }
+
+    // P5 跨会话记忆：完成的任务作为可检索经验写入 L1 情景记忆。
+    state.remember_task(task_id, task_brief, &response_text);
 
     // Send completion
     let _ = ws_send(socket, serde_json::json!({
