@@ -25,6 +25,77 @@ impl PipelineStage for PlanStage {
         let task = &ctx.state.current_task;
         let loop_count = ctx.state.loop_count;
 
+        // ── P-多智能体规划：两阶段——先枚举独立工作项（模型对"列举"的
+        // 服从度远高于"完整 JSON 分解"），≥2 项时机械展开为并行 TaskUnit
+        // （空 depends_on ⇒ dispatch 单波并行）+ 汇编 writer 任务。
+        // 失败/单项时回退到既有 LLM 分解路径。
+        if let Some(items) = crate::plan::enumerate_work_items(
+            ctx.agent.flash_provider().as_ref(),
+            task,
+            cancel.child_token(),
+        )
+        .await
+        {
+            if items.len() >= 2 {
+                let mut tasks: Vec<TaskUnit> = Vec::new();
+                for (i, (title, role)) in items.iter().enumerate() {
+                    tasks.push(TaskUnit {
+                        id: format!("task_{}", i + 1),
+                        description: title.clone(),
+                        assigned_role: role.clone(),
+                        depends_on: vec![],
+                        expected_output: format!("完成「{title}」并给出结果"),
+                        difficulty: "medium".into(),
+                        failed: false,
+                        error: None,
+                        output: None,
+                    });
+                }
+                let compile_id = format!("task_{}", items.len() + 1);
+                tasks.push(TaskUnit {
+                    id: compile_id.clone(),
+                    description: "汇总以上全部子任务的结果，产出最终交付物".into(),
+                    assigned_role: "writer".into(),
+                    depends_on: (1..=items.len()).map(|i| format!("task_{i}")).collect(),
+                    expected_output: "最终汇总交付物（整合所有子任务结果）".into(),
+                    difficulty: "medium".into(),
+                    failed: false,
+                    error: None,
+                    output: None,
+                });
+
+                tracing::info!(tasks = tasks.len(), "Enumerated multi-agent plan");
+                let goal = format!(
+                    "{}（多智能体并行执行：{} 个并行子任务 + 1 个汇编任务）",
+                    task,
+                    items.len()
+                );
+                let mut state = ctx.state.clone();
+                state.plan = Some(TaskPlan {
+                    overall_goal: goal.clone(),
+                    tasks,
+                    max_loops: ctx.state.max_loops,
+                });
+                state.current_task = goal.clone();
+
+                let summary = format!(
+                    "Enumerated multi-agent plan: {} parallel work items + compiler",
+                    items.len()
+                );
+                let msg = StageMessage {
+                    from_stage: "plan".into(),
+                    to_stage: "dispatch".into(),
+                    content: serde_json::to_string(&state.plan).unwrap_or_default(),
+                    task_id: None,
+                };
+                return Ok(StageOutput {
+                    updated_state: state,
+                    new_messages: vec![msg],
+                    summary,
+                });
+            }
+        }
+
         let repair_suggestions: String = ctx.state.repair_analyses.iter()
             .filter(|r| r.requires_re_plan)
             .map(|r| format!(
@@ -97,7 +168,8 @@ impl PipelineStage for PlanStage {
         if plan.tasks.len() == 1 && needs_decomposition {
             tracing::info!("Plan returned 1 task but decomposition needed — retrying with stronger prompt");
             let retry_prompt = build_plan_prompt_retry(task, loop_count);
-            if let Ok(retry_plan) = try_generate_plan(provider.as_ref(), &retry_prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await
+            // 升级到 pro 模型重试（flash 在复杂分解上更易偷懒合并）
+            if let Ok(retry_plan) = try_generate_plan(ctx.agent.pro_provider().as_ref(), &retry_prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await
                 && retry_plan.tasks.len() > 1 {
                     tracing::info!(tasks = retry_plan.tasks.len(), "Retry succeeded: decomposed into multiple tasks");
                     plan = retry_plan;
@@ -155,7 +227,9 @@ fn build_plan_prompt(
     needs_decomposition: bool,
 ) -> String {
     let decomp_hint = if needs_decomposition {
-        "IMPORTANT: The explorer determined this task MUST be decomposed into multiple parallel sub-tasks."
+        "IMPORTANT: The explorer determined this task MUST be decomposed into multiple parallel sub-tasks. \
+          Create ONE sub-task per enumerated subject/topic, each with empty depends_on, \
+          plus a final compilation task depending on all of them."
     } else {
         "Decompose if the task has multiple aspects; otherwise a single well-scoped task is acceptable."
     };
@@ -461,4 +535,88 @@ mod tests {
         let t1 = &merged.tasks[0];
         assert!(t1.output.is_none(), "failed task should not preserve output");
     }
+}
+
+/// P-多智能体规划：枚举目标的独立并行工作项（标题, 角色）。返回 None
+/// 表示枚举失败（回退到既有 LLM 分解路径）；返回空/单项目表示任务
+/// 无需拆分。角色从 researcher/executor/analyst/writer 中指派。
+pub async fn enumerate_work_items(
+    provider: &dyn miniagent_provider::traits::LlmProvider,
+    goal: &str,
+    cancel: CancellationToken,
+) -> Option<Vec<(String, String)>> {
+    use miniagent_core::config::InferenceConfig;
+    use miniagent_core::event::ContentBlock;
+    use miniagent_core::message::Message;
+    use miniagent_provider::traits::CompletionRequest;
+
+    let prompt = format!(
+        r#"Break this goal into its independent parallel work items. Each item must be
+independently completable by one agent and produce its own result.
+
+Goal:
+{goal}
+
+Rules:
+- 2 to 5 items; one item per independent subject/deliverable
+- Do NOT include a final "summary" item (the pipeline adds one)
+- role ∈ researcher | executor | analyst
+
+Output ONLY valid JSON:
+{{"items":[{{"title":"<work item>","role":"researcher"}}]}}"#
+    );
+    let request = CompletionRequest {
+        system: "You decompose goals into independent parallel work items. Output ONLY valid JSON."
+            .into(),
+        messages: vec![Message::user(&prompt)],
+        tools: vec![],
+        config: InferenceConfig {
+            temperature: Some(0.2),
+            max_tokens: Some(2_048),
+            ..Default::default()
+        },
+    };
+
+    let response = provider.complete(&request, cancel.child_token()).await.ok()?;
+    let text: String = response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let cleaned = miniagent_core::json_util::extract_and_repair(&text);
+
+    #[derive(serde::Deserialize)]
+    struct Item {
+        title: String,
+        #[serde(default = "default_role")]
+        role: String,
+    }
+    fn default_role() -> String {
+        "researcher".into()
+    }
+    #[derive(serde::Deserialize)]
+    struct Items {
+        #[serde(default)]
+        items: Vec<Item>,
+    }
+
+    let parsed: Items = serde_json::from_str(&cleaned).ok()?;
+    let role_ok = ["researcher", "executor", "analyst", "writer"];
+    let items: Vec<(String, String)> = parsed
+        .items
+        .into_iter()
+        .filter(|i| !i.title.trim().is_empty())
+        .map(|i| {
+            let role = if role_ok.contains(&i.role.as_str()) {
+                i.role
+            } else {
+                "researcher".into()
+            };
+            (i.title, role)
+        })
+        .collect();
+    if items.len() >= 2 { Some(items) } else { None }
 }

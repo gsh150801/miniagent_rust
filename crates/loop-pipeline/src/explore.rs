@@ -70,7 +70,12 @@ impl PipelineStage for ExploreStage {
 2. Gather real information — do not rely on your internal knowledge alone.
 3. Based on your research, clarify the task requirements.
 4. Estimate the complexity (simple / moderate / complex / very complex).
-5. Suggest whether the task can be decomposed into parallel sub-tasks.
+5. Suggest whether the task can be decomposed into parallel sub-tasks.\
+   Be generous: if the request enumerates multiple distinct subjects,\
+   deliverables, or topics (e.g. "A、B 和 C", "each write a file"), set\
+   needs_decomposition=true — even if you could do everything yourself.\
+   Having researched during exploration does NOT mean one agent must do\
+   the whole task alone.
 6. Record key findings from your research.
 7. If this is not the first loop, focus on what is still incomplete or needs improvement.
 
