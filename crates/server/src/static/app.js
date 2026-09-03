@@ -127,6 +127,7 @@ function handleMsg(msg) {
     case 'complete':
       stopElapsed();
       stageStatus = {};
+      liveToolOps.clear();
       finishStream(msg.task_id, msg.files);
       syncTaskMeta(msg.task_id, { status: 'completed' });
       renderProgressView();
@@ -153,6 +154,81 @@ function handleMsg(msg) {
 // The WS envelope `{type:"agent_event", event:{...}, task_id}` may carry a
 // task_id; if so, only apply events that match the currently selected task
 // so switching tasks doesn't bleed events across.
+// ── P-前端改进：实时操作卡（操作 + 参数收起 / 结果展开）──────────
+const liveToolOps = new Map(); // call_id -> {el, body, tool}
+
+// 操作中文名 + 参数行（收起态显示"操作 + 关键参数"）
+function toolOpDisplay(tool, input) {
+  const val = (k) => {
+    if (!input) return '';
+    const v = input[k] ?? input[k === 'command' ? 'command' : k];
+    return typeof v === 'string' ? v : (v ? JSON.stringify(v) : '');
+  };
+  switch (tool) {
+    case 'read':    return { icon: '&#128196;', label: '读取文件', param: val('path') || val('file') };
+    case 'write':   return { icon: '&#9997;',   label: '写入文件', param: val('path') || val('file') };
+    case 'edit':    return { icon: '&#9997;',   label: '编辑文件', param: val('path') || val('file') };
+    case 'bash':    return { icon: '&#128187;', label: '执行命令', param: val('command') };
+    case 'web_search':
+    case 'search':  return { icon: '&#128269;', label: '网络搜索', param: val('query') };
+    case 'web_fetch': return { icon: '&#127760;', label: '抓取网页', param: val('url') };
+    case 'pubmed_search': return { icon: '&#128269;', label: 'PubMed 检索', param: val('query') };
+    case 'citation_check': return { icon: '&#128269;', label: '引用核验', param: '报告全文' };
+    case 'glob':    return { icon: '&#128269;', label: '文件匹配', param: val('pattern') };
+    case 'grep':    return { icon: '&#128269;', label: '内容搜索', param: val('pattern') };
+    default:        return { icon: '&#128295;', label: tool, param: summarizeInput(input) };
+  }
+}
+
+function appendToolOpCard(callId, tool, input) {
+  const meta = toolOpDisplay(tool, input);
+  hideWelcome();
+  const inner = getInner();
+  const card = document.createElement('div');
+  card.className = 'op-card collapsed';
+  card.id = 'op_' + callId.replace(/[^a-zA-Z0-9]/g, '');
+  const paramLine = meta.param
+    ? `<span class="op-param">${escHtml(meta.param.slice(0, 120))}</span>`
+    : '';
+  card.innerHTML = `<div class="op-head">
+      <span class="op-chev">&#9654;</span>
+      <span class="op-icon">${meta.icon}</span>
+      <span class="op-label">${escHtml(meta.label)}</span>
+      ${paramLine}
+      <span class="op-status" id="${card.id}_status">&#8987;</span>
+    </div><div class="op-body" style="display:none"></div>`;
+  card.querySelector('.op-head').addEventListener('click', () => {
+    const body = card.querySelector('.op-body');
+    body.style.display = body.style.display === 'none' ? '' : 'none';
+    card.classList.toggle('collapsed');
+    card.querySelector('.op-chev').innerHTML = card.classList.contains('collapsed') ? '&#9654;' : '&#9660;';
+  });
+  inner.appendChild(card);
+  scrollBottom();
+  return card;
+}
+
+function fillToolOpResult(callId, tool, output, durationMs, isError) {
+  const card = document.getElementById('op_' + String(callId).replace(/[^a-zA-Z0-9]/g, ''));
+  if (!card) return;
+  const status = card.querySelector('.op-status');
+  if (status) status.innerHTML = isError ? '&#9888;' : '&#10003;';
+  if (durationMs) {
+    const d = document.createElement('span');
+    d.className = 'op-duration';
+    d.textContent = (durationMs / 1000).toFixed(1) + 's';
+    status?.parentNode?.appendChild(d);
+  }
+  const body = card.querySelector('.op-body');
+  if (!body) return;
+  const text = (output || '').slice(0, 4000);
+  if (text.trim()) {
+    body.innerHTML = `<div class="op-result">${escHtml(text)}${(output||'').length > 4000 ? '…[截断]' : ''}</div>`;
+  } else {
+    body.innerHTML = '<div class="op-result op-empty">（无输出）</div>';
+  }
+}
+
 function handleAgentEvent(envelope) {
   const ev = envelope && envelope.event;
   if (!ev || !ev.type) return;
@@ -163,6 +239,19 @@ function handleAgentEvent(envelope) {
   // bleed into the live view of the task the user is looking at.
   const matchesCurrent = !envelope.task_id || !currentTaskId || envelope.task_id === currentTaskId;
   ingestAgentEvent(ev, Date.now(), matchesCurrent);
+  // P-前端改进：中间面板实时操作卡（操作+参数收起 / 结果展开）
+  if (matchesCurrent && (ev.type === 'tool_call_requested' || ev.type === 'tool_call_completed')) {
+    const cid = String(ev.call_id ?? '');
+    if (ev.type === 'tool_call_requested') {
+      if (!liveToolOps.has(cid)) {
+        const el = appendToolOpCard(cid, ev.tool_name || 'unknown',
+          typeof ev.input === 'string' ? null : ev.input);
+        liveToolOps.set(cid, el);
+      }
+    } else {
+      fillToolOpResult(cid, ev.tool_name || 'unknown', ev.output, ev.duration_ms, ev.is_error);
+    }
+  }
   // Middle panel: any agent event for a known task implies it's actively
   // running. Skip if we've already completed/failed it.
   if (envelope.task_id && tasks[envelope.task_id]) {
@@ -349,6 +438,17 @@ function renderAsk(taskId, question, options) {
   q.textContent = '❓ ' + question;
   card.appendChild(q);
 
+  // 回答后冻结为"问 → 答"记录（卡片保留在聊天流中，不删除）
+  const freezeWithAnswer = (answer) => {
+    const a = document.createElement('div');
+    a.className = 'ask-answer';
+    a.textContent = '➡️ ' + answer;
+    card.appendChild(a);
+    card.querySelectorAll('button, input').forEach(el => el.remove());
+    card.classList.add('answered');
+    scrollBottom();
+  };
+
   // 选项按钮
   if (options.length > 0) {
     const optBox = document.createElement('div');
@@ -359,7 +459,7 @@ function renderAsk(taskId, question, options) {
       btn.textContent = opt;
       btn.addEventListener('click', () => {
         ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: opt }));
-        card.remove();
+        freezeWithAnswer(opt);
       });
       optBox.appendChild(btn);
     }
@@ -377,7 +477,7 @@ function renderAsk(taskId, question, options) {
       const answer = input.value.trim();
       if (answer) {
         ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: answer }));
-        card.remove();
+        freezeWithAnswer(answer || '（未回答）');
       }
     }
   });
@@ -390,7 +490,7 @@ function renderAsk(taskId, question, options) {
     const answer = input.value.trim();
     if (answer) {
       ws.send(JSON.stringify({ type: 'ask_reply', task_id: taskId, prompt: answer }));
-      card.remove();
+      freezeWithAnswer(answer);
     }
   });
   inputBox.appendChild(sendBtn);
@@ -626,10 +726,19 @@ function renderHistory(msg) {
       if (m.role === 'user') {
         inner.appendChild(makeUserBubble(m.content));
       } else if (m.role === 'assistant') {
-        const div = document.createElement('div');
-        div.className = 'msg msg-ai';
-        div.innerHTML = `<div class="msg-bubble rich">${md(m.content)}</div>`;
-        inner.appendChild(div);
+        const content = String(m.content ?? '');
+        if (content.startsWith('❓')) {
+          // 澄清反问（记忆机制 P3/P4：反问与回答在重绘后保留）
+          const div = document.createElement('div');
+          div.className = 'msg msg-ask';
+          div.innerHTML = `<div class="msg-bubble">🔔 ${escHtml(content)}</div>`;
+          inner.appendChild(div);
+        } else {
+          const div = document.createElement('div');
+          div.className = 'msg msg-ai';
+          div.innerHTML = `<div class="msg-bubble rich">${md(content)}</div>`;
+          inner.appendChild(div);
+        }
       }
     }
   } else {
@@ -945,6 +1054,9 @@ function showPlan(workflow, stages) {
   }
 
   hideWelcome();
+  // 阶段卡片不再插入聊天流（用户反馈：探索/澄清/规划/执行/评估等
+  // 阶段卡片是噪音）。右侧 Progress 视图仍完整展示计划与状态。
+  return;
   const card = document.createElement('div');
   card.className = 'exec-panel';
 
@@ -1028,6 +1140,9 @@ function renderActivityStats(toolEntries) {
 }
 
 function showStageOutput(stage, summary) {
+  // 阶段输出卡片不再插入聊天流（用户反馈）。每轮的具体操作（读/写/
+  // 编辑/搜索/命令等）由 agent_event 的实时操作卡逐条展示。
+  return;
   if (!summary) return;
 
   const icon = stage.includes('research') || stage.includes('agent') ? '&#128269;'

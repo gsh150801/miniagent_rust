@@ -1545,17 +1545,27 @@ async fn ask_user(
     })).await;
 
     // 等待回复，5 分钟超时
-    match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-        Ok(Ok(answer)) => {
-            state.asks.remove(task_id);
-            answer
-        }
+    let (answer, answered) = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+        Ok(Ok(answer)) => (answer, true),
         _ => {
             state.asks.remove(task_id);
             tracing::error!(task_id = task_id, "ask timed out or sender dropped");
-            String::new()
+            (String::new(), false)
         }
+    };
+    // 澄清问答持久化进对话历史（前端改进：反问的问题和用户回答在
+    // 重绘后保留；❓ 前缀让前端渲染为反问气泡）。
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": format!("❓ {question}"),
+        }));
+        t.messages.push(serde_json::json!({
+            "role": "user",
+            "content": if answered { answer.clone() } else { "（未回答——按默认假设继续执行）".to_string() },
+        }));
     }
+    answer
 }
 
 /// 辩论模式：Proposer vs Opponent → Judge（DebateRunner），角色模型按 ⚙️

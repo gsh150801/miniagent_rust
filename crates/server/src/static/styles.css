@@ -754,3 +754,20 @@ input,select,textarea{font-family:inherit;color:inherit}
 .goal-row{display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-top:1px dashed var(--border,#8883)}
 .goal-text{flex:1;line-height:1.4}
 .goal-src{opacity:.55;font-size:11px;white-space:nowrap}
+
+/* ── P-前端改进：实时操作卡（默认收起：操作+参数；展开：结果）── */
+.op-card{margin:6px 0;border:1px solid var(--border,#8884);border-radius:8px;background:var(--bg-tertiary,rgba(127,127,127,.06));overflow:hidden;font-size:12.5px}
+.op-card.is-error{border-color:#c0392b88}
+.op-head{display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;user-select:none}
+.op-chev{opacity:.6;font-size:10px}
+.op-icon{opacity:.85}
+.op-label{font-weight:600}
+.op-param{flex:1;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,monospace}
+.op-status{margin-left:auto}
+.op-duration{opacity:.55;font-size:11px;margin-left:6px}
+.op-body{padding:4px 10px 8px;border-top:1px dashed var(--border,#8883)}
+.op-result{white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;line-height:1.45;background:rgba(127,127,127,.05);border-radius:6px;padding:6px}
+.op-empty{opacity:.5}
+
+/* 澄清反问气泡 */
+.msg-ask .msg-bubble{background:linear-gradient(135deg,rgba(255,193,7,.12),rgba(255,193,7,.04));border:1px solid rgba(255,193,7,.35)}
