@@ -921,6 +921,34 @@ async fn handle_run_loop(
         })
     });
 
+    // P2 goal_state 覆盖 Loop 模式：LLM 提取本轮约束增量 → 合并进
+    // session.json（跨轮继承）→ 注入本轮执行上下文。
+    let goal_block = {
+        let providers: Vec<std::sync::Arc<dyn LlmProvider>> = {
+            let (f, p) = build_provider_pair(&state.models.read().unwrap().active().clone())
+                .unwrap_or_else(|e| panic!("loop: active model profile unusable: {e}"));
+            vec![f, p]
+        };
+        let prev = load_goal_state(&task_dir);
+        let prev_list: Vec<String> = prev.as_ref()
+            .map(|g| g.constraints.iter().map(|c| c.text.clone()).collect())
+            .unwrap_or_default();
+        let extracted = extract_goal_constraints(&prev_list, &prompt, &providers, tokio_util::sync::CancellationToken::new()).await;
+        let turn_source = format!("turn_{}", state.tasks.get(&task_id).map(|t| t.messages.len()).unwrap_or(1).max(1));
+        let gs = merge_goal_state(prev, &prompt, extracted, &turn_source);
+        match persist_goal_state(&task_dir, &gs) {
+            Ok(block) => {
+                manifest_log_goal_state(state, &task_id, &gs);
+                println!("   🎯 [loop] goal_state v{}: {} constraint(s)", gs.version, gs.constraints.len());
+                format!("{block}\n")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "loop session.json persist failed — continuing without goal_state");
+                String::new()
+            }
+        }
+    };
+
     // P5 跨模式会话记忆：新 loop 任务也能检索相关历史经验。注入顺序
     // 必须是"任务在前、背景在后"——记忆块放在任务前面会被规划器当成
     // 任务本身（live: task_1 目录名变成了"相关历史经验_来自以往任务"，
@@ -938,12 +966,7 @@ async fn handle_run_loop(
             )
         }
     };
-    let run_prompt = if memory_block.is_empty() {
-        prompt.clone()
-    } else {
-        // 任务在前、记忆作后置附录（附录已明确标注"不是本轮任务"）
-        format!("{prompt}{memory_block}")
-    };
+    let run_prompt = format!("{goal_block}{prompt}{memory_block}");
 
     // P3 执行中转向：pipeline 在每轮循环边界拉取待处理指令。
     let steer_state = state.clone();
