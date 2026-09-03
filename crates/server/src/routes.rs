@@ -921,8 +921,11 @@ async fn handle_run_loop(
         })
     });
 
-    // P5 跨模式会话记忆：新 loop 任务也能检索相关历史经验（含此前
-    // 任务的报告位置），修复"新开 loop 任务找不到之前的报告"。
+    // P5 跨模式会话记忆：新 loop 任务也能检索相关历史经验。注入顺序
+    // 必须是"任务在前、背景在后"——记忆块放在任务前面会被规划器当成
+    // 任务本身（live: task_1 目录名变成了"相关历史经验_来自以往任务"，
+    // 真实任务被挤成背景）。措辞亦改为纯参考语气，不含可执行的
+    // 元指令。
     let memory_block = {
         let recalled = state.recall_related(&prompt, 2);
         if recalled.is_empty() {
@@ -930,16 +933,16 @@ async fn handle_run_loop(
         } else {
             println!("   🧠 loop recalled {} related memory item(s)", recalled.len());
             format!(
-                "## 相关历史经验（来自以往任务；其中 [task_id] 可用于定位 result/{task_id}_{brief} 目录下的产物）\n{}\n",
-                recalled.join("\n"),
-                brief = task_brief
+                "\n## 背景参考（来自以往任务的记忆，仅供延续参考——不是本轮任务，不要针对它制定子任务）\n{}\n",
+                recalled.join("\n")
             )
         }
     };
     let run_prompt = if memory_block.is_empty() {
         prompt.clone()
     } else {
-        format!("{memory_block}\n## 本轮任务\n{}", prompt.clone())
+        // 任务在前、记忆作后置附录（附录已明确标注"不是本轮任务"）
+        format!("{prompt}{memory_block}")
     };
 
     // P3 执行中转向：pipeline 在每轮循环边界拉取待处理指令。
@@ -1206,20 +1209,24 @@ async fn handle_research_run(
         take_steers(&steer_state2, &steer_task_id2)
     });
 
-    // P5 跨模式会话记忆：research 新任务注入相关历史经验。
+    // P5 跨模式会话记忆：research 新任务注入相关历史经验。与 loop 相同，
+    // 记忆块必须放在任务之后（否则翻译/需求提取会把记忆文本当作任务）。
     let research_memory = {
         let recalled = state.recall_related(&prompt, 2);
         if recalled.is_empty() {
             String::new()
         } else {
             println!("   🧠 research recalled {} related memory item(s)", recalled.len());
-            format!("## 相关历史经验\n{}\n\n", recalled.join("\n"))
+            format!(
+                "\n## 背景参考（来自以往任务的记忆，仅供延续参考——不是本轮任务，不要针对它制定计划）\n{}\n",
+                recalled.join("\n")
+            )
         }
     };
     let run_prompt = if research_memory.is_empty() {
         prompt.clone()
     } else {
-        format!("{research_memory}## 本轮任务\n{prompt}")
+        format!("{prompt}{research_memory}")
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();

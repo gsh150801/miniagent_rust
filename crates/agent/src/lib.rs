@@ -647,17 +647,37 @@ impl Agent {
 
 
 
-        // Rebuild: prompt + summary + last 5 messages
+        // Rebuild: prompt + summary + last N messages.
+        // Tool-pair safety: the kept window must never START with a Tool
+        // message — its matching assistant tool_use call may have been cut,
+        // and providers (MiniMax/OpenAI strict) reject orphaned tool results
+        // ("tool call result does not follow tool call", live 400). Expand
+        // the window left until the first kept message is not a Tool role.
         let first = history.first().cloned();
-        let recent: Vec<Message> = history
+        let mut recent: Vec<Message> = history
             .iter()
             .rev()
             .take(keep_recent)
             .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+            .collect::<Vec<_>>();
+        while recent
+            .first()
+            .is_some_and(|m| m.role == miniagent_core::message::MessageRole::Tool)
+        {
+            // Grow leftwards to swallow the whole orphaned tool sequence.
+            let start = history.len() - recent.len();
+            if start == 0 {
+                break;
+            }
+            recent.insert(0, history[start - 1].clone());
+        }
+        recent.reverse();
+        // The window must also be a contiguous slice of the original history;
+        // insert() above keeps contiguity (we prepend the immediately
+        // preceding message). Re-derive from history to be safe:
+        if history.len() >= recent.len() {
+            recent = history[history.len() - recent.len()..].to_vec();
+        }
 
         let mut trimmed = Vec::with_capacity(keep_recent + 2);
         if let Some(msg) = first {
@@ -926,6 +946,48 @@ mod compaction_tests {
             assert!(p.contains(section), "prompt must contain {section}");
         }
         assert!(Agent::compaction_system_prompt().contains("FOUR structured sections"));
+    }
+
+    #[tokio::test]
+    async fn trim_never_orphans_tool_results() {
+        // live 事故复现：历史以 [assistant tool_use, tool, tool] 结尾且
+        // keep_recent 覆盖到 tool 序列——旧实现裁剪后 recent 以孤立 Tool
+        // 消息开头，MiniMax 400 "tool call result does not follow tool call"。
+        let provider = CapturingProvider::new();
+        let agent = Agent::new(
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+            Box::new(provider.clone()) as Box<dyn LlmProvider>,
+        );
+        let work_dir = std::env::temp_dir().join("miniagent_trim_pair_test");
+        let _ = std::fs::remove_dir_all(&work_dir);
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let tool_id = format!("{}", uuid::Uuid::new_v4());
+        let mut history = vec![Message::user("调研任务")];
+        for i in 0..20 {
+            history.push(Message::assistant_text(format!("step {i}: {}", "y".repeat(6_000))));
+        }
+        // 结尾：assistant 发起 tool_use → 两条 tool 结果（正是裁剪会切断的形态）
+        history.push(Message::assistant(vec![miniagent_core::event::ContentBlock::ToolUse {
+            id: miniagent_core::types::ToolCallId::new(),
+            name: "web_search".into(),
+            input: serde_json::json!({"query": "x"}),
+        }]));
+        history.push(Message::tool(tool_id.clone(), "result A"));
+        history.push(Message::tool(tool_id, "result B"));
+
+        let ctx = RunContext::new("system").with_working_dir(work_dir.to_string_lossy().to_string());
+        let mut hist = history.clone();
+        agent.trim_and_summarize_history(&mut hist, &ctx, CancellationToken::new()).await;
+
+        // 修复后窗口向左扩张包含配对的 tool_use，或整体不裁剪——
+        // 两种实现都不允许出现"孤立 Tool 开头"。
+        assert!(
+            hist.iter().filter(|m| m.role == miniagent_core::message::MessageRole::Tool).count() == 0
+                || hist[1].role != miniagent_core::message::MessageRole::Tool,
+            "kept window must not start with an orphaned Tool message"
+        );
+        let _ = std::fs::remove_dir_all(&work_dir);
     }
 
     #[test]
