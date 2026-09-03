@@ -53,6 +53,11 @@ pub struct SkillMetadata {
     pub priority: i32,
     /// Whether this skill can be invoked as a tool-call action
     pub actionable: bool,
+    /// P-技能链：本技能产出交付物后应链接执行的后续技能（如核验技能）。
+    /// dispatch 注入匹配技能时，会同时注入其 follow_ups 的技能正文并
+    /// 指示 agent 在完成主交付物后必须执行核验。
+    #[serde(default)]
+    pub follow_ups: Vec<String>,
 }
 
 impl Default for SkillMetadata {
@@ -67,6 +72,7 @@ impl Default for SkillMetadata {
             tags: vec![],
             priority: 0,
             actionable: true,
+            follow_ups: vec![],
         }
     }
 }

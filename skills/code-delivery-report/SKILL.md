@@ -9,6 +9,8 @@ triggers:
   - script documentation
   - 代码交付
   - README for script
+follow_ups:
+  - bioinf-verify-report
 tools_needed: []
 version: "1.0.0"
 priority: 8

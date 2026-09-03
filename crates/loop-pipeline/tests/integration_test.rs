@@ -251,6 +251,7 @@ fn mock_state(loop_count: usize, max_loops: usize, completed: bool) -> PipelineS
         stage_outputs: Vec::new(),
         clarifications: Vec::new(),
         clarified: false,
+        steerings: Vec::new(),
     }
 }
 

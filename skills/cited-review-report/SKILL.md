@@ -11,6 +11,8 @@ triggers:
   - survey report
   - review report
   - 文献综述报告
+follow_ups:
+  - bioinf-verify-report
 tools_needed:
   - citation_check
   - pubmed_search

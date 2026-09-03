@@ -507,8 +507,8 @@ impl PipelineStage for DispatchStage {
                         .await
                         .expect("dispatch semaphore closed");
                     execute_single_task(
-                        task, agent, cancel, wave_ctx.clone(), max_tool_iters, working_dir.clone(),
-                        steerings.clone(),
+                        task, agent, cancel, wave_ctx.clone(), max_tool_iters,
+                        working_dir.clone(), steerings.clone(),
                     ).await
                 }));
             }
@@ -773,7 +773,7 @@ impl PipelineStage for DispatchStage {
 /// Execute a single task (tactic layer).
 async fn execute_single_task(
     task: TaskUnit,
-    agent: Arc<Agent>,
+    agent: std::sync::Arc<Agent>,
     cancel: CancellationToken,
     wave_ctx: String,
     max_tool_iters: usize,
@@ -796,14 +796,30 @@ async fn execute_single_task(
         use miniagent_skill::registry::SkillRegistry;
         let discovery = SkillDiscovery::new();
         let bundles = discovery.discover();
-        if !bundles.is_empty() {
+if !bundles.is_empty() {
             let mut registry = SkillRegistry::new();
             for b in bundles {
                 registry.register(b);
             }
             let query = format!("{} {}", task.description, task.expected_output);
             let matched = registry.find_matching(&query, 2);
+            // P-技能链：匹配技能声明的 follow_ups（如 cited-review-report →
+            // bioinf-verify-report）一并注入，并在提示中强制"完成主交付物后
+            // 必须执行核验"——修复 live 问题：格式技能正文里的自检要求被
+            // worker 忽略，核验从未发生。
+            let mut chained: Vec<String> = Vec::new();
+            for m in &matched {
+                for fu in &m.metadata.follow_ups {
+                    if !chained.contains(fu) {
+                        chained.push(fu.clone());
+                    }
+                }
+            }
+            // P-技能团队：链式核验技能 → 独立核验子智能体（deliverable 完成后
+            // 由另一个 agent 按核验技能工作流执行校验）。
+            let mut verify_skill: Option<(String, String)> = None;
             if matched.is_empty() {
+                // 兜底：注入本地高优技能名册，让 agent 知道本地有什么可用
                 let catalog: Vec<String> = registry.all().iter()
                     .filter(|b| b.metadata.priority >= 8)
                     .map(|b| format!("- {}（{}）", b.metadata.name,
@@ -822,6 +838,23 @@ async fn execute_single_task(
                         "\n## 技能: {}（用户/规划器要求使用时必须遵循其工作流）\n{}\n",
                         skill.metadata.name, body
                     ));
+                }
+                // 链式核验技能：主技能产出交付物后必须按核验技能执行一次
+                // 校验，修复所有 mismatch 后才算完成。
+                for fu_name in &chained {
+                    if let Some(bundle) = registry.all().iter()
+                        .find(|b| &b.metadata.name == fu_name)
+                    {
+                        let body: String = bundle.body.lines().take(40).collect::<Vec<_>>().join("\n");
+                        system.push_str(&format!(
+                            "\n## 核验技能: {}（交付物完成后必须立即执行一次核验，\n修复全部 mismatch 后才算完成；核验记录写入交付说明）\n{}\n",
+                            bundle.metadata.name, body
+                        ));
+                        // 记录第一个链式核验技能 → 供独立核验子智能体使用
+                        if verify_skill.is_none() {
+                            verify_skill = Some((bundle.metadata.name.clone(), bundle.body.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -991,8 +1024,104 @@ async fn execute_single_task(
             // Strict success: real text output, no explicit refusal, and tool
             // activity (if any) did not uniformly fail. A bare tool call with
             // no substantive output and all-error results is NOT success.
-            let success = has_text && !has_clear_failure
+            let mut success = has_text && !has_clear_failure
                 && (!has_tool_calls || !all_tools_errored);
+
+            let verify_skill: Option<(String, String)> = {
+                use miniagent_skill::discovery::SkillDiscovery;
+                use miniagent_skill::registry::SkillRegistry;
+                let discovery = SkillDiscovery::new();
+                let bundles = discovery.discover();
+                if bundles.is_empty() {
+                    None
+                } else {
+                    let mut registry = SkillRegistry::new();
+                    for b in bundles {
+                        registry.register(b);
+                    }
+                    let query = format!("{} {}", task.description, task.expected_output);
+                    let matched = registry.find_matching(&query, 2);
+                    let mut found: Option<(String, String)> = None;
+                    for m in matched {
+                        for fu in &m.metadata.follow_ups {
+                            if found.is_none()
+                                && let Some(bundle) = registry.all().iter()
+                                    .find(|b| &b.metadata.name == fu)
+                            {
+                                found = Some((bundle.metadata.name.clone(), bundle.body.clone()));
+                            }
+                        }
+                    }
+                    found
+                }
+            };
+
+            // ── P-技能团队：核验子智能体 ─────────────────────────────
+            // 主 worker 产出交付物后，若该任务匹配了带 follow_ups 的技能
+            // （如 cited-review-report → bioinf-verify-report），由一个
+            // 独立的核验子智能体按核验技能工作流对交付物执行校验
+            // （citation_check / 文件存在性 / 事实抽查），产出核验报告。
+            // 核验 FAIL ⇒ 任务标记失败进入修复循环（自愈）；核验报告
+            // 附加到输出供审计。核验子智能体失败不否定主结果。
+            let mut output = output;
+            if success
+                && let Some((verify_name, verify_body)) = &verify_skill
+            {
+                let verify_prompt = format!(
+                    "{verify_body}\n\n\
+                     ## 待核验交付物\n{output}\n\n\
+                     ## 执行要求\n\
+                     1. 按上述核验技能的工作流逐项核验该交付物（引用/文件/事实）。\n\
+                     2. 使用 citation_check 等工具获取真实数据，禁止凭记忆判定。\n\
+                     3. 输出核验报告，且第一行必须是 `核验结论：PASS` 或 `核验结论：FAIL`。\n\
+                     4. FAIL 时逐条列出 mismatch 与修正建议。"
+                );
+                let verify_system = format!(
+                    "You are an independent VERIFICATION agent executing the \
+                     '{}' skill workflow against another agent's deliverable. \
+                     Be strict and evidence-based.",
+                    verify_name
+                );
+                let allowed: Vec<String> = vec![
+                    "citation_check".into(), "pubmed_search".into(), "web_search".into(),
+                    "web_fetch".into(), "read".into(), "glob".into(),
+                ];
+                let mut v_history = vec![Message::user(&verify_prompt)];
+                let mut v_context = RunContext::new(&verify_system)
+                    .with_complexity(TaskComplexity::Moderate)
+                    .with_provider(ProviderChoice::Auto)
+                    .with_allowed_tools(allowed)
+                    .with_working_dir(working_dir.clone());
+                v_context.max_tool_iterations = max_tool_iters.saturating_sub(2);
+                match agent.run_with_loop(&mut v_history, &v_context, cancel.child_token()).await {
+                    Ok(_v_delta) => {
+                        let v_text: String = v_history.iter()
+                            .filter(|m| m.role == miniagent_core::message::MessageRole::Assistant)
+                            .map(|m| m.text_content())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        let v_fail = miniagent_core::json_util::strip_reasoning_tags(&v_text)
+                            .contains("核验结论：FAIL");
+                        output.push_str(&format!(
+                            "\n\n---\n\n## 核验报告（{verify_name}）\n\n{}",
+                            miniagent_core::json_util::strip_reasoning_tags(&v_text)
+                        ));
+                        if v_fail {
+                            success = false;
+                            tracing::warn!(
+                                task_id = %task.id,
+                                "verification sub-agent ruled FAIL — task enters repair"
+                            );
+                        } else {
+                            tracing::info!(task_id = %task.id, "verification sub-agent: PASS");
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        task_id = %task.id, error = %e,
+                        "verification sub-agent failed — keeping main result"
+                    ),
+                }
+            }
 
             TaskResult {
                 task_id: task.id.clone(),

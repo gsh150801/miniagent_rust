@@ -10,6 +10,8 @@ triggers:
   - analysis report
   - statistical report
   - 结果报告
+follow_ups:
+  - bioinf-verify-report
 tools_needed: []
 version: "1.0.0"
 priority: 9
