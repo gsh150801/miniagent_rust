@@ -994,16 +994,20 @@ fn demo_self_improve() {
 async fn plan_command(query: &str, config: &Arc<AppConfig>) {
     use miniagent_agent::Agent;
     use miniagent_core::orchestration::{StageInput, StageDriver as _};
+    let key = match config.require_active_key() {
+        Ok(k) => k.clone(),
+        Err(e) => { eprintln!("{e}"); return; }
+    };
     use miniagent_planning::runners::PlanRunner;
     use miniagent_tool::tools;
     use miniagent_tool::approval::AutoApprove;
     use miniagent_tool::executor::ToolExecutor;
     use std::sync::Arc;
 
-    let key = match config.require_active_key() {
-        Ok(k) => k.clone(),
-        Err(e) => { eprintln!("{e}"); return; }
-    };
+    if let Err(e) = config.require_active_key() {
+        eprintln!("{e}");
+        return;
+    }
 
     // Build agent with tools（根据 PROVIDER 配置选择 provider）
     let (flash, pro) = make_providers(config);
@@ -1067,7 +1071,7 @@ async fn orchestrate_command(query: &str, pattern: &str, config: &Arc<AppConfig>
     use std::sync::Arc;
     use std::collections::HashMap;
 
-    let key = match config.require_active_key() {
+    let _key = match config.require_active_key() {
         Ok(k) => k.clone(),
         Err(e) => { eprintln!("{e}"); return; }
     };
@@ -1083,18 +1087,45 @@ async fn orchestrate_command(query: &str, pattern: &str, config: &Arc<AppConfig>
 
     let sub_tasks = match pattern {
         "chain" | "parallel" => {
-            // Use LLM to decompose
             use miniagent_core::message::Message;
             use miniagent_core::config::InferenceConfig;
             use miniagent_provider::traits::{CompletionRequest, LlmProvider};
 
-            let flash_provider: Box<dyn LlmProvider> = if config.is_stepfun() {
-                Box::new(StepFunFlash::new(&key))
-            } else {
-                Box::new(DeepSeekFlash::new(&key))
+            // 供应商经模型注册表解析（活跃档案），并附跨家族备援——
+            // 硬编码 StepFun/DeepSeek 会在供应商故障（429/402）时直接失败。
+            let active_profile = active_model_profile(config);
+            let decompose_providers: Vec<Box<dyn LlmProvider>> = {
+                let mut v = vec![miniagent_provider::factory::build_provider(
+                    &active_profile, miniagent_provider::factory::ProviderTier::Flash,
+                ).expect("active model profile usable")];
+                v.extend(miniagent_provider::factory::codegen_fallback_providers(config));
+                v
             };
-            let decompose_prompt = format!(
-                r#"Decompose this task into 3-5 independent sub-tasks that can be worked on in parallel.
+            let flash_provider = decompose_providers.first().expect("at least one provider");
+
+            // P-多智能体分配：两阶段——先枚举独立工作项（模型对"列举"的
+            // 服从度远高于"完整分解"），≥2 项时机械扇出为多个 worker。
+            let mut tasks: Vec<String> = Vec::new();
+            if let Some(items) = miniagent_loop_pipeline::plan::enumerate_work_items(
+                flash_provider.as_ref(),
+                &query,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+                && items.len() >= 2
+            {
+                eprintln!("   🧩 enumerated {} parallel work items:", items.len());
+                for (i, (title, role)) in items.iter().enumerate() {
+                    eprintln!("     {}. [{role}] {title:.90}", i + 1);
+                }
+                tasks = items.into_iter().map(|(t, _)| t).collect();
+                tasks.push("汇总以上全部子任务结果，输出最终报告".to_string());
+            }
+
+            if tasks.is_empty() {
+                // 回退：LLM 完整分解（枚举失败或单项时的既有路径）
+                let decompose_prompt = format!(
+                    r#"Decompose this task into 3-5 independent sub-tasks that can be worked on in parallel.
 Each sub-task should be self-contained and researchable with web search tools.
 Output a JSON array of strings. Example:
 ["Research topic A and its mechanisms", "Investigate topic B and key findings", "Analyze relationship between A and B"]
@@ -1102,29 +1133,29 @@ Output a JSON array of strings. Example:
 Task: {query}
 
 Output ONLY the JSON array, no markdown."#
-            );
-
-            let request = CompletionRequest {
-                system: "You are a task decomposer. Break complex tasks into independent parallel sub-tasks.".into(),
-                messages: vec![Message::user(&decompose_prompt)],
-                tools: vec![],
-                config: InferenceConfig { temperature: Some(0.1), max_tokens: Some(1000), ..Default::default() },
-            };
-            let cancel = CancellationToken::new();
-            let result = flash_provider.complete(&request, cancel).await;
-            match result {
-                Ok(resp) => {
-                    let text: String = resp.content.iter()
-                        .filter_map(|b| match b { miniagent_core::event::ContentBlock::Text { text } => Some(text.clone()), _ => None })
-                        .collect::<Vec<_>>().join("");
-                    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```");
-                    serde_json::from_str::<Vec<String>>(cleaned).unwrap_or_else(|_| vec![query.to_string()])
-                }
-                Err(e) => {
-                    eprintln!("   ⚠️ Task decomposition failed: {e}");
-                    vec![query.to_string()]
-                }
+                );
+                let request = CompletionRequest {
+                    system: "You are a task decomposer. Break complex tasks into independent parallel sub-tasks.".into(),
+                    messages: vec![Message::user(&decompose_prompt)],
+                    tools: vec![],
+                    config: InferenceConfig { temperature: Some(0.1), max_tokens: Some(1000), ..Default::default() },
+                };
+                let cancel = CancellationToken::new();
+                tasks = match flash_provider.complete(&request, cancel).await {
+                    Ok(resp) => {
+                        let text: String = resp.content.iter()
+                            .filter_map(|b| match b { miniagent_core::event::ContentBlock::Text { text } => Some(text.clone()), _ => None })
+                            .collect::<Vec<_>>().join("");
+                        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```");
+                        serde_json::from_str::<Vec<String>>(cleaned).unwrap_or_else(|_| vec![query.to_string()])
+                    }
+                    Err(e) => {
+                        eprintln!("   ⚠️ Task decomposition failed: {e}");
+                        vec![query.to_string()]
+                    }
+                };
             }
+            tasks
         }
         _ => vec![query.to_string()],
     };
@@ -1302,4 +1333,9 @@ async fn team_command(query: &str, config: &Arc<AppConfig>) {
         }
         Err(e) => eprintln!("❌ Graph error: {e}"),
     }
+}
+
+/// Load the active model profile from the runtime registry (per-call, cheap).
+fn active_model_profile(config: &Arc<AppConfig>) -> miniagent_core::models::ModelProfile {
+    miniagent_core::models::ModelRegistry::load(config).active().clone()
 }

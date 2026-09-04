@@ -585,6 +585,12 @@ Requirements:
 5. Print a final JSON line `RESULT = {{...}}` summarizing key numbers (effect sizes, p-values, CIs).
 6. Include brief comments. No external services, no GUI. No `plt.show()`.
 7. If the input data does not match expectations, raise a clear `ValueError` with a message.
+8. Structure the script into logical sections. Start each section with a
+   top-level comment line of EXACTLY this form (single line, English or
+   Chinese): `# == SECTION: <one-sentence description of what this section does> ==`
+   Typical sections: setup, data loading, quality control, the main
+   statistical test, visualization, export of deliverables. These markers
+   become the narrative markdown cells of the generated Jupyter notebook.
 
 Output ONLY the Python code, no markdown fences, no explanation."#,
             objective = task.objective,

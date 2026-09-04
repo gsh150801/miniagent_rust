@@ -60,6 +60,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/download/{task_id}/{*path}", get(download_handler))
         .route("/api/tasks/{task_id}/files", get(files_handler))
         .route("/api/tasks/{task_id}/preview/{*path}", get(preview_handler))
+        .route("/api/tasks/{task_id}/raw/{*path}", get(raw_image_handler))
         .route("/api/tasks/{task_id}", get(get_task_handler).delete(delete_task_handler))
         // Keep legacy routes
         .route("/api/health", get(health_handler))
@@ -477,7 +478,7 @@ async fn files_handler(
 // ── Text preview ──
 
 const PREVIEW_BYTES: usize = 200_000;
-const TEXT_EXTS: &[&str] = &["md", "json", "txt", "csv", "tsv", "py", "rs", "js", "ts", "html", "css", "yaml", "yml", "toml", "sh", "log"];
+const TEXT_EXTS: &[&str] = &["md", "json", "txt", "csv", "tsv", "py", "rs", "js", "ts", "html", "css", "yaml", "yml", "toml", "sh", "log", "ipynb"];
 
 async fn preview_handler(
     State(state): State<AppState>,
@@ -524,6 +525,126 @@ async fn preview_handler(
         "ext": ext,
         "content": content,
     })))
+}
+
+/// Serve raw image bytes for inline `<img>` preview (notebook figures,
+/// pipeline plots). Image extensions only; paths resolve inside the task dir.
+async fn raw_image_handler(
+    State(state): State<AppState>,
+    Path((task_id, path)): Path<(String, String)>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "svg", "webp"];
+    let result_dir = state
+        .tasks
+        .get(&task_id)
+        .map(|t| t.result_dir.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let resolved = resolve_safe(&result_dir, &path).ok_or(StatusCode::NOT_FOUND)?;
+    if !resolved.is_file() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let ext = resolved
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !IMAGE_EXTS.iter().any(|e| *e == ext) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    };
+    let bytes = std::fs::read(&resolved).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(([(axum::http::header::CONTENT_TYPE, mime)], bytes))
+}
+
+/// Push structured hypothesis/debate cards to the frontend: read the
+/// pipeline artifacts (hypotheses + debate verdicts) and emit a dedicated
+/// `hypotheses` WS event, also persisted into task messages so history
+/// replay re-renders the cards. Emits nothing when the artifacts are absent.
+async fn emit_hypothesis_cards(
+    socket: &Arc<Mutex<WsSink>>,
+    state: &AppState,
+    task_id: &str,
+    task_dir: &std::path::Path,
+) {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        let bytes = std::fs::read(task_dir.join(name)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let full = read_json("hypotheses_refined_full.json")
+        .or_else(|| read_json("hypotheses_full.json"));
+    let Some(full) = full else { return };
+    let Some(hyp_list) = full.as_array() else { return };
+    if hyp_list.is_empty() {
+        return;
+    }
+    let debate = read_json("debate_report.json")
+        .and_then(|d| d.get("per_hypothesis").cloned());
+    let verdict_by_id: std::collections::HashMap<String, &serde_json::Value> = debate
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.get("hypothesis_id")
+                        .and_then(|s| s.as_str())
+                        .map(|s| (s.to_string(), v))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let cards: Vec<serde_json::Value> = hyp_list
+        .iter()
+        .filter_map(|h| {
+            let id = h.get("id").and_then(|v| v.as_str())?;
+            let verdict = verdict_by_id.get(id).copied();
+            Some(serde_json::json!({
+                "id": id,
+                "statement": h.get("statement").and_then(|v| v.as_str()).unwrap_or(""),
+                "mechanism": h.get("mechanism").and_then(|v| v.as_str()).unwrap_or(""),
+                "confidence": h.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                "verdict": verdict
+                    .and_then(|v| v.get("verdict"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("undebated"),
+                "confidence_after": verdict
+                    .and_then(|v| v.get("confidence_after"))
+                    .and_then(|v| v.as_f64()),
+                "supporting_points": verdict
+                    .and_then(|v| v.get("supporting_points")).cloned()
+                    .unwrap_or(serde_json::json!([])),
+                "contradicting_points": verdict
+                    .and_then(|v| v.get("contradicting_points")).cloned()
+                    .unwrap_or(serde_json::json!([])),
+                "rebuttal_points": verdict
+                    .and_then(|v| v.get("rebuttal_points")).cloned()
+                    .unwrap_or(serde_json::json!([])),
+                "refinement_notes": verdict
+                    .and_then(|v| v.get("refinement_notes"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            }))
+        })
+        .collect();
+    if cards.is_empty() {
+        return;
+    }
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "hypotheses", "task_id": task_id, "hypotheses": cards,
+    })).await;
+    // Persist for history replay (renderHistory re-renders role=hypotheses).
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.messages.push(serde_json::json!({
+            "role": "hypotheses",
+            "content": serde_json::to_string(&cards).unwrap_or_default(),
+        }));
+    }
 }
 
 // ── Upload ──
@@ -1331,6 +1452,10 @@ async fn handle_research_run(
         })).await;
         return;
     }
+
+    // 结构化假说/辩论卡片：在总结文本流之前下发专用事件，前端渲染真正的
+    // 结构化卡片（结论/置信度/支持与反驳要点/rebuttal）而非纯 markdown。
+    emit_hypothesis_cards(socket, state, &task_id, &task_dir).await;
 
     let _ = ws_send(socket, serde_json::json!({
         "type": "stream",

@@ -29,6 +29,35 @@ fn preview_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Build the upstream-context block for a task: the outputs of its direct
+/// `depends_on` predecessors (successful only, truncated). Empty when the
+/// task has no completed dependencies — the prompt then contains nothing.
+fn upstream_context(task: &TaskUnit, result_map: &std::collections::HashMap<String, TaskResult>) -> String {
+    if task.depends_on.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = task
+        .depends_on
+        .iter()
+        .filter_map(|dep| result_map.get(dep))
+        .filter(|r| r.success && !r.output.trim().is_empty())
+        .map(|r| {
+            format!(
+                "### {}（上游任务输出摘要）\n{}",
+                r.task_id,
+                preview_chars(r.output.trim(), 3000)
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Upstream Results (use these; do not redo the upstream work)\n{}\n\n",
+        items.join("\n\n")
+    )
+}
+
 /// Resolve dependency order: returns groups of task IDs that can run in parallel.
 ///
 /// Delegates to the canonical Kahn scheduler in
@@ -498,6 +527,10 @@ impl PipelineStage for DispatchStage {
                 let working_dir = ctx.working_dir.clone();
                 let semaphore = semaphore.clone();
                 let steerings = steerings.clone();
+                // 上游任务的输出摘要直接注入依赖任务的提示：此前依赖任务
+                // 只能靠"读共享目录文件"这一隐性契约拿到上游结果，纯文本
+                // 类任务（无文件产物）会因此空转。
+                let upstream_block = upstream_context(&task, &result_map);
 
                 handles.push(tokio::spawn(async move {
                     // Acquire a permit before touching the provider; the
@@ -508,7 +541,7 @@ impl PipelineStage for DispatchStage {
                         .expect("dispatch semaphore closed");
                     execute_single_task(
                         task, agent, cancel, wave_ctx.clone(), max_tool_iters,
-                        working_dir.clone(), steerings.clone(),
+                        working_dir.clone(), steerings.clone(), upstream_block,
                     ).await
                 }));
             }
@@ -779,6 +812,7 @@ async fn execute_single_task(
     max_tool_iters: usize,
     working_dir: String,
     steerings: Vec<String>,
+    upstream_block: String,
 ) -> TaskResult {
     let mut system = new_role_system_prompt(
         &task.assigned_role,
@@ -885,6 +919,7 @@ if !bundles.is_empty() {
         "{repair_context}\n\n\
          ## Task\n{description}\n\
          ## Expected Output\n{expected}\n\n\
+         {upstream_block}\
          {tool_instructions}\n\
          {env_info}\n\
          {steer_block}\
@@ -893,6 +928,7 @@ if !bundles.is_empty() {
          Do NOT create `result/…` or `../…` paths — they end up outside this task's directory.",
         description = task.description,
         expected = task.expected_output,
+        upstream_block = upstream_block,
         tool_instructions = tool_instruction_block(),
         env_info = crate::prompts::env_info_block(&working_dir),
         steer_block = steer_block,

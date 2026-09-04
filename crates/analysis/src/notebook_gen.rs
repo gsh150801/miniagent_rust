@@ -30,16 +30,41 @@ pub fn build_notebook(
 
     cells.push(markdown_cell(&header_markdown(task, hypothesis_ref)));
 
-    for block in split_code_into_cells(code) {
-        cells.push(code_cell(&block));
+    let mut code_cell_count = 0usize;
+    // Scripts generated with `# == SECTION: <desc> ==` markers get a narrative
+    // markdown cell before each section's code; marker-free (legacy) scripts
+    // fall back to plain top-level splitting.
+    for section in split_sections(code) {
+        let Some(desc) = section.description else {
+            for block in split_code_into_cells(&section.code) {
+                if block.trim().is_empty() {
+                    continue;
+                }
+                cells.push(code_cell(&block));
+                code_cell_count += 1;
+            }
+            continue;
+        };
+        let blocks = split_code_into_cells(&section.code);
+        if blocks.iter().all(|b| b.trim().is_empty()) {
+            continue;
+        }
+        cells.push(markdown_cell(&format!("### {desc}\n")));
+        for block in blocks {
+            if block.trim().is_empty() {
+                continue;
+            }
+            cells.push(code_cell(&block));
+            code_cell_count += 1;
+        }
     }
     // Guarantee at least one code cell even if the script body was empty.
-    if cells.len() == 1 {
+    if code_cell_count == 0 {
         cells.push(code_cell(""));
     }
 
     cells.push(markdown_cell(
-        "## 结果 / Results\n\nOutputs (tables, figures, printed summaries) appear in the cells above once executed.",
+        "## 结果 / Results\n\nOutputs (tables, figures, printed summaries) appear in the cells above once executed. The final `RESULT = {...}` JSON line summarizes the key statistics; deliverable files (CSV/PNG) are written next to this notebook and listed in `provenance.json`.",
     ));
 
     json!({
@@ -68,6 +93,37 @@ pub fn write_notebook(nb: &Value, path: &Path) -> Result<(), AgentError> {
     std::fs::write(path, pretty)
         .map_err(|e| AgentError::Checkpoint(format!("write notebook: {e}")))?;
     Ok(())
+}
+
+/// One narrative section of a generated script: an optional `# == SECTION:`
+/// description plus the raw code lines that follow it.
+struct ScriptSection {
+    description: Option<String>,
+    code: String,
+}
+
+/// Split a script on top-level `# == SECTION: <desc> ==` markers (the marker
+/// line itself is dropped from the code). Scripts without any marker yield a
+/// single section with `description: None`, preserving the legacy path.
+fn split_sections(code: &str) -> Vec<ScriptSection> {
+    let mut sections = vec![ScriptSection { description: None, code: String::new() }];
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("# == SECTION:")
+            && let Some((desc, _)) = rest.split_once("==")
+        {
+            let desc = desc.trim().trim_matches(|c| c == ':' || c == '。' || c == '.');
+            sections.push(ScriptSection {
+                description: (!desc.is_empty()).then(|| desc.to_string()),
+                code: String::new(),
+            });
+            continue;
+        }
+        let last = sections.last_mut().expect("always non-empty");
+        last.code.push_str(line);
+        last.code.push('\n');
+    }
+    sections
 }
 
 /// Split a Python script into code-cell-sized blocks.
@@ -338,6 +394,31 @@ mod tests {
         assert!(cells[1].contains("def f():"));
         assert!(cells[1].contains("return x + y"), "indented body stays together: {cells:?}");
         assert!(cells[2].trim() == "z = f()");
+    }
+
+    #[test]
+    fn section_markers_become_markdown_cells() {
+        let code = "# == SECTION: Load the expression matrix ==\nimport pandas as pd\n\n# == SECTION: Run the differential test ==\ndf.describe()\nprint('done')\n";
+        let nb = build_notebook(&task(), None, code);
+        let cells = nb["cells"].as_array().unwrap();
+        let types: Vec<&str> = cells.iter().map(|c| c["cell_type"].as_str().unwrap()).collect();
+        // header md, md, code, md, code, results md
+        assert_eq!(types, vec!["markdown", "markdown", "code", "markdown", "code", "markdown"]);
+        let narrative = source_to_string(&cells[1]["source"]);
+        assert!(narrative.contains("Load the expression matrix"));
+        assert!(!narrative.contains("== SECTION =="));
+        // marker line itself must not leak into code cells
+        let code0 = source_to_string(&cells[2]["source"]);
+        assert!(code0.contains("import pandas as pd"));
+        assert!(!code0.contains("SECTION"));
+    }
+
+    #[test]
+    fn marker_free_scripts_keep_legacy_layout() {
+        let nb = build_notebook(&task(), None, "import pandas as pd\nprint('hi')\n");
+        let cells = nb["cells"].as_array().unwrap();
+        let types: Vec<&str> = cells.iter().map(|c| c["cell_type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["markdown", "code", "markdown"]);
     }
 
     #[test]

@@ -591,14 +591,16 @@ pub async fn run_research(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client");
-    // efetch natively supports comma-separated ids; each record in the text
-    // response ends with a "PMID: <id>" line, giving exact id↔abstract
-    // pairing. One request per 50 papers instead of one per paper.
+    // efetch natively supports comma-separated ids; we request the XML form —
+    // the plain-text format places each record's "Conflict of interest
+    // statement" block after the `PMID:` terminator line, which previously
+    // shifted every abstract onto the wrong PMID. XML pairs fields to PMIDs
+    // unambiguously. One request per 50 papers.
     let chunk_size = 50;
     for chunk in pmids.chunks(chunk_size) {
         let ids = chunk.join(",");
         let mut url = format!(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={ids}&rettype=abstract&retmode=text"
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={ids}&retmode=xml"
         );
         if !pubmed_key.is_empty() {
             url.push_str(&format!("&api_key={pubmed_key}"));
@@ -614,7 +616,7 @@ pub async fn run_research(
                 String::new()
             }
         };
-        for (pmid, text) in parse_efetch_records(&body) {
+        for (pmid, text) in parse_efetch_xml(&body) {
             let clean = text.trim().to_lowercase();
             let word_count = text.split_whitespace().count();
             if word_count < 30           // too short for an abstract
@@ -981,6 +983,34 @@ pub async fn run_research(
         }
     }
     println!("```");
+
+    // Audit artifact (goal 1): map KG paper ids back to PMIDs + titles so
+    // every edge's `source_paper_id` resolves to a citable reference.
+    let sources_path = project_dir.join("kg_sources.json");
+    let mut source_map = serde_json::Map::new();
+    for rel in kg.all_relations() {
+        for pid in rel.supporting_papers.iter().chain(rel.source_paper_id.iter()) {
+            let key = pid.to_string();
+            if source_map.contains_key(&key) {
+                continue;
+            }
+            let pmid = pmid_from_uuid(*pid).unwrap_or_default();
+            let title = paper_texts
+                .iter()
+                .find(|(p, _)| *p == pmid)
+                .and_then(|(_, t)| t.lines().next())
+                .unwrap_or("")
+                .strip_prefix("Title: ")
+                .unwrap_or("")
+                .to_string();
+            source_map.insert(key, serde_json::json!({ "pmid": pmid, "title": title }));
+        }
+    }
+    let _ = std::fs::write(
+        &sources_path,
+        serde_json::to_vec_pretty(&serde_json::Value::Object(source_map))
+            .unwrap_or_default(),
+    );
 
     let phase3_dur = phase_start.elapsed();
     manifest.record_stage(
@@ -2203,7 +2233,7 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
     // of silently dropping it from the KG.
     let repaired = miniagent_core::json_util::extract_and_repair(&response_text);
     match serde_json::from_str::<serde_json::Value>(&repaired) {
-        Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
+        Ok(parsed) => Ok(parse_extraction_result(pmid_to_uuid(pmid), &parsed)),
         Err(_first_err) if repaired.trim().is_empty() => {
             eprintln!("   ⚠ KG extraction empty response for PMID {pmid}; retrying");
             let retry_provider: std::sync::Arc<dyn LlmProvider> =
@@ -2228,13 +2258,13 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
                 }).collect::<Vec<_>>().join("");
             let repaired = miniagent_core::json_util::extract_and_repair(&text);
             match serde_json::from_str::<serde_json::Value>(&repaired) {
-                Ok(parsed) => Ok(parse_extraction_result(uuid::Uuid::new_v4(), &parsed)),
+                Ok(parsed) => Ok(parse_extraction_result(pmid_to_uuid(pmid), &parsed)),
                 Err(e) => {
                     eprintln!(
                         "   ⚠ KG extraction parse failed for PMID {pmid} (retry): {e}; output head: {:?}",
                         repaired.chars().take(160).collect::<String>()
                     );
-                    Ok(parse_extraction_result(uuid::Uuid::new_v4(), &serde_json::Value::Null))
+                    Ok(parse_extraction_result(pmid_to_uuid(pmid), &serde_json::Value::Null))
                 }
             }
         }
@@ -2243,7 +2273,7 @@ Focus on biologically/scientifically meaningful entities. Output ONLY valid JSON
                 "   ⚠ KG extraction parse failed for PMID {pmid}: {e}; output head: {:?}",
                 repaired.chars().take(160).collect::<String>()
             );
-            Ok(parse_extraction_result(uuid::Uuid::new_v4(), &serde_json::Value::Null))
+            Ok(parse_extraction_result(pmid_to_uuid(pmid), &serde_json::Value::Null))
         }
     }
 }
@@ -2400,34 +2430,129 @@ Output ONLY valid JSON (no markdown fences):
     }
 }
 
-/// Split a multi-record efetch `rettype=abstract&retmode=text` body into
-/// `(pmid, abstract)` pairs. Each record ends with a `PMID: <id>` line, so
-/// text before that terminator belongs to that PMID. Records without a
-/// terminating PMID line are dropped.
-fn parse_efetch_records(body: &str) -> Vec<(String, String)> {
+/// Deterministic UUID for a PMID, so every KG entity/relation stays
+/// traceable to its source paper: `uuid::Uuid::from_u128(pmid)` round-trips
+/// exactly through `Uuid::as_u128` (see [`pmid_from_uuid`]). The previous
+/// `Uuid::new_v4()` per extraction silently severed the KG→literature
+/// provenance chain (goal 1).
+fn pmid_to_uuid(pmid: &str) -> uuid::Uuid {
+    uuid::Uuid::from_u128(pmid.parse::<u128>().unwrap_or(0))
+}
+
+/// Inverse of [`pmid_to_uuid`]; returns `None` for the zero sentinel (unknown
+/// PMID, e.g. externally enriched edges).
+fn pmid_from_uuid(id: uuid::Uuid) -> Option<String> {
+    let n = id.as_u128();
+    (n > 0).then(|| n.to_string())
+}
+
+/// Split a PubMed efetch `retmode=xml` body into `(pmid, text)` pairs.
+///
+/// The plain-text efetch format places each record's "Conflict of interest
+/// statement" block AFTER the terminating `PMID: <id>` line, so line-based
+/// splitting mis-assigns whole abstracts to the wrong PMID (observed live:
+/// 9/12 corpus entries were pure COI text and every abstract was shifted by
+/// one paper). The XML format is unambiguous — one `<PubmedArticle>` per
+/// record — so we parse it directly.
+///
+/// The returned text is a compact structured record:
+/// `Title: ...\nYear: ...\nAbstract: ...` (abstract sections joined with
+/// their `Label` prefixes). Records without a PMID or abstract are dropped.
+fn parse_efetch_xml(body: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut current_lines: Vec<&str> = Vec::new();
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("PMID: ")
-            && let Some(pmid) = rest.split_whitespace().next()
-            && pmid.chars().all(|c| c.is_ascii_digit())
-        {
-            let text: String = current_lines
-                .iter()
-                .map(|l| *l)
-                .filter(|l| !l.trim().is_empty())
-                .collect::<Vec<&str>>()
-                .join(" ");
-            if !text.is_empty() {
-                out.push((pmid.to_string(), text));
+    for chunk in body.split("<PubmedArticle>").skip(1) {
+        let record = match chunk.split("</PubmedArticle>").next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let pmid = match first_tag_contents(record, "PMID") {
+            Some(p) if p.chars().all(|c| c.is_ascii_digit()) => p,
+            _ => continue,
+        };
+        let title = first_tag_contents(record, "ArticleTitle").unwrap_or_default();
+        // Abstract sections, each prefixed with its Label ("BACKGROUND: ...").
+        let mut abstract_parts: Vec<String> = Vec::new();
+        for seg in record.split("<AbstractText") {
+            let Some(inner) = seg.split_once('>') else { continue };
+            let (attrs, rest) = inner;
+            let text = match rest.split_once("</AbstractText>") {
+                Some((t, _)) => t,
+                None => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
             }
-            current_lines.clear();
-            continue;
+            let label = extract_attr(attrs, "Label").unwrap_or_default();
+            let text = strip_xml_tags(text);
+            abstract_parts.push(if label.is_empty() {
+                text
+            } else {
+                format!("{label}: {text}")
+            });
         }
-        current_lines.push(line);
+        if abstract_parts.is_empty() {
+            continue; // no usable abstract (bookshelf/index-only record)
+        }
+        let year = ["PubDate", "ArticleDate"]
+            .iter()
+            .find_map(|tag| {
+                let seg = first_tag_contents(record, tag)?;
+                first_tag_contents(&seg, "Year")
+            })
+            .unwrap_or_default();
+        let text = {
+            let mut t = format!("Title: {}", strip_xml_tags(&title));
+            if !year.is_empty() {
+                t.push_str(&format!("\nYear: {year}"));
+            }
+            t.push_str(&format!("\nAbstract: {}", abstract_parts.join(" ")));
+            t
+        };
+        out.push((pmid, text));
     }
     out
+}
+
+/// Contents of the first `<tag ...>...</tag>` occurrence in `s` (attribute
+/// list tolerated between the tag name and `>`).
+fn first_tag_contents(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = s.find(&open)?;
+    let after_open = &s[start..];
+    let inner_start = after_open.find('>')? + 1;
+    let rest = &after_open[inner_start..];
+    let end = rest.find(&format!("</{tag}>"))?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Value of `attr="..."` inside an XML attribute list.
+fn extract_attr(attrs: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=\"");
+    let start = attrs.find(&pat)? + pat.len();
+    let rest = &attrs[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Remove inner markup tags (`<i>`, `<sup>`, …) and unescape the XML
+/// entities PubMed actually emits.
+fn strip_xml_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
 }
 
 /// Build a compact English GEO query from a task objective (primary signal)
@@ -2836,22 +2961,40 @@ mod research_tests {
     use super::*;
 
     #[test]
-    fn efetch_records_split_on_pmid_terminators() {
-        let body = "1. Nature. 2023\nLecanemab slows decline.\n\nPMID: 36449413 [Indexed for MEDLINE]\n\n\n2. JAMA. 2023\nDonanemab also works.\n\nPMID: 37459141 [Indexed for MEDLINE]\n";
-        let recs = parse_efetch_records(body);
+    fn efetch_xml_pairs_abstract_to_correct_pmid() {
+        // Reproduces the live failure: record 1 has a COI block that follows
+        // its abstract; the text-format parser shifted it onto record 2.
+        let body = r#"<PubmedArticleSet>
+<PubmedArticle><MedlineCitation><PMID Version="1">36449413</PMID>
+<Article><Journal><Title>Nature</Title></Journal>
+<JournalIssue><PubDate><Year>2023</Year></PubDate></JournalIssue>
+<ArticleTitle>Lecanemab slows <i>decline</i> in early Alzheimer's</ArticleTitle>
+<Abstract><AbstractText>Amyloid beta accumulates.</AbstractText>
+<AbstractText Label="METHODS" NlmCategory="METHODS">We ran a trial &amp; analysis.</AbstractText></Abstract>
+</Article></MedlineCitation></PubmedArticle>
+<PubmedArticle><MedlineCitation><PMID Version="1">37459141</PMID>
+<Article><ArticleTitle>Donanemab also works</ArticleTitle>
+<Abstract><AbstractText>A second antibody trial.</AbstractText></Abstract>
+</Article><CoiStatement>The authors declare no conflict.</CoiStatement>
+</MedlineCitation></PubmedArticle>
+</PubmedArticleSet>"#;
+        let recs = parse_efetch_xml(body);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].0, "36449413");
+        // Own abstract present, COI of the OTHER record absent.
         assert!(recs[0].1.contains("Lecanemab"));
+        assert!(recs[0].1.contains("METHODS: We ran a trial & analysis."));
+        assert!(recs[0].1.contains("Year: 2023"));
+        assert!(!recs[0].1.contains("no conflict"));
         assert_eq!(recs[1].0, "37459141");
         assert!(recs[1].1.contains("Donanemab"));
-        // blank lines collapsed to single spaces
-        assert!(!recs[0].1.contains("\n"));
     }
 
     #[test]
-    fn efetch_record_without_pmid_is_dropped() {
-        let body = "orphan text with no terminator\nPMID: not-a-number\n";
-        assert!(parse_efetch_records(body).is_empty());
+    fn efetch_xml_drops_records_without_abstract_or_pmid() {
+        let body = "<PubmedArticle><MedlineCitation><PMID>1</PMID></MedlineCitation></PubmedArticle>\
+                    <PubmedArticle><MedlineCitation><ArticleTitle>orphan no pmid</ArticleTitle></MedlineCitation></PubmedArticle>";
+        assert!(parse_efetch_xml(body).is_empty());
     }
 
     #[test]

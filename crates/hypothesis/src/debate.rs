@@ -68,6 +68,11 @@ pub struct HypothesisVerdict {
     /// the Judge's verdict is visible in the report). Absent on legacy data.
     #[serde(default)]
     pub opponent_recommendation: Option<Verdict>,
+    /// The Proposer's second-round answers to the Opponent's strongest
+    /// objections. Empty when the Opponent raised nothing or the rebuttal
+    /// call failed (degrade, don't fail). Absent on legacy data.
+    #[serde(default)]
+    pub rebuttal_points: Vec<String>,
 }
 
 /// Cross-comparison across all hypotheses (Phase B).
@@ -233,6 +238,7 @@ impl HypothesisDebater {
                             confidence_after: 0.0,
                             refinement_notes: format!("debate failed: {e}"),
                             opponent_recommendation: None,
+                            rebuttal_points: vec![],
                         });
                     }
                 }
@@ -262,7 +268,10 @@ impl HypothesisDebater {
             .take(self.max_refine)
             .collect();
 
-        let rounds = if to_refine.is_empty() { 1 } else { 1 + 1 };
+        let rounds = {
+            let any_rebuttal = verdicts.iter().any(|v| !v.rebuttal_points.is_empty());
+            1 + usize::from(any_rebuttal) + usize::from(!to_refine.is_empty())
+        };
         // Phase C: refinement failure degrades to "keep the debated originals
         // with updated confidence" (the assembly loop already handles missing
         // refined entries) instead of discarding the whole debate outcome.
@@ -349,7 +358,7 @@ impl HypothesisDebater {
 {ctx}
 {evidence_block}
 
-**Your task:** list the 2-4 strongest pieces of evidence or reasoning that SUPPORT the hypothesis (cite the kind of literature, e.g. "GEO expression studies", "GWAS", "prior reviews"), and your confidence as the proposer.
+**Your task:** list the 2-4 strongest pieces of evidence or reasoning that SUPPORT the hypothesis (cite the kind of literature, e.g. "GEO expression studies", "GWAS", "prior reviews"), and your confidence as the proposer. When a point draws on the retrieved evidence above, cite its URL or PMID in parentheses at the end of the point.
 
 Output ONLY valid JSON (no markdown fences):
 {{
@@ -391,7 +400,7 @@ Output ONLY valid JSON (no markdown fences):
 **The proposer has already argued:**
 {proposer_case}
 
-**Your task:** attack. List the 2-4 strongest CONTRADICTIONS or alternative explanations, and state what you would recommend the panel do with this hypothesis.
+**Your task:** attack. List the 2-4 strongest CONTRADICTIONS or alternative explanations, and state what you would recommend the panel do with this hypothesis. When a point draws on the retrieved evidence above, cite its URL or PMID in parentheses at the end of the point.
 
 Output ONLY valid JSON (no markdown fences):
 {{
@@ -422,9 +431,53 @@ Output ONLY valid JSON (no markdown fences):
                 .join("\n")
         };
 
-        // 3. Judge — weigh both sides, rule, leave refinement notes.
+        // 3. Rebuttal — the Proposer answers the Opponent's strongest
+        // objections so the Judge sees a genuine two-round exchange instead
+        // of two unchallenged monologues. Degrade to no rebuttal on failure:
+        // a missing second round beats losing the whole debate.
+        let mut rebuttal_points: Vec<String> = Vec::new();
+        if !contradicting_points.is_empty() {
+            let rebuttal_prompt = format!(
+                r#"You are the PROPOSER (正方) in the rebuttal round of a scientific debate. The opponent has attacked your hypothesis. Answer each attack head-on: concede what must be conceded, refute what the literature contradicts, and say honestly what additional evidence would settle the point.
+
+{ctx}
+{evidence_block}
+
+**The opponent attacked:**
+{opponent_case}
+
+**Your task:** for the 2-4 strongest attacks, give your rebuttal. When a rebuttal draws on the retrieved evidence above, cite its URL or PMID in parentheses at the end of the point.
+
+Output ONLY valid JSON (no markdown fences):
+{{
+  "rebuttal_points": ["..."]
+}}"#
+            );
+            if let Ok(rep) = complete_json_with_retry(
+                self.proposer.as_ref(),
+                "You are a rigorous scientific proposer. Output ONLY valid JSON.",
+                &rebuttal_prompt,
+                "proposer rebuttal",
+                cancel.clone(),
+            )
+            .await
+            {
+                rebuttal_points = str_array(&rep, "rebuttal_points");
+            }
+        }
+        let rebuttal_case = if rebuttal_points.is_empty() {
+            "(no rebuttal offered)".to_string()
+        } else {
+            rebuttal_points
+                .iter()
+                .map(|s| format!("  - {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 4. Judge — weigh both sides (and the rebuttal), rule, leave notes.
         let judge_prompt = format!(
-            r#"You are the JUDGE (裁判) of a scientific debate. Weigh the proposer's case against the opponent's critique and rule on the hypothesis.
+            r#"You are the JUDGE (裁判) of a scientific debate. Weigh the proposer's case and rebuttal against the opponent's critique and rule on the hypothesis.
 
 {ctx}
 {evidence_block}
@@ -434,6 +487,9 @@ Output ONLY valid JSON (no markdown fences):
 
 **Opponent's critique:**
 {opponent_case}
+
+**Proposer's rebuttal:**
+{rebuttal_case}
 
 **Your task:**
 1. `verdict` — `accept` (evidence holds), `revise` (plausible but has weaknesses to address), or `reject` (contradictions / no evidence are decisive).
@@ -477,6 +533,7 @@ Output ONLY valid JSON (no markdown fences):
                 .unwrap_or("")
                 .to_string(),
             opponent_recommendation,
+            rebuttal_points,
         })
     }
 
@@ -916,6 +973,7 @@ pub fn persist_debate_report(
                 "confidence_after": v.confidence_after,
                 "supporting_points": v.supporting_points,
                 "contradicting_points": v.contradicting_points,
+                "rebuttal_points": v.rebuttal_points,
                 "refinement_notes": v.refinement_notes,
                 "opponent_recommendation": v.opponent_recommendation,
             })
@@ -939,10 +997,18 @@ pub fn persist_debate_report(
         })
         .collect();
 
+    let mut comparison = serde_json::to_value(&outcome.comparison)
+        .unwrap_or(serde_json::Value::Null);
+    // Alias consumed by the report generator (`strongest_hypothesis`);
+    // the canonical field remains `strongest_id`.
+    if let Some(id) = outcome.comparison.strongest_id {
+        comparison["strongest_hypothesis"] = serde_json::json!(id.to_string());
+    }
+
     let report = serde_json::json!({
         "rounds": outcome.rounds,
         "per_hypothesis": per,
-        "comparison": outcome.comparison,
+        "comparison": comparison,
         "refined": refined,
     });
 
@@ -1188,6 +1254,7 @@ mod tests {
                 confidence_after: 0.9,
                 refinement_notes: "".into(),
                 opponent_recommendation: None,
+                rebuttal_points: vec![],
             }],
             comparison: CrossComparison { strongest_id: Some(id), ..Default::default() },
             refined: vec![hyp(id, "APOE drives AD", 0.8, d, g)],

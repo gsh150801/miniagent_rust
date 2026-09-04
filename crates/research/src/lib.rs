@@ -515,8 +515,13 @@ impl ProjectManifest {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
         md.push_str("## 5. 假说辩论与裁决\n\n");
         if let Some(ref report) = debate_value {
-            if let Some(rounds) = report.get("rounds").and_then(|v| v.as_array()) {
-                md.push_str(&format!("共 **{}** 轮交叉质询。\n\n", rounds.len()));
+            // `rounds` is a count (integer); legacy fixtures may still write
+            // an array — accept either.
+            let rounds_count = report
+                .get("rounds")
+                .and_then(|v| v.as_u64().map(|n| n as usize).or_else(|| v.as_array().map(|a| a.len())));
+            if let Some(n) = rounds_count {
+                md.push_str(&format!("共 **{n}** 轮交叉质询（正方立论 → 反方驳论 → 正方 rebuttal → 裁判裁决，另加跨假说对比与精炼轮）。\n\n"));
             }
             if let Some(per) = report.get("per_hypothesis").and_then(|v| v.as_array()) {
                 md.push_str("### 5.1 各假说裁决\n\n");
@@ -547,6 +552,7 @@ impl ProjectManifest {
                     ));
                     push_bullets(&mut md, "**支持要点**", ph.get("supporting_points"));
                     push_bullets(&mut md, "**反对要点**", ph.get("contradicting_points"));
+                    push_bullets(&mut md, "**正方 rebuttal**", ph.get("rebuttal_points"));
                     if let Some(notes) = ph.get("refinement_notes").and_then(|v| v.as_str()) {
                         if !notes.is_empty() {
                             md.push_str(&format!("**精炼说明**：\n\n{}\n\n", notes));
@@ -1133,8 +1139,14 @@ fn extract_paper_meta(p: &serde_json::Value) -> (String, String, Option<String>)
 }
 
 /// Pull a title out of the `<n>. <journal block>... <title>.` blob format
-/// that legacy `papers.json` writes.
+/// that legacy `papers.json` writes. The XML-based efetch fetcher writes a
+/// structured record instead, whose title is the `Title: ...` line.
 fn extract_title_from_text(text: &str) -> String {
+    let trimmed = text.trim_start();
+    // Structured record form: "Title: <title>\nYear: ...\nAbstract: ..."
+    if let Some(rest) = trimmed.strip_prefix("Title: ") {
+        return rest.lines().next().unwrap_or(rest).trim().to_string();
+    }
     // Strip leading numbering: "12. <text>"
     let trimmed = text.trim_start();
     let after_num = trimmed
