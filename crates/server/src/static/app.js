@@ -832,11 +832,9 @@ function renderHistory(msg) {
     for (const so of msg.stage_outputs) {
       if (so.stage === 'subtask' && so.summary) {
         restoreSubtask(so.summary);
-      } else if (so.stage && so.summary && PIPELINE_PHASES[so.stage] && !planStageNames.has(so.stage)) {
-        trackPhase(so.stage, 'completed', { summary: so.summary.response_preview || '' });
-      } else if (so.stage && so.summary) {
-        showStageOutput(so.stage, so.summary);
       }
+      // 阶段级 stage_output（explore/clarify/plan/dispatch/evaluate…）
+      // 不重播为中间面板卡——用户只需要具体操作（worker 工具事件）。
     }
   }
 
@@ -1102,6 +1100,7 @@ function elapsedStr() {
 
 // ── Stages ──
 function showPlan(workflow, stages) {
+  // pills 更新（顶部条），阶段卡片不插入聊天流。
   const el = document.getElementById('stagePills');
   el.innerHTML = '';
   for (const s of stages) {
@@ -1111,7 +1110,7 @@ function showPlan(workflow, stages) {
     pill.textContent = s.name;
     el.appendChild(pill);
   }
-
+  return;
   hideWelcome();
   // 阶段卡片不再插入聊天流（用户反馈：探索/澄清/规划/执行/评估等
   // 阶段卡片是噪音）。右侧 Progress 视图仍完整展示计划与状态。
@@ -1475,19 +1474,8 @@ function trackPhase(stage, status, data) {
   const planStageNames = new Set((currentPlan?.stages || []).map(s => s.name));
   const summary = data && typeof data.summary === 'string' ? data.summary : null;
   if (planStageNames.has(stage)) {
-    // Research 模式：plan 内阶段也有丰富的执行详情（per-task 进度、三方
-    // 裁决、GEO 下载……）。不进 Pipeline Phases 列表（避免与 Workflow
-    // Stages 重复），但渲染中间面板执行卡——长时间运行不再是黑盒。
-    if (currentPlan?.workflow === 'research' && (summary || status !== 'pending')) {
-      upsertExecCard('ph-' + stage, {
-        title: `${PIPELINE_PHASES[stage] || stage}`,
-        role: stage,
-        status,
-        preview: mdPlain(summary || '', 140),
-        bodyHtml: summary ? md(summary) : '',
-        meta: '',
-      });
-    }
+    // Plan 内阶段的状态变化只更新 pills / 右侧 Progress 视图——中间面板
+    // 不再显示阶段卡（用户反馈：探索/澄清/规划/执行/评估是噪音）。
     return;
   }
   let p = phases.find(x => x.name === stage);
@@ -1498,15 +1486,7 @@ function trackPhase(stage, status, data) {
   p.status = status;
   p.ts = Date.now();
   if (summary) p.summary = summary;
-  // Execution summary card in the middle panel (expandable).
-  upsertExecCard('ph-' + stage, {
-    title: `${p.label || stage}`,
-    role: stage,
-    status,
-    preview: mdPlain(summary || '', 140),
-    bodyHtml: summary ? md(summary) : '',
-    meta: '',
-  });
+  // 非 plan 阶段（如 steer）也不生成中间面板卡。
 }
 
 // Insert-or-update one subtask in the todo list + its execution card.

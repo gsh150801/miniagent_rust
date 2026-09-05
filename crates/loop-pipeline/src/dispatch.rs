@@ -519,6 +519,12 @@ impl PipelineStage for DispatchStage {
                     "wave": wave_idx + 1,
                 }));
 
+                // P-前端改进：worker 内部工具事件透传（读/写/编辑/搜索/
+                // 命令等逐条实时展示为中间面板操作卡）。通过共享 Agent 的
+                // event sender 广播，前端 handleAgentEvent 已有处理路径。
+                // agent.run_with_loop 内部自动发出 tool_call_requested/
+                // completed 事件（Agent::run_with_loop → emit_event）。
+
                 let task = (*task).clone();
                 let agent = ctx.agent.clone();
                 let cancel = cancel.child_token();
