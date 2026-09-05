@@ -36,26 +36,46 @@ fn upstream_context(task: &TaskUnit, result_map: &std::collections::HashMap<Stri
     if task.depends_on.is_empty() {
         return String::new();
     }
-    let items: Vec<String> = task
-        .depends_on
-        .iter()
-        .filter_map(|dep| result_map.get(dep))
-        .filter(|r| r.success && !r.output.trim().is_empty())
-        .map(|r| {
-            format!(
-                "### {}（上游任务输出摘要）\n{}",
-                r.task_id,
-                preview_chars(r.output.trim(), 3000)
-            )
-        })
-        .collect();
-    if items.is_empty() {
+    let mut ok_items: Vec<String> = Vec::new();
+    let mut failed_deps: Vec<String> = Vec::new();
+    for dep in &task.depends_on {
+        match result_map.get(dep) {
+            Some(r) if r.success && !r.output.trim().is_empty() => {
+                ok_items.push(format!(
+                    "### {}（上游任务输出摘要）\n{}",
+                    r.task_id,
+                    preview_chars(r.output.trim(), 3000)
+                ));
+            }
+            Some(r) if !r.success => {
+                failed_deps.push(format!(
+                    "### {}（上游任务失败）\n错误: {}",
+                    r.task_id,
+                    r.error.as_deref().unwrap_or("unknown")
+                ));
+            }
+            _ => {
+                failed_deps.push(format!("### {}（上游任务尚未执行或无结果）", dep));
+            }
+        }
+    }
+    if ok_items.is_empty() && failed_deps.is_empty() {
         return String::new();
     }
-    format!(
-        "\n## Upstream Results (use these; do not redo the upstream work)\n{}\n\n",
-        items.join("\n\n")
-    )
+    let mut out = String::new();
+    if !ok_items.is_empty() {
+        out.push_str(&format!(
+            "\n## Upstream Results (use these; do not redo the upstream work)\n{}\n\n",
+            ok_items.join("\n\n")
+        ));
+    }
+    if !failed_deps.is_empty() {
+        out.push_str(&format!(
+            "\n## Upstream Failures（这些上游任务失败了——基于已有材料产出最优可用结果，\n在报告中如实标注哪些部分因上游失败而缺失）\n{}\n\n",
+            failed_deps.join("\n")
+        ));
+    }
+    out
 }
 
 /// Resolve dependency order: returns groups of task IDs that can run in parallel.

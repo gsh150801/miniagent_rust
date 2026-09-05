@@ -473,6 +473,40 @@ impl LoopPipeline {
                 ctx.state.completed = true;
             }
 
+            // ── P4 审查门：所有任务完成后，经 ask 通道请用户 accept/reject ──
+            // 仅在 evaluate 判定 completed 且 ask_hook 存在时触发一次。
+            // 超时/无回答自动接受（不阻塞无人值守运行）。
+            // reject ⇒ 重置所有子任务状态 → 下一轮重新 dispatch（修复）。
+            // 用户意见通过 steerings 注入下一轮规划。
+            if ctx.state.completed
+                && ctx.state.loop_count >= 1
+                && !ctx.state.task_results.is_empty()
+                && let Some(hook) = ctx.clarify_hook.as_ref()
+            {
+                
+                let question = format!(
+                    "所有任务已完成（{} 个子任务）。接受最终交付物，还是打回重做（可附修改意见）？",
+                    ctx.state.task_results.len()
+                );
+                let opts = vec![
+                    "接受，完成".to_string(),
+                    "打回重做（请补充修改意见）".to_string(),
+                ];
+                let answer = hook(question, opts).await;
+                if !answer.is_empty() && answer.contains("打回") {
+                    tracing::info!(feedback = %answer, "P4 gate: user rejected — forcing repair loop");
+                    ctx.state.completed = false;
+                    ctx.state
+                        .current_task
+                        .push_str(&format!("\n[用户打回] {}", answer));
+                    ctx.state.steerings.push(answer);
+                    // Reset all task results so dispatch re-runs everything
+                    for r in &mut ctx.state.task_results {
+                        r.success = false;
+                    }
+                }
+            }
+
             // ── P3: 评估决定停止后，先消费待处理的用户转向 ──
             // 转向改变"完成"的定义。此处必须"就地消费并注入"（附加到
             // current_task + steerings），只检查不消费会让下一轮顶部的

@@ -518,6 +518,10 @@ impl Agent {
                             cancel.child_token(),
                         )
                         .await;
+                        // P-修复：trim 后立即修补孤立 tool_use/tool_result
+                        // ——压缩窗口可能切在工具序列中间（live: MiniMax
+                        // 400 "tool call result does not follow tool call"）
+                        miniagent_core::message::validate_transcript(history);
 
                         // Break on too many consecutive all-error rounds
                         if consecutive_errors >= self.max_consecutive_errors() {
