@@ -221,23 +221,26 @@ function appendToolOpCard(callId, tool, input) {
   hideWelcome();
   const inner = getInner();
   const card = document.createElement('div');
+  const safeId = 'op_' + callId.replace(/[^a-zA-Z0-9]/g, '');
   card.className = 'op-card collapsed';
-  card.id = 'op_' + callId.replace(/[^a-zA-Z0-9]/g, '');
+  card.id = safeId;
   const paramLine = meta.param
-    ? `<span class="op-param">${escHtml(meta.param.slice(0, 120))}</span>`
+    ? `<span class="op-param">${escHtml(meta.param.slice(0, 140))}</span>`
     : '';
   card.innerHTML = `<div class="op-head">
       <span class="op-chev">&#9654;</span>
       <span class="op-icon">${meta.icon}</span>
       <span class="op-label">${escHtml(meta.label)}</span>
       ${paramLine}
-      <span class="op-status" id="${card.id}_status">&#8987;</span>
+      <span class="op-status" id="${safeId}_status"><span class="op-pending">⠋</span></span>
     </div><div class="op-body" style="display:none"></div>`;
-  card.querySelector('.op-head').addEventListener('click', () => {
+  card.querySelector('.op-head').addEventListener('click', (e) => {
+    if (e.target.closest('.op-status')) return;
     const body = card.querySelector('.op-body');
-    body.style.display = body.style.display === 'none' ? '' : 'none';
-    card.classList.toggle('collapsed');
-    card.querySelector('.op-chev').innerHTML = card.classList.contains('collapsed') ? '&#9654;' : '&#9660;';
+    const showing = body.style.display !== 'none';
+    body.style.display = showing ? 'none' : '';
+    card.classList.toggle('collapsed', showing);
+    card.querySelector('.op-chev').innerHTML = showing ? '&#9654;' : '&#9660;';
   });
   inner.appendChild(card);
   scrollBottom();
@@ -245,21 +248,28 @@ function appendToolOpCard(callId, tool, input) {
 }
 
 function fillToolOpResult(callId, tool, output, durationMs, isError) {
-  const card = document.getElementById('op_' + String(callId).replace(/[^a-zA-Z0-9]/g, ''));
+  const safeId = 'op_' + String(callId).replace(/[^a-zA-Z0-9]/g, '');
+  const card = document.getElementById(safeId);
   if (!card) return;
   const status = card.querySelector('.op-status');
-  if (status) status.innerHTML = isError ? '&#9888;' : '&#10003;';
+  if (status) {
+    status.innerHTML = isError
+      ? '<span class="op-err">✗</span>'
+      : '<span class="op-ok">✓</span>';
+  }
   if (durationMs) {
     const d = document.createElement('span');
     d.className = 'op-duration';
-    d.textContent = (durationMs / 1000).toFixed(1) + 's';
+    d.textContent = durationMs >= 1000
+      ? (durationMs / 1000).toFixed(1) + 's'
+      : durationMs + 'ms';
     status?.parentNode?.appendChild(d);
   }
   const body = card.querySelector('.op-body');
   if (!body) return;
-  const text = (output || '').slice(0, 4000);
+  const text = (output || '').slice(0, 6000);
   if (text.trim()) {
-    body.innerHTML = `<div class="op-result">${escHtml(text)}${(output||'').length > 4000 ? '…[截断]' : ''}</div>`;
+    body.innerHTML = `<div class="op-result">${escHtml(text)}${(output||'').length > 6000 ? '\n…[截断]' : ''}</div>`;
   } else {
     body.innerHTML = '<div class="op-result op-empty">（无输出）</div>';
   }
