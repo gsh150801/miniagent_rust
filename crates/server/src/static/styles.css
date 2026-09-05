@@ -327,35 +327,32 @@ input,select,textarea{font-family:inherit;color:inherit}
 .drag-overlay.active{display:flex}
 .drag-overlay .inner{background:var(--bg2);padding:30px 50px;border-radius:var(--radius-lg);text-align:center;color:var(--accent);font-weight:600;font-size:16px;box-shadow:var(--shadow-lg)}
 
-/* ── Preview as Files-pane sub-card (multi-open) ────────────
-   Each opened file renders as a stacked card inside the Files pane,
-   so chat + files + N open previews all coexist. */
-.pv-card{margin:8px 0 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg2);
-  box-shadow:var(--shadow-sm);overflow:hidden}
-.pv-card + .pv-card{margin-top:10px}
-.pv-card-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border);
-  background:var(--bg3);font-size:12.5px}
-.pv-card-head .picon{font-size:14px}
-.pv-card-head .ptitle{font-weight:600;font-size:12.5px;word-break:break-all;flex:1;min-width:0}
-.pv-card-head .pmeta{font-size:10.5px;color:var(--text3);margin-top:1px}
-.pv-card-close{width:24px;height:24px;background:transparent;border:none;font-size:16px;color:var(--text3);
-  border-radius:var(--radius-sm);cursor:pointer}
-.pv-card-close:hover{background:var(--hover);color:var(--text)}
-.pv-card-download{font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--border);
-  border-radius:4px;padding:1px 6px}
-.pv-card-download:hover{background:var(--accent-soft)}
-.pv-card-body{overflow:auto;max-height:480px;padding:12px 14px;font-size:12.5px;line-height:1.55;
-  word-break:break-word;color:var(--text);background:var(--bg2)}
-
-/* ── Preview drawer (deprecated single-instance) ────────────── */
-.preview-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);
-  flex:0 0 auto;background:var(--bg)}
-.preview-head .picon{font-size:16px}
-.preview-head .ptitle{font-weight:600;font-size:13px;word-break:break-all}
-.preview-head .pmeta{font-size:11px;color:var(--text3);margin-top:2px}
-.preview-close{width:28px;height:28px;background:transparent;border:none;font-size:18px;color:var(--text3);border-radius:var(--radius-sm)}
-.preview-close:hover{background:var(--hover);color:var(--text)}
-.preview-body{flex:1;overflow:auto;padding:14px 16px;font-size:13px;line-height:1.6;word-break:break-word;color:var(--text);min-height:0}
+/* ── Files 面板内的浏览器式多标签预览 ─────────────────────── */
+/* 打开预览后 Files 面板变为上下结构：上方文件树（可滚动），
+   下方标签条 + 单一预览区（类浏览器多页面）。 */
+#rpFiles.has-previews{display:flex;flex-direction:column;height:100%;overflow:hidden}
+#rpFiles.has-previews .file-toolbar{flex:0 0 auto}
+#rpFiles.has-previews .ftree{flex:0 1 auto;overflow-y:auto;min-height:80px;max-height:45%;
+  border-bottom:1px solid var(--border);padding-bottom:6px}
+.pv-region{flex:1 1 auto;display:flex;flex-direction:column;min-height:0;margin-top:6px}
+.pv-tabbar{display:flex;align-items:flex-end;gap:2px;overflow-x:auto;flex:0 0 auto;
+  padding:0 2px;border-bottom:1px solid var(--border);scrollbar-width:thin}
+.pv-tab{display:flex;align-items:center;gap:6px;max-width:180px;min-width:90px;
+  padding:6px 8px 6px 10px;cursor:pointer;flex:0 0 auto;
+  font-size:12px;color:var(--text2);
+  border:1px solid transparent;border-bottom:none;border-radius:8px 8px 0 0;
+  white-space:nowrap;user-select:none}
+.pv-tab:hover{background:var(--hover);color:var(--text)}
+.pv-tab.active{background:var(--bg2);color:var(--text);font-weight:600;
+  border-color:var(--border);box-shadow:0 -2px 0 var(--accent) inset}
+.pv-tab-icon{flex:0 0 auto;font-size:12px}
+.pv-tab-title{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.pv-tab-close{flex:0 0 auto;width:16px;height:16px;line-height:14px;padding:0;
+  background:transparent;border:none;border-radius:4px;color:var(--text3);
+  font-size:13px;cursor:pointer;text-align:center}
+.pv-tab-close:hover{background:var(--border);color:var(--text)}
+.pv-view{flex:1 1 auto;overflow:auto;padding:12px 14px;font-size:12.5px;line-height:1.55;
+  word-break:break-word;color:var(--text);background:var(--bg2);min-height:0}
 
 /* ── Toast ──────────────────────────────────────────────────── */
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--text);
@@ -756,9 +753,9 @@ input,select,textarea{font-family:inherit;color:inherit}
 .preview-loading{color:var(--text3);font-size:12.5px}
 .preview-truncated{margin-top:12px;padding:8px 10px;background:var(--yellow-soft);color:var(--yellow);
   border-radius:var(--radius-sm);font-size:11.5px;font-family:var(--font);white-space:normal}
-.preview-body.pv-text{font-family:var(--mono);font-size:12px;white-space:pre-wrap}
-.preview-body.pv-raw{color:var(--text3)}
-.preview-body.rich table{width:100%}
+.preview-body.pv-text,.pv-view.pv-text{font-family:var(--mono);font-size:12px;white-space:pre-wrap}
+.preview-body.pv-raw,.pv-view.pv-raw{color:var(--text3)}
+.preview-body.rich table,.pv-view.rich table{width:100%}
 
 /* ── Responsive ─────────────────────────────────────────────── */
 @media (max-width:900px){
@@ -797,7 +794,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 .msg-ask .msg-bubble{background:linear-gradient(135deg,rgba(255,193,7,.12),rgba(255,193,7,.04));border:1px solid rgba(255,193,7,.35)}
 
 /* ── Notebook preview (.ipynb) ─────────────────────────────── */
-.preview-body.nb-preview { padding: 16px 20px; }
+.preview-body.nb-preview,.pv-view.nb-preview { padding: 16px 20px; }
 .nb-wrap { max-width: 900px; margin: 0 auto; }
 .nb-cell { margin-bottom: 14px; }
 .nb-md {
@@ -837,8 +834,8 @@ input,select,textarea{font-family:inherit;color:inherit}
 .nb-out-html td, .nb-out-html th { border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; }
 .nb-meta { margin-top: 12px; font-size: 11px; color: var(--text-secondary); text-align: center; }
 .nb-empty { color: var(--text-secondary); text-align: center; padding: 24px; }
-.preview-body.pv-image { display: flex; align-items: center; justify-content: center; padding: 20px; }
-.preview-body.pv-image .pv-img { max-width: 100%; max-height: 75vh; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.25); }
+.preview-body.pv-image,.pv-view.pv-image { display: flex; align-items: center; justify-content: center; padding: 20px; }
+.preview-body.pv-image .pv-img,.pv-view.pv-image .pv-img { max-width: 100%; max-height: 75vh; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.25); }
 
 /* ── Hypothesis / debate cards ─────────────────────────────── */
 .hyp-cards-title { font-weight: 600; margin-bottom: 10px; }

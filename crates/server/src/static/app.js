@@ -1861,7 +1861,16 @@ function fmtSize(n) {
 function renderFilesView() {
   const el = document.getElementById('rpFiles');
   if (!el) return;
+  // 任务切换 → 旧任务的预览标签全部作废
+  if (previewsForTask !== null && previewsForTask !== currentTaskId) {
+    openPreviews = [];
+    activePreviewPath = null;
+    previewsForTask = null;
+  }
   if (!currentTaskId) {
+    previewsForTask = null;
+    openPreviews = [];
+    activePreviewPath = null;
     el.innerHTML = `<div class="rp-empty"><div class="icon">&#128193;</div><div>Select a task to browse its output files.</div></div>`;
     return;
   }
@@ -1886,6 +1895,8 @@ function renderFilesView() {
     f.querySelector('.act-download')?.addEventListener('click', () => downloadFile(f.dataset.path));
     f.addEventListener('click', (e) => { if (!e.target.closest('.fact')) openPreview(f.dataset.path); });
   });
+  // innerHTML 重置会清掉预览标签区——按缓存状态重建
+  renderPreviewTabs();
 }
 
 function renderFileNodes(nodes) {
@@ -1914,91 +1925,161 @@ function downloadFile(path) {
   document.body.appendChild(a); a.click(); a.remove();
 }
 
-// Each opened file becomes its own preview card inside the Files pane,
-// stacked so users can open multiple files at once. Closing a card
-// removes only that file's preview.
-async function openPreview(path) {
-  if (!currentTaskId) return;
-  // If this path is already open, focus its card instead of duplicating.
-  const existing = document.querySelector(`.pv-card[data-path="${cssEscape(path)}"]`);
-  if (existing) {
-    existing.scrollIntoView({ block: 'nearest' });
+// ── Files 面板内的浏览器式多标签预览 ──────────────────────────
+// 每个打开的文件是一个标签（左右排列），下方单一预览区显示激活标签的
+// 内容；× 关闭单个标签。渲染好的内容按标签缓存，切换零开销。
+// Provenance 以伪路径 __provenance__ 参与同一标签组。
+let openPreviews = [];        // [{path, title, state:'loading'|'ready'|'error', className, html, truncated}]
+let activePreviewPath = null;
+let previewsForTask = null;   // 标签组归属的任务（切任务时清空）
+
+function previewTabTitle(path) {
+  if (path === '__provenance__') return 'Provenance 溯源';
+  return path.split('/').pop();
+}
+
+function renderPreviewTabs() {
+  const filesPane = document.getElementById('rpFiles');
+  if (!filesPane) return;
+  let region = document.getElementById('pvRegion');
+  if (!openPreviews.length) {
+    if (region) region.remove();
+    filesPane.classList.remove('has-previews');
     return;
   }
-  // Make sure the right panel + Files tab is active so the card is visible.
+  filesPane.classList.add('has-previews');
+  if (!region) {
+    region = document.createElement('div');
+    region.id = 'pvRegion';
+    region.className = 'pv-region';
+    filesPane.appendChild(region);
+  }
+  const tabsHtml = openPreviews.map(t => `
+    <div class="pv-tab${t.path === activePreviewPath ? ' active' : ''}" data-path="${escHtml(t.path)}" title="${escHtml(t.path)}">
+      <span class="pv-tab-icon">${t.path === '__provenance__' ? '🔗' : '📄'}</span>
+      <span class="pv-tab-title">${escHtml(t.title)}</span>
+      <button class="pv-tab-close" data-path="${escHtml(t.path)}" title="Close">×</button>
+    </div>`).join('');
+  const active = openPreviews.find(t => t.path === activePreviewPath) || openPreviews[openPreviews.length - 1];
+  if (active && active.path !== activePreviewPath) activePreviewPath = active.path;
+  let viewHtml = '';
+  if (active) {
+    if (active.state === 'loading') {
+      viewHtml = `<div class="preview-loading"><span class="cursor"></span> Loading…</div>`;
+    } else {
+      viewHtml = active.html || '';
+    }
+  }
+  region.innerHTML = `
+    <div class="pv-tabbar">${tabsHtml}</div>
+    <div class="pv-view ${active && active.state === 'ready' ? active.className || '' : ''}" id="pvView">${viewHtml}</div>
+    ${active && active.state === 'ready' && active.truncated ? `<div class="preview-truncated">Preview truncated (${fmtSize(active.size || 0)} total). Download for full content.</div>` : ''}`;
+  // 标签切换 + 关闭（事件绑定而非内联 onclick，路径含引号也安全）
+  region.querySelectorAll('.pv-tab').forEach(el => {
+    el.addEventListener('click', () => switchPreviewTab(el.dataset.path));
+  });
+  region.querySelectorAll('.pv-tab-close').forEach(el => {
+    el.addEventListener('click', (e) => { e.stopPropagation(); closePreviewTab(el.dataset.path); });
+  });
+  if (active && active.state === 'ready') {
+    const view = document.getElementById('pvView');
+    if (view && (active.className || '').includes('rich')) enhanceRichBody(view);
+  }
+  // 激活标签滚入可视区
+  const activeTab = region.querySelector('.pv-tab.active');
+  if (activeTab) activeTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+function switchPreviewTab(path) {
+  activePreviewPath = path;
+  renderPreviewTabs();
+}
+
+function closePreviewTab(path) {
+  const idx = openPreviews.findIndex(t => t.path === path);
+  if (idx < 0) return;
+  openPreviews.splice(idx, 1);
+  if (activePreviewPath === path) {
+    const next = openPreviews[idx - 1] || openPreviews[idx] || null;
+    activePreviewPath = next ? next.path : null;
+  }
+  renderPreviewTabs();
+}
+
+// 一次性把抓取/渲染结果写入标签缓存并刷新视图。
+function applyPreviewContent(path, state, className, html, extra) {
+  const tab = openPreviews.find(t => t.path === path);
+  if (!tab) return; // 标签已被关闭
+  tab.state = state;
+  tab.className = className || '';
+  tab.html = html || '';
+  if (extra) Object.assign(tab, extra);
+  renderPreviewTabs();
+}
+
+async function openPreview(path) {
+  if (!currentTaskId) return;
+  // 任务切换后旧标签组作废
+  if (previewsForTask !== currentTaskId) {
+    openPreviews = [];
+    activePreviewPath = null;
+    previewsForTask = currentTaskId;
+  }
+  // 已打开 → 激活即可
+  if (openPreviews.some(t => t.path === path)) {
+    activePreviewPath = path;
+    renderPreviewTabs();
+    return;
+  }
   if (document.getElementById('rightPanel').classList.contains('collapsed')) expandRightPanel();
   switchRightTab('files');
 
-  const filesPane = document.getElementById('rpFiles');
-  const card = document.createElement('div');
-  card.className = 'pv-card';
-  card.dataset.path = path;
-  card.innerHTML = `
-    <div class="pv-card-head">
-      <span class="picon">📄</span>
-      <div style="flex:1;min-width:0">
-        <div class="ptitle">${escHtml(path.split('/').pop())}</div>
-        <div class="pmeta">${escHtml(path)}</div>
-      </div>
-      <a class="pv-card-download" href="/api/download/${currentTaskId}/${encodeURIComponent(path)}" download title="Download">⬇</a>
-      <button class="pv-card-close" title="Close" onclick="this.closest('.pv-card')?.remove()">×</button>
-    </div>
-    <div class="pv-card-body"><div class="preview-loading"><span class="cursor"></span> Loading…</div></div>`;
-  // Insert AFTER the file tree (so file list stays at top, previews stack below).
-  filesPane.appendChild(card);
-  card.scrollIntoView({ block: 'nearest' });
+  const tab = { path, title: previewTabTitle(path), state: 'loading', className: '', html: '' };
+  openPreviews.push(tab);
+  activePreviewPath = path;
+  renderPreviewTabs();
 
-  const body = card.querySelector('.pv-card-body');
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/preview/${encodeURIComponent(path)}`);
     const data = await resp.json();
     if (!data.preview) {
-      body.className = 'pv-card-body pv-raw';
-      body.innerHTML = `Binary file (${fmtSize(data.size)}).<br>Use download to access it.`;
+      applyPreviewContent(path, 'ready', 'pv-raw',
+        `Binary file (${fmtSize(data.size)}).<br>Use download to access it.`);
       return;
     }
     const ext = (data.ext || '').toLowerCase();
+    let className = '', html = '';
     if (['png','jpg','jpeg','gif','svg','webp'].includes(ext)) {
       // 图片（notebook 图表、管线绘图）经 raw 路由内联渲染。
-      body.className = 'pv-card-body pv-image';
-      body.innerHTML = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;
-      return;
-    }
-    if (ext === 'ipynb') {
-      body.className = 'pv-card-body rich nb-preview';
-      const html = renderNotebook(data.content);
-      if (html === null) {
-        body.className = 'pv-card-body pv-text';
-        body.textContent = prettyJson(data.content);
+      className = 'pv-image';
+      html = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;
+    } else if (ext === 'ipynb') {
+      const rendered = renderNotebook(data.content);
+      if (rendered === null) {
+        className = 'pv-text';
+        html = escHtml(prettyJson(data.content));
       } else {
-        body.innerHTML = html;
-        enhanceRichBody(body);
+        className = 'rich nb-preview';
+        html = rendered;
       }
-      return;
-    }
-    if (ext === 'md') {
-      body.className = 'pv-card-body rich md-preview';
-      body.innerHTML = md(data.content);
-      enhanceRichBody(body);
+    } else if (ext === 'md') {
+      className = 'rich md-preview';
+      html = md(data.content);
     } else if (ext === 'json') {
-      body.className = 'pv-card-body pv-text';
-      body.textContent = prettyJson(data.content);
+      className = 'pv-text';
+      html = escHtml(prettyJson(data.content));
     } else if (ext === 'csv' || ext === 'tsv') {
-      body.className = 'pv-card-body rich';
-      body.innerHTML = csvToTable(data.content, ext === 'tsv' ? '\t' : ',');
+      className = 'rich';
+      html = csvToTable(data.content, ext === 'tsv' ? '\t' : ',');
     } else {
-      body.className = 'pv-card-body pv-text';
-      body.textContent = data.content;
+      className = 'pv-text';
+      html = escHtml(data.content);
     }
-    if (data.truncated) {
-      const note = document.createElement('div');
-      note.className = 'preview-truncated';
-      note.textContent = `Preview truncated (${fmtSize(data.size)} total). Download for full content.`;
-      body.appendChild(note);
-    }
+    applyPreviewContent(path, 'ready', className, html, {
+      truncated: !!data.truncated, size: data.size,
+    });
   } catch(err) {
-    body.className = 'pv-card-body pv-raw';
-    body.innerHTML = `Failed to load preview: ${escHtml(err.message)}`;
+    applyPreviewContent(path, 'error', 'pv-raw', `Failed to load preview: ${escHtml(err.message)}`);
   }
 }
 
@@ -2006,16 +2087,6 @@ async function openPreview(path) {
 function cssEscape(s) {
   if (window.CSS && window.CSS.escape) return window.CSS.escape(s);
   return String(s).replace(/["\\]/g, '\\$&');
-}
-
-// Close a single preview card by path (also exposed on the × button).
-function closePreview(path) {
-  if (!path) {
-    document.querySelectorAll('.pv-card').forEach(c => c.remove());
-    return;
-  }
-  const card = document.querySelector(`.pv-card[data-path="${cssEscape(path)}"]`);
-  if (card) card.remove();
 }
 
 function prettyJson(s) {
@@ -2233,45 +2304,38 @@ function showValidationCards(plans, container) {
 // 脚本/输入输出哈希、conda 环境、seed、git commit、repair 历史。
 async function viewProvenance() {
   if (!currentTaskId) return;
-  // Provenance also renders as a Files-pane preview card (the special
-  // PROVENANCE pseudo-path avoids colliding with a real file preview).
+  // Provenance 以伪路径作为 Files 面板内的一个标签打开。
   const PROVENANCE = '__provenance__';
-  const existing = document.querySelector(`.pv-card[data-path="${cssEscape(PROVENANCE)}"]`);
-  if (existing) { existing.scrollIntoView({ block: 'nearest' }); return; }
+  if (previewsForTask !== currentTaskId) {
+    openPreviews = [];
+    activePreviewPath = null;
+    previewsForTask = currentTaskId;
+  }
+  if (openPreviews.some(t => t.path === PROVENANCE)) {
+    activePreviewPath = PROVENANCE;
+    renderPreviewTabs();
+    return;
+  }
   if (document.getElementById('rightPanel').classList.contains('collapsed')) expandRightPanel();
   switchRightTab('files');
 
-  const filesPane = document.getElementById('rpFiles');
-  const card = document.createElement('div');
-  card.className = 'pv-card';
-  card.dataset.path = PROVENANCE;
-  card.innerHTML = `
-    <div class="pv-card-head">
-      <span class="picon">🔗</span>
-      <div style="flex:1;min-width:0">
-        <div class="ptitle">Provenance 溯源</div>
-        <div class="pmeta">${escHtml(currentTaskId)}</div>
-      </div>
-      <button class="pv-card-close" title="Close" onclick="this.closest('.pv-card')?.remove()">×</button>
-    </div>
-    <div class="pv-card-body rich"><div class="preview-loading"><span class="cursor"></span> Loading provenance…</div></div>`;
-  filesPane.appendChild(card);
-  card.scrollIntoView({ block: 'nearest' });
+  openPreviews.push({ path: PROVENANCE, title: previewTabTitle(PROVENANCE), state: 'loading', className: '', html: '' });
+  activePreviewPath = PROVENANCE;
+  renderPreviewTabs();
 
-  const body = card.querySelector('.pv-card-body');
   try {
     const resp = await fetch(`/api/provenance/${currentTaskId}`);
     const data = await resp.json();
     if (data.error) {
-      body.innerHTML = `<div class="pv-empty">${escHtml(data.error)}</div>`;
+      applyPreviewContent(PROVENANCE, 'ready', '', `<div class="pv-empty">${escHtml(data.error)}</div>`);
       return;
     }
     const records = Array.isArray(data.records) ? data.records : [];
     if (!records.length) {
-      body.innerHTML = `<div class="pv-empty">No provenance records found.</div>`;
+      applyPreviewContent(PROVENANCE, 'ready', '', `<div class="pv-empty">No provenance records found.</div>`);
       return;
     }
-    body.innerHTML = records.map((r, i) => {
+    const html = records.map((r, i) => {
       const rec = r.provenance || r.record || {};
       const kv = (k) => rec[k] !== undefined && rec[k] !== null && `${rec[k]}`.length
         ? `<div class="pv-kv"><span class="pv-k">${escHtml(k)}</span><span class="pv-v"><code>${escHtml(typeof rec[k] === 'string' ? rec[k] : JSON.stringify(rec[k]))}</code></span></div>` : '';
@@ -2284,8 +2348,9 @@ async function viewProvenance() {
         ${kv('inputs')}${kv('outputs')}${kv('package_versions')}${repairs}
       </details>`;
     }).join('');
+    applyPreviewContent(PROVENANCE, 'ready', 'rich', html);
   } catch (err) {
-    body.innerHTML = `<div class="pv-empty">Failed to load provenance: ${escHtml(err.message)}</div>`;
+    applyPreviewContent(PROVENANCE, 'ready', '', `<div class="pv-empty">Failed to load provenance: ${escHtml(err.message)}</div>`);
   }
 }
 
