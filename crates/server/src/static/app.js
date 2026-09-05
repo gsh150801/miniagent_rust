@@ -1914,39 +1914,61 @@ function downloadFile(path) {
   document.body.appendChild(a); a.click(); a.remove();
 }
 
+// Each opened file becomes its own preview card inside the Files pane,
+// stacked so users can open multiple files at once. Closing a card
+// removes only that file's preview.
 async function openPreview(path) {
   if (!currentTaskId) return;
-  const overlay = document.getElementById('previewOverlay');
-  const body = document.getElementById('previewBody');
-  const title = document.getElementById('previewTitle');
-  const meta = document.getElementById('previewMeta');
-  const dl = document.getElementById('previewDownload');
-  title.textContent = path.split('/').pop();
-  meta.textContent = path;
-  dl.onclick = () => downloadFile(path);
-  body.className = 'preview-body';
-  body.innerHTML = `<div class="preview-loading"><span class="cursor"></span> Loading…</div>`;
-  overlay.classList.add('active');
+  // If this path is already open, focus its card instead of duplicating.
+  const existing = document.querySelector(`.pv-card[data-path="${cssEscape(path)}"]`);
+  if (existing) {
+    existing.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  // Make sure the right panel + Files tab is active so the card is visible.
+  if (document.getElementById('rightPanel').classList.contains('collapsed')) expandRightPanel();
+  switchRightTab('files');
+
+  const filesPane = document.getElementById('rpFiles');
+  const card = document.createElement('div');
+  card.className = 'pv-card';
+  card.dataset.path = path;
+  card.innerHTML = `
+    <div class="pv-card-head">
+      <span class="picon">📄</span>
+      <div style="flex:1;min-width:0">
+        <div class="ptitle">${escHtml(path.split('/').pop())}</div>
+        <div class="pmeta">${escHtml(path)}</div>
+      </div>
+      <a class="pv-card-download" href="/api/download/${currentTaskId}/${encodeURIComponent(path)}" download title="Download">⬇</a>
+      <button class="pv-card-close" title="Close" onclick="this.closest('.pv-card')?.remove()">×</button>
+    </div>
+    <div class="pv-card-body"><div class="preview-loading"><span class="cursor"></span> Loading…</div></div>`;
+  // Insert AFTER the file tree (so file list stays at top, previews stack below).
+  filesPane.appendChild(card);
+  card.scrollIntoView({ block: 'nearest' });
+
+  const body = card.querySelector('.pv-card-body');
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/preview/${encodeURIComponent(path)}`);
     const data = await resp.json();
     if (!data.preview) {
-      body.className = 'preview-body pv-raw';
+      body.className = 'pv-card-body pv-raw';
       body.innerHTML = `Binary file (${fmtSize(data.size)}).<br>Use download to access it.`;
       return;
     }
     const ext = (data.ext || '').toLowerCase();
     if (['png','jpg','jpeg','gif','svg','webp'].includes(ext)) {
       // 图片（notebook 图表、管线绘图）经 raw 路由内联渲染。
-      body.className = 'preview-body pv-image';
+      body.className = 'pv-card-body pv-image';
       body.innerHTML = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;
       return;
     }
     if (ext === 'ipynb') {
-      body.className = 'preview-body rich nb-preview';
+      body.className = 'pv-card-body rich nb-preview';
       const html = renderNotebook(data.content);
       if (html === null) {
-        body.className = 'preview-body pv-text';
+        body.className = 'pv-card-body pv-text';
         body.textContent = prettyJson(data.content);
       } else {
         body.innerHTML = html;
@@ -1955,17 +1977,17 @@ async function openPreview(path) {
       return;
     }
     if (ext === 'md') {
-      body.className = 'preview-body rich md-preview';
+      body.className = 'pv-card-body rich md-preview';
       body.innerHTML = md(data.content);
       enhanceRichBody(body);
     } else if (ext === 'json') {
-      body.className = 'preview-body pv-text';
+      body.className = 'pv-card-body pv-text';
       body.textContent = prettyJson(data.content);
     } else if (ext === 'csv' || ext === 'tsv') {
-      body.className = 'preview-body rich';
+      body.className = 'pv-card-body rich';
       body.innerHTML = csvToTable(data.content, ext === 'tsv' ? '\t' : ',');
     } else {
-      body.className = 'preview-body pv-text';
+      body.className = 'pv-card-body pv-text';
       body.textContent = data.content;
     }
     if (data.truncated) {
@@ -1975,11 +1997,26 @@ async function openPreview(path) {
       body.appendChild(note);
     }
   } catch(err) {
-    body.className = 'preview-body pv-raw';
+    body.className = 'pv-card-body pv-raw';
     body.innerHTML = `Failed to load preview: ${escHtml(err.message)}`;
   }
 }
-function closePreview() { document.getElementById('previewOverlay').classList.remove('active'); }
+
+// CSS.escape polyfill: ids/selectors with special chars need escaping.
+function cssEscape(s) {
+  if (window.CSS && window.CSS.escape) return window.CSS.escape(s);
+  return String(s).replace(/["\\]/g, '\\$&');
+}
+
+// Close a single preview card by path (also exposed on the × button).
+function closePreview(path) {
+  if (!path) {
+    document.querySelectorAll('.pv-card').forEach(c => c.remove());
+    return;
+  }
+  const card = document.querySelector(`.pv-card[data-path="${cssEscape(path)}"]`);
+  if (card) card.remove();
+}
 
 function prettyJson(s) {
   try { return JSON.stringify(JSON.parse(s), null, 2); }
@@ -2196,17 +2233,32 @@ function showValidationCards(plans, container) {
 // 脚本/输入输出哈希、conda 环境、seed、git commit、repair 历史。
 async function viewProvenance() {
   if (!currentTaskId) return;
-  const overlay = document.getElementById('previewOverlay');
-  const body = document.getElementById('previewBody');
-  const title = document.getElementById('previewTitle');
-  const meta = document.getElementById('previewMeta');
-  const dl = document.getElementById('previewDownload');
-  title.textContent = 'Provenance 溯源';
-  meta.textContent = currentTaskId;
-  dl.onclick = null;
-  body.className = 'preview-body rich';
-  body.innerHTML = `<div class="preview-loading"><span class="cursor"></span> Loading provenance…</div>`;
-  overlay.classList.add('active');
+  // Provenance also renders as a Files-pane preview card (the special
+  // PROVENANCE pseudo-path avoids colliding with a real file preview).
+  const PROVENANCE = '__provenance__';
+  const existing = document.querySelector(`.pv-card[data-path="${cssEscape(PROVENANCE)}"]`);
+  if (existing) { existing.scrollIntoView({ block: 'nearest' }); return; }
+  if (document.getElementById('rightPanel').classList.contains('collapsed')) expandRightPanel();
+  switchRightTab('files');
+
+  const filesPane = document.getElementById('rpFiles');
+  const card = document.createElement('div');
+  card.className = 'pv-card';
+  card.dataset.path = PROVENANCE;
+  card.innerHTML = `
+    <div class="pv-card-head">
+      <span class="picon">🔗</span>
+      <div style="flex:1;min-width:0">
+        <div class="ptitle">Provenance 溯源</div>
+        <div class="pmeta">${escHtml(currentTaskId)}</div>
+      </div>
+      <button class="pv-card-close" title="Close" onclick="this.closest('.pv-card')?.remove()">×</button>
+    </div>
+    <div class="pv-card-body rich"><div class="preview-loading"><span class="cursor"></span> Loading provenance…</div></div>`;
+  filesPane.appendChild(card);
+  card.scrollIntoView({ block: 'nearest' });
+
+  const body = card.querySelector('.pv-card-body');
   try {
     const resp = await fetch(`/api/provenance/${currentTaskId}`);
     const data = await resp.json();

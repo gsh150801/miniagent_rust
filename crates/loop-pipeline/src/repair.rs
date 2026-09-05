@@ -199,6 +199,13 @@ Task ID: {task_id}
             all_analyses.push(analysis);
         }
 
+        // Root-cause digest computed BEFORE the analyses are moved into the
+        // repair state below (the summary block still needs them).
+        let causes: Vec<String> = all_analyses
+            .iter()
+            .map(|a| format!("{}: {}", a.failed_task_id, a.root_cause))
+            .collect();
+
         let mut state = ctx.state.clone();
         state.repair_analyses.extend(all_analyses);
 
@@ -220,18 +227,13 @@ Task ID: {task_id}
         Ok(StageOutput {
             updated_state: state,
             new_messages: messages,
-            summary: {
-                let causes: Vec<String> = all_analyses.iter()
-                    .map(|a| format!("{}: {}", a.failed_task_id, a.root_cause))
-                    .collect();
-                format!(
-                    "修复分析：{} 个失败任务。\n{}\n重探索: {}，重规划: {}。",
-                    failed_results.len(),
-                    causes.join("\n"),
-                    if has_re_explore { "需要" } else { "不需要" },
-                    if has_re_plan { "需要" } else { "不需要" },
-                )
-            },
+            summary: format!(
+                "修复分析：{} 个失败任务。\n{}\n重探索: {}，重规划: {}。",
+                failed_results.len(),
+                causes.join("\n"),
+                if has_re_explore { "需要" } else { "不需要" },
+                if has_re_plan { "需要" } else { "不需要" },
+            ),
         })
     }
 }

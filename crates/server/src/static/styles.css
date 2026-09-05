@@ -327,19 +327,35 @@ input,select,textarea{font-family:inherit;color:inherit}
 .drag-overlay.active{display:flex}
 .drag-overlay .inner{background:var(--bg2);padding:30px 50px;border-radius:var(--radius-lg);text-align:center;color:var(--accent);font-weight:600;font-size:16px;box-shadow:var(--shadow-lg)}
 
-/* ── Preview drawer ─────────────────────────────────────────── */
-.preview-overlay{position:fixed;inset:0;background:rgba(20,24,50,.35);display:none;z-index:40;
-  justify-content:flex-end;backdrop-filter:blur(2px)}
-.preview-overlay.active{display:flex}
-.preview-drawer{width:min(720px,90vw);height:100%;background:var(--bg2);display:flex;flex-direction:column;
-  box-shadow:var(--shadow-lg)}
-.preview-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border)}
-.preview-head .picon{font-size:18px}
-.preview-head .ptitle{font-weight:600;font-size:14px;word-break:break-all}
+/* ── Preview as Files-pane sub-card (multi-open) ────────────
+   Each opened file renders as a stacked card inside the Files pane,
+   so chat + files + N open previews all coexist. */
+.pv-card{margin:8px 0 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg2);
+  box-shadow:var(--shadow-sm);overflow:hidden}
+.pv-card + .pv-card{margin-top:10px}
+.pv-card-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border);
+  background:var(--bg3);font-size:12.5px}
+.pv-card-head .picon{font-size:14px}
+.pv-card-head .ptitle{font-weight:600;font-size:12.5px;word-break:break-all;flex:1;min-width:0}
+.pv-card-head .pmeta{font-size:10.5px;color:var(--text3);margin-top:1px}
+.pv-card-close{width:24px;height:24px;background:transparent;border:none;font-size:16px;color:var(--text3);
+  border-radius:var(--radius-sm);cursor:pointer}
+.pv-card-close:hover{background:var(--hover);color:var(--text)}
+.pv-card-download{font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--border);
+  border-radius:4px;padding:1px 6px}
+.pv-card-download:hover{background:var(--accent-soft)}
+.pv-card-body{overflow:auto;max-height:480px;padding:12px 14px;font-size:12.5px;line-height:1.55;
+  word-break:break-word;color:var(--text);background:var(--bg2)}
+
+/* ── Preview drawer (deprecated single-instance) ────────────── */
+.preview-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);
+  flex:0 0 auto;background:var(--bg)}
+.preview-head .picon{font-size:16px}
+.preview-head .ptitle{font-weight:600;font-size:13px;word-break:break-all}
 .preview-head .pmeta{font-size:11px;color:var(--text3);margin-top:2px}
-.preview-close{width:30px;height:30px;background:transparent;border:none;font-size:20px;color:var(--text3);border-radius:var(--radius-sm)}
+.preview-close{width:28px;height:28px;background:transparent;border:none;font-size:18px;color:var(--text3);border-radius:var(--radius-sm)}
 .preview-close:hover{background:var(--hover);color:var(--text)}
-.preview-body{flex:1;overflow:auto;padding:16px 18px;font-size:13px;line-height:1.6;word-break:break-word;color:var(--text)}
+.preview-body{flex:1;overflow:auto;padding:14px 16px;font-size:13px;line-height:1.6;word-break:break-word;color:var(--text);min-height:0}
 
 /* ── Toast ──────────────────────────────────────────────────── */
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--text);

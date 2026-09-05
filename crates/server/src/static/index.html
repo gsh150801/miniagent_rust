@@ -112,7 +112,7 @@
       <button class="rp-tab active" data-tab="progress" onclick="switchRightTab('progress')">📊 Progress</button>
       <button class="rp-tab" data-tab="files" onclick="switchRightTab('files')">📁 Files</button>
     </div>
-    <div class="rp-content">
+    <div class="rp-content" id="rpContent">
       <div id="rpProgress"></div>
       <div id="rpGoal" style="display:none"></div>
 
@@ -128,23 +128,6 @@
   <div class="inner">
     <div style="font-size:40px">📄</div>
     <p>Drop files here</p>
-  </div>
-</div>
-
-<!-- ── Preview drawer ──────────────────────────────────────── -->
-<div class="preview-overlay" id="previewOverlay" onclick="if(event.target===this)closePreview()">
-  <div class="preview-drawer">
-    <div class="preview-head">
-      <span class="picon">📄</span>
-      <div style="flex:1;min-width:0">
-        <div class="ptitle" id="previewTitle"></div>
-        <div class="pmeta" id="previewMeta"></div>
-      </div>
-      <button class="btn-header" onclick="document.getElementById('previewDownload').click()" title="Download" style="width:30px;height:30px;font-size:13px">⬇</button>
-      <button class="preview-close" onclick="closePreview()" title="Close">×</button>
-    </div>
-    <div class="preview-body" id="previewBody"></div>
-    <a id="previewDownload" style="display:none"></a>
   </div>
 </div>
 
