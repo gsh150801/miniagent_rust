@@ -65,8 +65,17 @@ input,select,textarea{font-family:inherit;color:inherit}
 /* ── Layout ─────────────────────────────────────────────────── */
 .app{display:flex;height:100vh;overflow:hidden}
 
+/* ── 左右栏拖拽调宽分隔条 ─────────────────────────────────── */
+.grip{width:5px;flex:0 0 5px;cursor:col-resize;background:transparent;position:relative;z-index:5;
+  touch-action:none}
+.grip::after{content:'';position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);
+  background:transparent;transition:background .12s}
+.grip:hover::after,.grip.dragging::after{background:var(--accent)}
+body.panel-dragging{cursor:col-resize;user-select:none}
+body.panel-dragging .sidebar,body.panel-dragging .right-panel{transition:none}
+
 /* ── Sidebar ────────────────────────────────────────────────── */
-.sidebar{width:260px;background:var(--sidebar-bg);border-right:1px solid var(--border);
+.sidebar{width:var(--sidebar-w,260px);background:var(--sidebar-bg);border-right:1px solid var(--border);
   display:flex;flex-direction:column;flex-shrink:0;transition:width .18s ease}
 .ftree-dir.collapsed>.ftree-children{display:none}
 .ftree-dir .chevron{display:inline-block;transition:transform .15s ease}
@@ -293,7 +302,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 .btn-send:disabled{background:var(--bg4);color:var(--text3);cursor:not-allowed;transform:none}
 
 /* ── Right panel ────────────────────────────────────────────── */
-.right-panel{width:320px;background:var(--sidebar-bg);border-left:1px solid var(--border);
+.right-panel{width:var(--rightpanel-w,320px);background:var(--sidebar-bg);border-left:1px solid var(--border);
   display:flex;flex-direction:column;flex-shrink:0}
 .right-panel.collapsed{width:0;border-left:none;overflow:hidden}
 .rp-tabs{display:flex;border-bottom:1px solid var(--border);background:var(--bg2)}
@@ -761,6 +770,7 @@ input,select,textarea{font-family:inherit;color:inherit}
 @media (max-width:900px){
   .sidebar,.right-panel{position:absolute;z-index:35;height:100%}
   .sidebar{left:0}.right-panel{right:0}
+  .grip{display:none}
   .chat-header .ct-titles h3{font-size:13px}
   .model-chip .mc-name{max-width:80px}
   .stage-pills{max-width:35%}
@@ -953,3 +963,28 @@ details.hyp-sec summary { cursor: pointer; font-size: 12px; color: var(--text-se
 
 /* ── Trace: research manifest events ──────────────────────── */
 .trace-manifest-msg { font-size: 12px; padding: 2px 0 6px; line-height: 1.5; word-break: break-word; }
+
+/* ── 操作卡（工具调用流）——参考 Claude Code 截图效果 ── */
+.op-card{margin:4px 0;border:1px solid var(--border,#8883);border-radius:8px;background:var(--bg-primary,#fff);overflow:hidden;font-size:13px;transition:border-color .15s}
+.op-card:hover{border-color:var(--border-hover,#8886)}
+.op-card.is-error{border-color:#e74c3c55}
+.op-head{display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;user-select:none;min-height:20px}
+.op-chev{opacity:.45;font-size:9px;transition:transform .15s;flex-shrink:0}
+.op-card:not(.collapsed) .op-chev{transform:rotate(90deg)}
+.op-icon{opacity:.7;flex-shrink:0}
+.op-label{font-weight:500;flex-shrink:0}
+.op-param{flex:1;opacity:.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px}
+.op-status{margin-left:auto;flex-shrink:0;font-size:13px}
+.op-status .op-ok{color:#27ae60}
+.op-status .op-err{color:#e74c3c}
+.op-status .op-pending{opacity:.4;animation:spin1s 1s linear infinite;display:inline-block}
+@keyframes spin1s{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.op-duration{opacity:.45;font-size:11px;margin-left:4px;flex-shrink:0}
+.op-body{padding:0 12px 10px 28px;border-top:1px solid var(--border,#8882)}
+.op-body .op-result{white-space:pre-wrap;word-break:break-word;max-height:400px;overflow:auto;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px;line-height:1.5;background:var(--bg-code,rgba(127,127,127,.06));border-radius:6px;padding:8px;margin-top:6px}
+.op-body .op-empty{opacity:.4;font-style:italic}
+
+/* 澄清反问卡 */
+.msg-ask .ask-question{font-weight:600;margin-bottom:6px}
+.msg-ask .ask-answer{margin-top:6px;padding:6px 10px;background:rgba(39,174,96,.08);border-radius:6px;border-left:3px solid #27ae60}
+.msg-ask.answered{opacity:.75}

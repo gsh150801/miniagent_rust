@@ -182,23 +182,37 @@ const liveToolOps = new Map(); // call_id -> {el, body, tool}
 // 操作中文名 + 参数行（收起态显示"操作 + 关键参数"）
 function toolOpDisplay(tool, input) {
   const val = (k) => {
-    if (!input) return '';
-    const v = input[k] ?? input[k === 'command' ? 'command' : k];
-    return typeof v === 'string' ? v : (v ? JSON.stringify(v) : '');
+    if (!input || typeof input !== 'object') return '';
+    const v = input[k];
+    return typeof v === 'string' ? v : (v != null ? JSON.stringify(v) : '');
   };
+  const icon_terminal = '&#128194;'; // 📄 terminal icon
+  const icon_search = '&#128270;';   // 🔎 magnifier
+  const icon_edit = '&#9998;';       // ✎ pencil
+  const icon_globe = '&#127760;';    // 🌐 globe
+  const icon_gear = '&#9881;';       // ⚙ gear
   switch (tool) {
-    case 'read':    return { icon: '&#128196;', label: '读取文件', param: val('path') || val('file') };
-    case 'write':   return { icon: '&#9997;',   label: '写入文件', param: val('path') || val('file') };
-    case 'edit':    return { icon: '&#9997;',   label: '编辑文件', param: val('path') || val('file') };
-    case 'bash':    return { icon: '&#128187;', label: '执行命令', param: val('command') };
+    case 'read':    return { icon: icon_edit, label: '读取', param: val('path') || val('file') };
+    case 'write':   return { icon: icon_edit, label: '写入', param: val('path') || val('file') };
+    case 'edit':    return { icon: icon_edit, label: '编辑', param: val('path') || val('file') };
+    case 'bash':    return { icon: icon_terminal, label: '终端', param: val('command') };
+    case 'conda':   return { icon: icon_terminal, label: 'Conda', param: val('command') || val('env') };
     case 'web_search':
-    case 'search':  return { icon: '&#128269;', label: '网络搜索', param: val('query') };
-    case 'web_fetch': return { icon: '&#127760;', label: '抓取网页', param: val('url') };
-    case 'pubmed_search': return { icon: '&#128269;', label: 'PubMed 检索', param: val('query') };
-    case 'citation_check': return { icon: '&#128269;', label: '引用核验', param: '报告全文' };
-    case 'glob':    return { icon: '&#128269;', label: '文件匹配', param: val('pattern') };
-    case 'grep':    return { icon: '&#128269;', label: '内容搜索', param: val('pattern') };
-    default:        return { icon: '&#128295;', label: tool, param: summarizeInput(input) };
+    case 'search':  return { icon: icon_search, label: '搜索', param: val('query') };
+    case 'web_fetch': return { icon: icon_globe, label: '抓取', param: val('url') };
+    case 'pubmed_search': return { icon: icon_search, label: 'PubMed', param: val('query') };
+    case 'patent_search': return { icon: icon_search, label: '专利检索', param: val('query') };
+    case 'clinical_trials_search': return { icon: icon_search, label: '临床试验', param: val('query') };
+    case 'geo_search': return { icon: icon_search, label: 'GEO 检索', param: val('query') };
+    case 'opentargets': return { icon: icon_search, label: 'OpenTargets', param: val('query') || val('efo_id') };
+    case 'enrichr': return { icon: icon_search, label: 'Enrichr', param: val('genes','').slice(0,60) };
+    case 'uniprot': return { icon: icon_search, label: 'UniProt', param: val('gene') };
+    case 'citation_check': return { icon: icon_search, label: '引用核验', param: '报告全文' };
+    case 'glob':    return { icon: icon_search, label: '文件匹配', param: val('pattern') };
+    case 'grep':    return { icon: icon_search, label: '内容搜索', param: val('pattern') };
+    case 'git_tool': return { icon: icon_terminal, label: 'Git', param: val('command') };
+    case 'notebook_edit': return { icon: icon_edit, label: 'Notebook', param: val('path') };
+    default:        return { icon: icon_gear, label: tool, param: summarizeInput(input) };
   }
 }
 
@@ -315,6 +329,72 @@ function expandSidebar() {
 }
 function toggleSidebarMobile() {
   document.getElementById('sidebar').classList.toggle('open');
+}
+
+// ── 左右栏拖拽调宽 ──────────────────────────────────────────
+// 宽度持久化到 localStorage；从折叠态直接拖出手柄即恢复面板。
+const PANEL_LIMITS = {
+  sidebar:    { min: 180, max: 560, cssVar: '--sidebar-w',   key: 'ma_sidebar_w' },
+  rightPanel: { min: 260, max: 760, cssVar: '--rightpanel-w', key: 'ma_rightpanel_w' },
+};
+
+function applyPanelWidth(panelId, px) {
+  const lim = PANEL_LIMITS[panelId];
+  const w = Math.round(Math.max(lim.min, Math.min(lim.max, px)));
+  document.documentElement.style.setProperty(lim.cssVar, w + 'px');
+  return w;
+}
+
+function restorePanelWidths() {
+  try {
+    const l = Number(localStorage.getItem(PANEL_LIMITS.sidebar.key));
+    if (l > 0) applyPanelWidth('sidebar', l);
+    const r = Number(localStorage.getItem(PANEL_LIMITS.rightPanel.key));
+    if (r > 0) applyPanelWidth('rightPanel', r);
+  } catch { /* localStorage unavailable — defaults apply */ }
+}
+
+function initPanelGrips() {
+  const pairs = [['gripLeft', 'sidebar'], ['gripRight', 'rightPanel']];
+  for (const [gripId, panelId] of pairs) {
+    const grip = document.getElementById(gripId);
+    if (!grip || grip.dataset.wired) continue;
+    grip.dataset.wired = '1';
+    grip.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      grip.classList.add('dragging');
+      document.body.classList.add('panel-dragging');
+      const panel = document.getElementById(panelId);
+      const isRight = panelId === 'rightPanel';
+      const move = (ev) => {
+        const raw = isRight ? (window.innerWidth - ev.clientX) : ev.clientX;
+        const w = applyPanelWidth(panelId, raw);
+        // 从折叠态拖出 = 恢复面板
+        if (panel.classList.contains('collapsed') && w >= PANEL_LIMITS[panelId].min) {
+          panel.classList.remove('collapsed');
+          const reopen = document.getElementById(panelId === 'sidebar' ? 'sidebarReopen' : 'rightReopen');
+          if (reopen) reopen.style.display = 'none';
+        }
+      };
+      const up = () => {
+        grip.classList.remove('dragging');
+        document.body.classList.remove('panel-dragging');
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', up);
+        try {
+          const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue(PANEL_LIMITS[panelId].cssVar)) || 0;
+          if (cur > 0) localStorage.setItem(PANEL_LIMITS[panelId].key, String(cur));
+        } catch { /* ignore */ }
+      };
+      window.addEventListener('mousemove', move);
+      window.addEventListener('mouseup', up);
+    });
+    // 双击手柄恢复默认宽度
+    grip.addEventListener('dblclick', () => {
+      document.documentElement.style.removeProperty(PANEL_LIMITS[panelId].cssVar);
+      try { localStorage.removeItem(PANEL_LIMITS[panelId].key); } catch { /* ignore */ }
+    });
+  }
 }
 
 // ── Tasks ──
@@ -2385,6 +2465,8 @@ function enhanceRichBody(root) {
 }
 
 // ── Init ──
+restorePanelWidths();
+initPanelGrips();
 renderProgressView();
 renderFilesView();
 connect();
