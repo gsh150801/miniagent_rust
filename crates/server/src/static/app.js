@@ -128,8 +128,15 @@ function handleMsg(msg) {
       stopElapsed();
       stageStatus = {};
       liveToolOps.clear();
-      finishStream(msg.task_id, msg.files);
-      syncTaskMeta(msg.task_id, { status: 'completed' });
+      // Failure completions carry status:"failed" with no files — don't mark
+      // the task completed (the list would show a bogus ✓ until refresh).
+      if (msg.status === 'failed') {
+        finishStreamError('任务执行失败（详见服务器日志 / project.json 事件日志）');
+        syncTaskMeta(msg.task_id, { status: 'failed' });
+      } else {
+        finishStream(msg.task_id, msg.files);
+        syncTaskMeta(msg.task_id, { status: 'completed' });
+      }
       renderProgressView();
       break;
     case 'error':
@@ -141,6 +148,21 @@ function handleMsg(msg) {
     case 'tasks':
       tasks = msg.tasks;
       renderTaskList();
+      break;
+    case 'hypotheses':
+      // 结构化假说/辩论卡片（research 管线）：渲染真正的卡片而非 markdown。
+      // 与 plan/progress 相同的任务过滤——切到历史任务时不被新事件污染。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      if (Array.isArray(msg.hypotheses) && msg.hypotheses.length) {
+        showHypothesisCards(msg.hypotheses, null, msg.cross);
+      }
+      break;
+    case 'validation':
+      // 验证计划结构化卡片（目标3）：数据分析任务 + 湿实验方案。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      if (Array.isArray(msg.plans) && msg.plans.length) {
+        showValidationCards(msg.plans);
+      }
       break;
     case 'task_messages': renderHistory(msg); break;
   }
@@ -555,12 +577,23 @@ async function viewTrace(taskId, title) {
   overlay.className = 'confirm-overlay';
   overlay.style.alignItems = 'flex-start';
 
+  // Two entry shapes: agent events ({ts, event:{type,...}}) and research
+  // manifest events ({timestamp, kind, message} — surfaced by /api/trace
+  // from project.json for research runs).
   const eventHtml = events.length === 0
     ? '<p class="mini-empty">No events recorded for this task.</p>'
     : events.map((entry, i) => {
+        if (entry.kind || entry.timestamp) {
+          // research manifest event
+          const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('zh-CN') : '';
+          return `<div class="trace-event">
+            <div class="trace-header"><span class="trace-kind">${escHtml(entry.kind || 'event')}</span><span class="trace-ts">${ts}</span></div>
+            <div class="trace-manifest-msg">${escHtml(String(entry.message ?? ''))}</div>
+          </div>`;
+        }
         const ev = entry.event || {};
         const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString('zh-CN') : '';
-        const kind = ev.kind || 'unknown';
+        const kind = ev.type || 'unknown';
         let detail = '';
         if (ev.tool_name) detail += `<div><b>Tool:</b> ${escHtml(ev.tool_name)}</div>`;
         if (ev.input) detail += `<div class="trace-input"><b>Input:</b> <pre>${escHtml(typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input, null, 2).slice(0, 500))}</pre></div>`;
@@ -635,6 +668,7 @@ function selectTask(id) {
   currentPlan = null;
   activityFeed = [];
   activityStats = { tools: 0, toolErrors: 0, skills: 0, subtasks: 0, iterations: 0 };
+  resultAnchor = null;
   resetSubtaskState();
   renderProgressView();
   renderFilesView();
@@ -708,6 +742,10 @@ function renderHistory(msg) {
   const pills = document.getElementById('stagePills');
   el.innerHTML = '<div class="messages-inner"></div>';
   pills.innerHTML = '';
+  // The result-anchor belongs to the OLD inner — drop it so subsequent
+  // upsertExecCard calls (trackPhase / restoreSubtask / live ops)
+  // re-attach to the freshly-rendered inner instead of orphaning here.
+  resultAnchor = null;
   resetSubtaskState();
   const inner = el.querySelector('.messages-inner');
 
@@ -725,6 +763,16 @@ function renderHistory(msg) {
     for (const m of msg.messages) {
       if (m.role === 'user') {
         inner.appendChild(makeUserBubble(m.content));
+      } else if (m.role === 'hypotheses') {
+        try {
+          const cards = JSON.parse(String(m.content ?? '[]'));
+          if (Array.isArray(cards) && cards.length) showHypothesisCards(cards, inner, m.cross || null);
+        } catch { /* legacy/corrupt entry — skip */ }
+      } else if (m.role === 'validation') {
+        try {
+          const plans = JSON.parse(String(m.content ?? '[]'));
+          if (Array.isArray(plans) && plans.length) showValidationCards(plans, inner);
+        } catch { /* legacy/corrupt entry — skip */ }
       } else if (m.role === 'assistant') {
         const content = String(m.content ?? '');
         if (content.startsWith('❓')) {
@@ -755,11 +803,22 @@ function renderHistory(msg) {
   if (msg.plan && msg.plan.stages) {
     currentPlan = { workflow: msg.plan.workflow, stages: msg.plan.stages };
     showPlan(msg.plan.workflow, msg.plan.stages);
-    // If task completed, mark all pills green
-    const baseStatus = (msg.status === 'failed') ? 'failed' : 'completed';
-    for (const s of msg.plan.stages) {
-      stageStatus[s.name] = baseStatus;
-      updateStagePill(s.name, baseStatus);
+    // Only terminal tasks get a blanket pill status — a RUNNING task must
+    // not show every stage green (reload mid-run painted 8/8 completed).
+    if (msg.status === 'completed' || msg.status === 'failed') {
+      for (const s of msg.plan.stages) {
+        stageStatus[s.name] = msg.status;
+        updateStagePill(s.name, msg.status);
+      }
+    } else {
+      // Running/unknown: derive per-stage state from persisted stage_outputs.
+      const done = new Set((msg.stage_outputs || []).map(o => o.stage));
+      for (const s of msg.plan.stages) {
+        if (done.has(s.name)) {
+          stageStatus[s.name] = 'completed';
+          updateStagePill(s.name, 'completed');
+        }
+      }
     }
   }
 
@@ -1414,8 +1473,23 @@ function handleProgressMsg(msg) {
 // phases — they render in the Workflow Stages tree instead.
 function trackPhase(stage, status, data) {
   const planStageNames = new Set((currentPlan?.stages || []).map(s => s.name));
-  if (planStageNames.has(stage)) return;
   const summary = data && typeof data.summary === 'string' ? data.summary : null;
+  if (planStageNames.has(stage)) {
+    // Research 模式：plan 内阶段也有丰富的执行详情（per-task 进度、三方
+    // 裁决、GEO 下载……）。不进 Pipeline Phases 列表（避免与 Workflow
+    // Stages 重复），但渲染中间面板执行卡——长时间运行不再是黑盒。
+    if (currentPlan?.workflow === 'research' && (summary || status !== 'pending')) {
+      upsertExecCard('ph-' + stage, {
+        title: `${PIPELINE_PHASES[stage] || stage}`,
+        role: stage,
+        status,
+        preview: mdPlain(summary || '', 140),
+        bodyHtml: summary ? md(summary) : '',
+        meta: '',
+      });
+    }
+    return;
+  }
   let p = phases.find(x => x.name === stage);
   if (!p) {
     p = { name: stage, label: PIPELINE_PHASES[stage] || stage, status, summary: null, ts: Date.now() };
@@ -1792,7 +1866,7 @@ async function loadFileTree(taskId) {
   } catch(err) { /* ignore */ }
 }
 
-const FILE_ICONS = { md:'&#128221;', json:'&#128295;', txt:'&#128196;', csv:'&#128202;', tsv:'&#128202;', py:'&#128012;', rs:'&#9881;', js:'&#9881;', html:'&#127760;', css:'&#127912;', log:'&#128221;' };
+const FILE_ICONS = { md:'&#128221;', json:'&#128295;', txt:'&#128196;', csv:'&#128202;', tsv:'&#128202;', py:'&#128012;', rs:'&#9881;', js:'&#9881;', html:'&#127760;', css:'&#127912;', log:'&#128221;', ipynb:'&#129300;', png:'&#127912;', jpg:'&#127912;', jpeg:'&#127912;', svg:'&#127912;', gif:'&#127912;', webp:'&#127912;' };
 function fileIcon(node) {
   if (node.is_dir) return node.name === '.workflow' ? '&#9881;' : '&#128193;';
   return FILE_ICONS[node.ext?.toLowerCase()] || '&#128196;';
@@ -1819,6 +1893,7 @@ function renderFilesView() {
   el.innerHTML = `<div class="file-toolbar">
       <span>Output files</span>
       <span class="count"></span>
+      <button class="btn-refresh" onclick="viewProvenance()" title="Provenance 溯源">&#128279;</button>
       <button class="btn-refresh" onclick="loadFileTree(currentTaskId)" title="Refresh">&#8635;</button>
     </div>
     <div class="ftree">${tree}</div>`;
@@ -1881,6 +1956,24 @@ async function openPreview(path) {
       return;
     }
     const ext = (data.ext || '').toLowerCase();
+    if (['png','jpg','jpeg','gif','svg','webp'].includes(ext)) {
+      // 图片（notebook 图表、管线绘图）经 raw 路由内联渲染。
+      body.className = 'preview-body pv-image';
+      body.innerHTML = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;
+      return;
+    }
+    if (ext === 'ipynb') {
+      body.className = 'preview-body rich nb-preview';
+      const html = renderNotebook(data.content);
+      if (html === null) {
+        body.className = 'preview-body pv-text';
+        body.textContent = prettyJson(data.content);
+      } else {
+        body.innerHTML = html;
+        enhanceRichBody(body);
+      }
+      return;
+    }
     if (ext === 'md') {
       body.className = 'preview-body rich md-preview';
       body.innerHTML = md(data.content);
@@ -1920,6 +2013,248 @@ function csvToTable(text, sep) {
   const head = rows[0].map(c => `<th>${escHtml(c)}</th>`).join('');
   const body = rows.slice(1, 200).map(r => `<tr>${r.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`).join('');
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+// ── Jupyter notebook preview（.ipynb 单元格级渲染）─────────────
+// markdown cell 经 marked 渲染；code cell 显示源码与执行输出
+// （stream 文本、HTML 结果、base64 图片、错误回溯）。
+function nbSource(src) {
+  return Array.isArray(src) ? src.join('') : String(src ?? '');
+}
+
+function renderNotebook(jsonText) {
+  let nb;
+  try { nb = JSON.parse(jsonText); } catch { return null; }
+  if (!nb || !Array.isArray(nb.cells)) return null;
+  const parts = [];
+  for (const cell of nb.cells) {
+    const type = cell.cell_type;
+    const src = nbSource(cell.source);
+    if (type === 'markdown') {
+      parts.push(`<div class="nb-cell nb-md">${md(src)}</div>`);
+      continue;
+    }
+    // code cell: source + outputs
+    let outputsHtml = '';
+    for (const o of (cell.outputs || [])) {
+      const data = o.data || {};
+      if (data && data['image/png']) {
+        outputsHtml += `<div class="nb-out"><img src="data:image/png;base64,${data['image/png']}"></div>`;
+      } else if (data && data['image/svg+xml']) {
+        outputsHtml += `<div class="nb-out"><img src="data:image/svg+xml;utf8,${encodeURIComponent(data['image/svg+xml'])}"></div>`;
+      } else if (data && data['text/html']) {
+        outputsHtml += `<div class="nb-out nb-out-html">${nbSource(data['text/html'])}</div>`;
+      } else if (data && data['text/plain']) {
+        outputsHtml += `<div class="nb-out"><pre>${escHtml(nbSource(data['text/plain']))}</pre></div>`;
+      } else if (o.output_type === 'stream') {
+        outputsHtml += `<div class="nb-out nb-stdout"><pre>${escHtml(nbSource(o.text))}</pre></div>`;
+      } else if (o.output_type === 'error') {
+        outputsHtml += `<div class="nb-out nb-error"><pre>${escHtml((o.traceback || []).join('\n') || (o.ename + ': ' + o.evalue))}</pre></div>`;
+      }
+    }
+    parts.push(`<div class="nb-cell nb-code">
+      <div class="nb-code-src"><span class="nb-lang">In</span><pre>${escHtml(src)}</pre></div>
+      ${outputsHtml ? `<div class="nb-code-out">${outputsHtml}</div>` : ''}
+    </div>`);
+  }
+  const kernel = nb.metadata?.kernelspec?.display_name;
+  return `<div class="nb-wrap">${parts.join('') || '<div class="nb-empty">(empty notebook)</div>'}
+    ${kernel ? `<div class="nb-meta">kernel: ${escHtml(kernel)} · nbformat ${escHtml(String(nb.nbformat ?? ''))}</div>` : ''}</div>`;
+}
+
+// ── 结构化假说/辩论卡片 ────────────────────────────────────────
+// research 管线完成后端会推送 type=hypotheses 事件：每条假说渲染为
+// 结构化卡片（statement/mechanism/置信度条/裁决/支持与反驳要点/
+// rebuttal），支持实时与历史重绘两个入口。
+const VERDICT_META = {
+  accept:    { label: 'Accept', cls: 'ok',    icon: '&#9989;' },
+  revise:    { label: 'Revise', cls: 'warn',  icon: '&#128295;' },
+  reject:    { label: 'Reject', cls: 'err',   icon: '&#10060;' },
+  undebated: { label: 'Undebated', cls: 'idle', icon: '&#128196;' },
+};
+
+function bulletList(items, cls) {
+  if (!Array.isArray(items) || items.length === 0) return '';
+  return `<ul class="hyp-list ${cls || ''}">${items.map(x =>
+    `<li>${escHtml(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')}</ul>`;
+}
+
+function showHypothesisCards(cards, container, cross) {
+  const el = container || document.querySelector('#messages .messages-inner');
+  if (!el) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-ai hyp-cards-msg';
+  const cardsHtml = cards.map((h, i) => {
+    const verdict = VERDICT_META[h.verdict?.toLowerCase()] || VERDICT_META.undebated;
+    const conf = Math.round((h.confidence ?? 0) * 100);
+    const confAfter = (typeof h.confidence_after === 'number')
+      ? Math.round(h.confidence_after * 100) : null;
+    return `<div class="hyp-card verdict-${verdict.cls}">
+      <div class="hyp-head">
+        <span class="hyp-idx">H${i + 1}</span>
+        <span class="hyp-verdict ${verdict.cls}">${verdict.icon} ${verdict.label}</span>
+        <span class="hyp-conf" title="debate confidence">
+          <span class="hyp-conf-bar"><span style="width:${conf}%"></span></span>
+          <span class="hyp-conf-num">${conf}%</span>
+          ${confAfter !== null ? `<span class="hyp-conf-after">&rarr; ${confAfter}%</span>` : ''}
+        </span>
+      </div>
+      <div class="hyp-statement">${escHtml(h.statement || '')}</div>
+      ${h.mechanism ? `<details class="hyp-sec"><summary>Mechanism</summary><div>${md(h.mechanism)}</div></details>` : ''}
+      ${bulletList(h.supporting_points, 'hyp-support') ? `<div class="hyp-sec-title">支持要点</div>${bulletList(h.supporting_points, 'hyp-support')}` : ''}
+      ${bulletList(h.contradicting_points, 'hyp-contrast') ? `<div class="hyp-sec-title">反驳/矛盾</div>${bulletList(h.contradicting_points, 'hyp-contrast')}` : ''}
+      ${bulletList(h.rebuttal_points, 'hyp-rebuttal') ? `<div class="hyp-sec-title">正方 Rebuttal</div>${bulletList(h.rebuttal_points, 'hyp-rebuttal')}` : ''}
+      ${h.refinement_notes ? `<div class="hyp-notes"><span class="hyp-sec-title">Refinement</span>${escHtml(h.refinement_notes)}</div>` : ''}
+    </div>`;
+  }).join('');
+  wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#128300; 致病机理假说（${cards.length} 条，含辩论裁决）</div><div class="hyp-cards">${cardsHtml}</div>${renderCrossComparison(cross, cards)}</div>`;
+  el.appendChild(wrap);
+  scrollBottom();
+}
+
+// ── 辩论交叉比较（judge 的跨假说裁决）──────────────────────────
+// contradictions_between（矛盾对）+ ranking_rationale + 最强假说 +
+// merge_suggestions：假说之间的"证据-矛盾之处的辩论和比较"结论区。
+function hypShortRef(id, cards) {
+  const idx = cards.findIndex(c => c.id === id);
+  return idx >= 0 ? `H${idx + 1}` : (id || '').slice(0, 8);
+}
+
+function renderCrossComparison(cross, cards) {
+  if (!cross) return '';
+  const contradictions = Array.isArray(cross.contradictions) ? cross.contradictions : [];
+  const merges = Array.isArray(cross.merge_suggestions) ? cross.merge_suggestions : [];
+  const rationale = cross.ranking_rationale || '';
+  if (!contradictions.length && !rationale && !cross.strongest && !merges.length) return '';
+  const contraHtml = contradictions.map(c => `
+    <div class="cross-pair">
+      <span class="cross-vs">${escHtml(hypShortRef(c.a?.id, cards))} vs ${escHtml(hypShortRef(c.b?.id, cards))}</span>
+      <span class="cross-reason">${escHtml(c.reason || '')}</span>
+    </div>`).join('');
+  return `<div class="cross-compare">
+    <div class="cross-title">&#9878;&#65039; 交叉比较（跨假说裁决）</div>
+    ${cross.strongest ? `<div class="cross-strongest">&#128170; 最强假说：${escHtml(hypShortRef(cross.strongest.id, cards))} — ${escHtml((cross.strongest.statement || '').slice(0, 160))}</div>` : ''}
+    ${rationale ? `<div class="cross-rationale"><span class="hyp-sec-title">排序依据</span>${escHtml(rationale)}</div>` : ''}
+    ${contraHtml ? `<div class="cross-pairs"><span class="hyp-sec-title">假说间矛盾（${contradictions.length} 对）</span>${contraHtml}</div>` : ''}
+    ${merges.length ? `<div class="cross-merges"><span class="hyp-sec-title">合并/精简建议</span>${bulletList(merges, 'hyp-support')}</div>` : ''}
+  </div>`;
+}
+
+// ── 验证计划卡片（目标3：数据分析任务 + 湿实验方案）─────────────
+// validation 阶段完成后端推送 type=validation 事件：每个假说一张计划卡，
+// DA 任务行显示数据集徽章（GEO accession 等）、统计方法与预期结果；
+// 湿实验协议折叠展示步骤/对照/时间线。
+function datasetBadge(src) {
+  if (!src || typeof src !== 'object') return '';
+  const kind = String(src.kind || '').toUpperCase();
+  const val = src.value || '';
+  const label = kind === 'GEO' && val ? `GEO · ${val}`
+    : kind === 'LOCAL' ? `本地 · ${val}`
+    : kind === 'CUSTOM_URL' ? 'URL'
+    : kind || '';
+  return `<span class="ds-badge ds-${escHtml(String(src.kind || 'other'))}">${escHtml(label)}</span>`;
+}
+
+function showValidationCards(plans, container) {
+  const el = container || document.querySelector('#messages .messages-inner');
+  if (!el) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-ai val-cards-msg';
+  const totalDa = plans.reduce((n, p) => n + (p.data_analysis_tasks?.length || 0), 0);
+  const totalWl = plans.reduce((n, p) => n + (p.wet_lab_protocols?.length || 0), 0);
+  const cardsHtml = plans.map((p) => {
+    const das = Array.isArray(p.data_analysis_tasks) ? p.data_analysis_tasks : [];
+    const wls = Array.isArray(p.wet_lab_protocols) ? p.wet_lab_protocols : [];
+    const daHtml = das.map(t => `
+      <div class="da-task">
+        <div class="da-head">
+          <span class="da-id">${escHtml(t.id || '')}</span>
+          ${datasetBadge(t.dataset_source)}
+          <span class="da-method">${escHtml(t.statistical_method || '')}</span>
+          <span class="da-prio" title="priority">${Math.round((t.priority ?? 0.5) * 100)}%</span>
+        </div>
+        <div class="da-obj">${escHtml(t.objective || '')}</div>
+        <div class="da-meta">
+          ${t.cohort_definition ? `<span><b>队列：</b>${escHtml(t.cohort_definition)}</span>` : ''}
+          ${t.expected_outcome ? `<span><b>预期：</b>${escHtml(t.expected_outcome)}</span>` : ''}
+          ${t.deliverable ? `<span><b>交付：</b>${escHtml(t.deliverable)}</span>` : ''}
+        </div>
+      </div>`).join('');
+    const wlHtml = wls.map(w => `
+      <details class="wl-proto">
+        <summary>
+          <span class="da-id">${escHtml(w.id || '')}</span>
+          <span class="wl-obj">${escHtml(w.objective || '')}</span>
+          ${w.timeline_days ? `<span class="wl-days">${escHtml(String(w.timeline_days))} 天</span>` : ''}
+          <span class="da-prio" title="feasibility">${Math.round((w.feasibility ?? 0.5) * 100)}%</span>
+        </summary>
+        <div class="wl-body">
+          ${bulletList(w.steps, 'wl-steps') ? `<div class="hyp-sec-title">步骤</div>${bulletList(w.steps, 'wl-steps')}` : ''}
+          ${bulletList(w.controls, 'hyp-support') ? `<div class="hyp-sec-title">对照</div>${bulletList(w.controls, 'hyp-support')}` : ''}
+          ${w.expected_outcome ? `<div class="da-meta"><span><b>预期：</b>${escHtml(w.expected_outcome)}</span></div>` : ''}
+          ${bulletList(w.reagents, 'wl-reagents') ? `<div class="hyp-sec-title">试剂</div>${bulletList(w.reagents, 'wl-reagents')}` : ''}
+        </div>
+      </details>`).join('');
+    return `<div class="val-card">
+      <div class="val-head">
+        <span class="val-idx">Plan ${escHtml(String((p.index ?? 0) + 1))}</span>
+        <span class="val-count">${das.length} 数据分析 · ${wls.length} 湿实验</span>
+      </div>
+      ${p.statement ? `<div class="val-statement">${escHtml(p.statement)}</div>` : ''}
+      ${p.rationale ? `<div class="val-rationale">${escHtml(p.rationale)}</div>` : ''}
+      ${daHtml ? `<div class="hyp-sec-title">数据分析任务（可端到端执行）</div><div class="da-list">${daHtml}</div>` : ''}
+      ${wlHtml ? `<div class="hyp-sec-title">湿实验方案</div><div class="wl-list">${wlHtml}</div>` : ''}
+    </div>`;
+  }).join('');
+  wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#129514; 验证任务计划（${plans.length} 个假说 · ${totalDa} 个数据分析任务 · ${totalWl} 个湿实验方案）</div><div class="hyp-cards">${cardsHtml}</div></div>`;
+  el.appendChild(wrap);
+  scrollBottom();
+}
+
+// ── Provenance（溯源审计）面板 ────────────────────────────────
+// 后端 /api/provenance/{task_id} 汇总 analysis/**/provenance.json：
+// 脚本/输入输出哈希、conda 环境、seed、git commit、repair 历史。
+async function viewProvenance() {
+  if (!currentTaskId) return;
+  const overlay = document.getElementById('previewOverlay');
+  const body = document.getElementById('previewBody');
+  const title = document.getElementById('previewTitle');
+  const meta = document.getElementById('previewMeta');
+  const dl = document.getElementById('previewDownload');
+  title.textContent = 'Provenance 溯源';
+  meta.textContent = currentTaskId;
+  dl.onclick = null;
+  body.className = 'preview-body rich';
+  body.innerHTML = `<div class="preview-loading"><span class="cursor"></span> Loading provenance…</div>`;
+  overlay.classList.add('active');
+  try {
+    const resp = await fetch(`/api/provenance/${currentTaskId}`);
+    const data = await resp.json();
+    if (data.error) {
+      body.innerHTML = `<div class="pv-empty">${escHtml(data.error)}</div>`;
+      return;
+    }
+    const records = Array.isArray(data.records) ? data.records : [];
+    if (!records.length) {
+      body.innerHTML = `<div class="pv-empty">No provenance records found.</div>`;
+      return;
+    }
+    body.innerHTML = records.map((r, i) => {
+      const rec = r.provenance || r.record || {};
+      const kv = (k) => rec[k] !== undefined && rec[k] !== null && `${rec[k]}`.length
+        ? `<div class="pv-kv"><span class="pv-k">${escHtml(k)}</span><span class="pv-v"><code>${escHtml(typeof rec[k] === 'string' ? rec[k] : JSON.stringify(rec[k]))}</code></span></div>` : '';
+      const repairs = Array.isArray(rec.repair_history) && rec.repair_history.length
+        ? `<div class="pv-kv"><span class="pv-k">repair_history</span><span class="pv-v">${rec.repair_history.map(x => `<div>&#8594; attempt ${escHtml(String(x.attempt ?? ''))}: ${escHtml(x.action || '')} ${x.error_tail ? `<code>${escHtml(String(x.error_tail).slice(0, 200))}</code>` : ''}</div>`).join('')}</span></div>` : '';
+      return `<details class="pv-rec" ${i === 0 ? 'open' : ''}>
+        <summary>${escHtml(rec.task_id || r.path || `record ${i + 1}`)}</summary>
+        <div class="pv-path">${escHtml(r.path || '')}</div>
+        ${kv('hypothesis_ref')}${kv('script_path')}${kv('script_hash')}${kv('seed')}${kv('conda_env')}${kv('conda_used')}${kv('git_commit')}${kv('exit_code')}${kv('execution_backend')}${kv('notebook_path')}${kv('notebook_executed')}${kv('duration')}
+        ${kv('inputs')}${kv('outputs')}${kv('package_versions')}${repairs}
+      </details>`;
+    }).join('');
+  } catch (err) {
+    body.innerHTML = `<div class="pv-empty">Failed to load provenance: ${escHtml(err.message)}</div>`;
+  }
 }
 
 // ── Helpers ──

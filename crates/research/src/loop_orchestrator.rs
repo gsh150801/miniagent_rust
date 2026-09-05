@@ -91,6 +91,7 @@ pub async fn run_research_in_loop(
     let mut working_query = query.clone();
     let mut clarified_once = false;
     let mut summary_log: Vec<String> = Vec::new();
+    let total_start = std::time::Instant::now();
 
     for (phase, label) in PHASES {
         let phase_start = std::time::Instant::now();
@@ -162,6 +163,11 @@ pub async fn run_research_in_loop(
         // ── Plan: the phase's execution is the plan (deterministic). ──
         println!("   plan: dispatch run_research(stop_after={phase}) — resume skips completed stages");
 
+        // ── 内层重跑循环：P4 审查门打回时，该阶段在同一轮内重新派发 ──
+        // （此前打回只重置了 manifest 阶段却直接前进到下一阶段——重跑从未
+        // 发生。每个阶段最多打回 2 次，避免用户反复打回造成死循环。）
+        let mut rejections = 0usize;
+        loop {
         // ── Dispatch (+ one bounded repair round) ────────────────────
         let mut opts_phase = opts.clone();
         opts_phase.stop_after = Some(phase.to_string());
@@ -207,6 +213,22 @@ pub async fn run_research_in_loop(
                     for u in &adj.unmet {
                         println!("      ⚠ {u}");
                     }
+                    // 三方裁决（advocate→challenger→arbiter）对前端可见：
+                    // 作为该阶段的执行详情推送，多智能体协作过程不再是黑盒。
+                    emit(
+                        phase,
+                        "running",
+                        Some(format!(
+                            "⚖️ 三方裁决（advocate→challenger→arbiter）：{:?} — {}{}",
+                            adj.verdict,
+                            adj.summary.chars().take(120).collect::<String>(),
+                            if adj.unmet.is_empty() {
+                                String::new()
+                            } else {
+                                format!("；未满足项 {} 个", adj.unmet.len())
+                            }
+                        )),
+                    );
                     if adj.verdict == adjudicate::AdjudicationVerdict::Complete || attempt >= 2 {
                         if attempt >= 2
                             && adj.verdict != adjudicate::AdjudicationVerdict::Complete
@@ -251,12 +273,20 @@ pub async fn run_research_in_loop(
             return msg;
         }
 
+        // ── Emit completed BEFORE the gate: structured cards (debated
+        // hypotheses / validation plans) ride the completed event, so the
+        // user decides accept/reject with the actual artifacts in view. ──
+        let dur = phase_start.elapsed().as_secs_f64();
+        println!("┗━━ {label} done in {dur:.1}s\n");
+        emit(phase, "completed", Some(summary.chars().take(200).collect()));
+
         // ── P4 阶段产物审查门：关键阶段完成后请用户 accept/reject ──
         // 仅 gate 假说与验证计划（科研判断密度最高的两个产物）。ask 通道
         // 超时（用户离开）自动视为接受——不阻塞无人值守运行。
         let gated = interactive_gate
             && ask_hook.is_some()
-            && matches!(*phase, "hypotheses" | "validation");
+            && matches!(*phase, "hypotheses" | "validation")
+            && rejections < 2;
         if gated {
             let question = format!(
                 "阶段『{label}』已完成。接受并继续下一阶段，还是打回重做（可在下一条消息附修改意见）？"
@@ -271,9 +301,11 @@ pub async fn run_research_in_loop(
                 println!("   ✅ 审查门：用户接受，继续");
                 summary_log.push(format!("{phase}: accepted"));
             } else {
-                println!("   ↩️ 审查门：用户打回——{answer}");
+                rejections += 1;
+                println!("   ↩️  审查门：用户打回（第 {rejections} 次）——{answer}");
                 summary_log.push(format!("{phase}: rejected ({answer})"));
-                // 打回：重置该阶段与其上游产物阶段，强制重派（resume 语义）
+                // 打回：重置该阶段与其上游产物阶段，内层循环重新派发
+                // （resume 语义：只重跑该阶段的 stages）。
                 let manifest_path = project_dir.join("project.json");
                 if let Ok(raw) = std::fs::read_to_string(&manifest_path)
                     && let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(raw.as_bytes())
@@ -289,26 +321,140 @@ pub async fn run_research_in_loop(
                         let _ = std::fs::write(&manifest_path, json);
                     }
                 }
-                // 用户意见并入工作请求，下一轮重派吸收
+                // 用户意见并入工作请求，重派时吸收
                 working_query.push_str(&format!("\n[用户打回意见] {answer}"));
-                // 该阶段重跑后再次请求审查（gated 阶段重新进入）
+                emit(
+                    phase,
+                    "running",
+                    Some(format!("↩️ 审查门打回（第 {rejections} 次）：重跑本阶段并吸收修改意见")),
+                );
+                continue;
             }
         }
-
-        let dur = phase_start.elapsed().as_secs_f64();
-        println!("┗━━ {label} done in {dur:.1}s\n");
-        emit(phase, "completed", Some(summary.chars().take(200).collect()));
+        break;
+        } // ── 内层重跑循环结束 ──
     }
 
+    let total_dur = total_start.elapsed();
+    println!("\n╔══ Research × Loop Complete ({:.1}s) ═══╗", total_dur.as_secs_f64());
+    let final_summary = build_final_summary(&project_dir, &summary_log, &working_query, total_dur);
+    println!("{final_summary}");
+    final_summary
+}
+
+/// Structured end-of-run summary aggregated from the manifest and phase
+/// artifacts: stage timings, KG scale, hypothesis verdict counts, validation
+/// plans, analysis outcomes. The full narrative lives in `<brief>.md`; this
+/// is the chat-facing digest.
+fn build_final_summary(
+    project_dir: &std::path::Path,
+    summary_log: &[String],
+    working_query: &str,
+    total_dur: std::time::Duration,
+) -> String {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        std::fs::read(project_dir.join(name))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    };
+    let manifest = read_json("project.json").unwrap_or(serde_json::Value::Null);
+
+    // Stage table (name · status · duration).
+    let mut stage_lines = String::new();
+    if let Some(stages) = manifest.get("stages").and_then(|v| v.as_array()) {
+        for s in stages {
+            let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = s.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let icon = match status {
+                "completed" => "✅",
+                "skipped" => "⏭️",
+                _ => "⚠️",
+            };
+            let dur = s
+                .get("duration_secs")
+                .and_then(|v| v.as_f64())
+                .map(|d| format!(" {:.0}s", d))
+                .unwrap_or_default();
+            stage_lines.push_str(&format!("\n| {icon} {name} | `{status}`{dur} |"));
+        }
+    }
+
+    // Hypotheses + debate verdicts.
+    let hyp_count = read_json("hypotheses_refined_full.json")
+        .or_else(|| read_json("hypotheses_full.json"))
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    let mut verdict_counts = std::collections::BTreeMap::new();
+    if let Some(per) = read_json("debate_report.json")
+        .and_then(|d| d.get("per_hypothesis").cloned())
+        .and_then(|v| v.as_array().cloned())
+    {
+        for v in per {
+            let verdict = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("?");
+            *verdict_counts.entry(verdict.to_string()).or_insert(0usize) += 1;
+        }
+    }
+    let verdict_str = if verdict_counts.is_empty() {
+        "未辩论".to_string()
+    } else {
+        verdict_counts
+            .iter()
+            .map(|(k, n)| format!("{k}×{n}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+
+    // Validation plans + analysis outcomes from the manifest.
+    let plan_count = manifest
+        .get("validation_plans")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let analyses = manifest.get("analyses").and_then(|v| v.as_array());
+    let (an_ok, an_fail) = analyses
+        .map(|arr| {
+            (
+                arr.iter().filter(|a| a.get("success").and_then(|s| s.as_bool()) == Some(true)).count(),
+                arr.iter().filter(|a| a.get("success").and_then(|s| s.as_bool()) == Some(false)).count(),
+            )
+        })
+        .unwrap_or((0, 0));
+    let kg_line = manifest
+        .get("kg_stats")
+        .and_then(|k| {
+            let e = k.get("entities").and_then(|v| v.as_u64())?;
+            let r = k.get("relations").and_then(|v| v.as_u64())?;
+            Some(format!("\n| 🕸️ 知识图谱 | {e} 实体 · {r} 关系 |"))
+        })
+        .unwrap_or_default();
+
+    // Papers count from the corpus artifact.
+    let papers = read_json("papers.json")
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+
+    let brief = miniagent_core::paths::sanitize_task_brief(
+        working_query.lines().next().unwrap_or("research"),
+    );
     format!(
-        "# Research × Loop Complete\n\n\
-         - Project directory: `{}`\n\
-         - Subtasks: {} phases × (explore→plan→dispatch→adjudicate→repair)\n\
-         - Outcomes: {}\n\
-         - Audit trail: `project.json`, `run_report.md`, `report_review.json`\n",
-        project_dir.display(),
-        PHASES.len(),
-        summary_log.join("; "),
+        "# Research × Loop 完成（{:.1} 分钟）\n\n\
+         > 面向用户的完整报告：`{brief}.md` · 审计轨迹：`project.json` / `run_report.md` / `report_review.json`\n\n\
+         ## 产物总览\n\
+         | 阶段 | 结果 |\n\
+         |---|---|\n\
+         | 📚 文献语料 | {papers} 篇入库 |{kg_line}\n\
+         | 💡 假说 | {hyp_count} 条（辩论裁决：{verdict_str}） |\n\
+         | 🧪 验证计划 | {plan_count} 份（数据分析任务 + 湿实验方案） |\n\
+         | 📓 数据分析 | 成功 {an_ok} / 失败 {an_fail}（.ipynb + 溯源记录见 analysis/） |\n\n\
+         ## 阶段执行（每子任务 explore→dispatch→三方裁决→repair）\n\
+         | 阶段 | 状态·耗时 |{stage_lines}\n\n\
+         ## 裁决与审查记录\n{}",
+        total_dur.as_secs_f64() / 60.0,
+        summary_log
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
 }
 

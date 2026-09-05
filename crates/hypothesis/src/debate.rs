@@ -550,15 +550,30 @@ Output ONLY valid JSON (no markdown fences):
             .enumerate()
             .map(|(i, h)| {
                 let v = verdicts.get(i);
+                // Full evidence on both sides (bounded) — feeding only the
+                // first contradicting point starved the judge's cross-view.
+                let points = |list: &[String], n: usize, none: &str| {
+                    if list.is_empty() {
+                        none.to_string()
+                    } else {
+                        list.iter()
+                            .take(n)
+                            .map(|p| format!("     · {p}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
                 format!(
-                    "- H{} [id={}]: {}\n   verdict={:?}, confidence_after={:.2}\n   contradictions: {}",
+                    "- H{} [id={}]: {}\n   verdict={:?}, confidence_after={:.2}\n   supporting evidence:\n{}\n   contradictions:\n{}",
                     i + 1,
                     h.id,
                     h.statement,
                     v.map(|x| x.verdict).unwrap_or(Verdict::Revise),
                     v.map(|x| x.confidence_after).unwrap_or(h.confidence),
-                    v.and_then(|x| x.contradicting_points.first().cloned())
-                        .unwrap_or_else(|| "(none)".into()),
+                    v.map(|x| points(&x.supporting_points, 3, "     · (none)"))
+                        .unwrap_or_else(|| "     · (none)".into()),
+                    v.map(|x| points(&x.contradicting_points, 3, "     · (none)"))
+                        .unwrap_or_else(|| "     · (none)".into()),
                 )
             })
             .collect();

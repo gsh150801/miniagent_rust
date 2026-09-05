@@ -624,7 +624,35 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
                 .to_string()
         };
 
-        let resp = complete_code_text(self.provider.as_ref(), &request, cancel.clone()).await?;
+        // Provider-level FAILURE (402 balance exhausted, 429, 5xx, network)
+        // must not kill the task when cross-family fallbacks are wired —
+        // observed live: a 402 aborted script generation while two fallback
+        // vendors sat idle (the fallback below only covered empty output).
+        let resp = match complete_code_text(self.provider.as_ref(), &request, cancel.clone()).await {
+            Ok(r) => r,
+            Err(primary_err) => {
+                let mut rescued: Option<String> = None;
+                for fb in &self.codegen_fallback {
+                    match complete_code_text(fb.as_ref(), &request, cancel.clone()).await {
+                        Ok(r) => {
+                            tracing::warn!(
+                                "primary provider failed ({primary_err}); cross-family fallback produced script ({})",
+                                task.id
+                            );
+                            rescued = Some(r);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("fallback provider also failed ({e}) for {}", task.id);
+                        }
+                    }
+                }
+                match rescued {
+                    Some(r) => r,
+                    None => return Err(primary_err),
+                }
+            }
+        };
         let mut script = to_script(&resp);
 
         // Reasoning models can exhaust the token budget on chain-of-thought
@@ -640,8 +668,24 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             tracing::warn!("script generation {why} ({}), escalating budget/provider", task.id);
             let mut retry = request.clone();
             retry.config.max_tokens = Some(16_384);
-            let mut text =
-                complete_code_text(self.provider.as_ref(), &retry, cancel.clone()).await?;
+            let mut text = match complete_code_text(self.provider.as_ref(), &retry, cancel.clone()).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // Same provider-failure rescue as the first attempt.
+                    let mut out = String::new();
+                    for fb in &self.codegen_fallback {
+                        if let Ok(t) = complete_code_text(fb.as_ref(), &retry, cancel.clone()).await {
+                            tracing::warn!("primary failed on retry ({e}); fallback produced script ({})", task.id);
+                            out = t;
+                            break;
+                        }
+                    }
+                    if out.is_empty() {
+                        return Err(e);
+                    }
+                    out
+                }
+            };
             script = to_script(&text);
             if (script.is_empty() || python_looks_truncated(&script))
                 && !self.codegen_fallback.is_empty()

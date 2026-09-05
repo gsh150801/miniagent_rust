@@ -2493,3 +2493,50 @@ core/kg/loop-pipeline/provider/telemetry/skill/tool/workflow/planning/memory/hyp
 ### 保留决策（有意不动）
 - `memory`（CLI+server 实际接线）、`self-improve` crate（CLI demo + docs/03 设计）、`planning`/`workflow`/`loop-pipeline` 三编排范式（server 三模式入口）。
 - provider 各响应结构体上的 `#[allow(dead_code)]` 字段：建模线上协议格式，删除无收益。
+
+## Round 40: 四目标差距修复——阶段对齐 / 中途结构化卡片 / 分析任务级进度 / 裁决可见
+
+**背景**：对照四大产品目标（性能可追溯 / 假说辩论比较 / 验证计划 / 端到端 notebook 分析）跑基线 e2e（research 模式）后差距分析，前后端同步修复。
+
+### Bug（基线实证）
+- **plan 阶段名不匹配**：server 固定 plan 用 `kg_build/link_prediction/validation_plans`，而管线 emit `kg/prediction/validation` → 3 个 pill 永远 pending、进度条封顶 5/8、trackPhase 重复渲染 Pipeline Phases 行。plan 阶段名统一为管线 PHASES 键。
+- **failed 完成被标记 completed**：`complete status:"failed"` 无条件 `syncTaskMeta completed`，任务列表误显示 ✓。前端按 status 分流。
+- **trace 面板字段错误**：AgentEvent serde tag 是 `type`，viewTrace 渲染 `ev.kind` → 恒 "unknown"；且 research 任务 event_log 恒空。/api/trace 对 research 任务回读 `project.json` 的 append-only `event_log`（ManifestEvent {timestamp,kind,message}），前端统一渲染两种形态。
+- **hypotheses 事件无任务过滤**：切到历史任务时新事件的卡片会污染当前面板。与 plan/progress 一致的 guard。
+
+### 目标 2/3 前端闭环（结构化卡片中途推送）
+- **推送时机**：`emit_hypothesis_cards` 从"整条管线跑完后"提前到 **debate 阶段 completed 即推**（progress 桥内钩子），用户在 validation 审查门前就能看到带裁决的假说；幂等（role:hypotheses 已存在则跳过）。end-of-run 调用保留为兜底。
+- **交叉比较**：`hypotheses` 事件新增 `cross` 字段（debate_report.json → comparison：矛盾对含双方 statement、ranking_rationale、最强假说、merge_suggestions），前端 `renderCrossComparison` 渲染"跨假说裁决"区块。
+- **辩论质量**：`compare()` 输入从"每假说仅第 1 条矛盾点"扩展为支持/矛盾各 ≤3 条完整要点（judge 交叉比较不再信息饥饿）。
+- **验证计划卡片**（新增 `emit_validation_cards` + `validation` WS 事件 + role:validation 持久化回放）：每假说一张卡——rationale、DA 任务（GEO/TCGA/Local 徽章、统计方法、队列、预期、交付、优先级）、湿实验协议（折叠：步骤/对照/试剂/时间线/可行性）。validation 阶段 completed 即推。
+
+### 目标 4 分析执行可见性
+- Phase 8 每个 DA 任务 3 类进度事件：GEO 下载中 / 执行中（方法+目标）/ 结果（成功含 notebook 执行与自修复轮次、dry-run、失败原因）。此前 analysis 阶段 30-55 分钟零事件。
+- Phase 7 每个验证计划生成进度（i/total + 完成计数）。
+- `finalize_task` 产物收集加入 `.png`（图表成为一等交付物）。
+
+### 目标 1 多智能体可见性
+- loop_orchestrator 三方裁决（advocate→challenger→arbiter）结果作为阶段 detail 推送（verdict + 摘要 + 未满足项计数），前端执行卡实时更新——裁决不再是 stdout 黑盒。
+- trackPhase：research 模式下 plan 内阶段携带 summary 时渲染中间面板执行卡（per-task 进度/裁决/GEO 下载可见），不进 Pipeline Phases 列表避免双渲染。
+
+### 验证
+- `cargo build --release` 通过；`cargo test --release -p miniagent-research -p miniagent-hypothesis -p miniagent-server` 44 通过 0 失败。
+- 基线 e2e（帕金森病 α-突触核蛋白×神经炎症，research 模式 WS 驱动）vs 优化后 e2e 对比事件流：pill 8/8、hypotheses/cross/validation 事件、analysis per-task 进度、complete files 含图表。
+
+### 审查门行为修复（P4 打回从未生效）
+- 原实现：用户打回后仅重置 manifest 阶段并记录意见，随后 for 循环直接进入下一阶段——重跑从未发生，"打回重做"名存实亡。
+- 修复：阶段体重构为内层 `loop`——打回时重置该阶段 stages、意见并入工作请求、**同轮重新派发**（resume 只重跑该阶段）；每阶段最多打回 2 次防死循环。
+- 顺序修正：`emit(phase,"completed")` 移到审查门**之前**——结构化卡片（假说裁决/验证计划）随 completed 事件先行推送，用户决策 accept/reject 时能看到实际产物。
+
+### 长程任务硬超时（基线实证致命）
+- 基线 e2e 在分析阶段中途被服务端 60 分钟硬编码超时杀掉（8 个 DA 任务只完成 3.5 个），complete failed 且 files=0——目标 1"支持长程任务"直接不成立。
+- 修复：`RESEARCH_TIMEOUT_SECS`（AppConfig，默认 10800s/3h，.env 可覆盖），超时报错信息提示该变量。
+
+### 供应商故障韧性（402 实证）
+- 基线后验证 run 中途 MiniMax 余额耗尽（402 Insufficient Balance）：AnalysisRunner 脚本生成的跨供应商回退只覆盖"空/截断响应"，API 错误经 `?` 直抛、已接线的 2 个回退供应商闲置未用——任务级进度事件让该退化即时可见。
+- 修复：首次生成与预算重试两处，主供应商**出错**（402/429/5xx/网络）即遍历 codegen fallback 链救援，全部失败才返回原错误。
+
+### renderHistory 假说/验证卡丢失（验证 run 实证）
+- 现象：基线任务切到 verification run（前端实测），消息流只剩 user + 一条空 assistant，5 张假说卡 + 2 张验证卡 + 交叉比较**全部缺失**，仅右侧 pill 树正常。`/api/tasks/{id}` 返回 8 条 messages 含 hypotheses/validation，payload 完整。
+- 根因：模块级 `resultAnchor` 在 `renderHistory` 第 742 行重建 `.messages-inner` 时被孤立引用到旧 inner；后续 `trackPhase/upsertExecCard → ensureResultAnchor` 因 `parentNode === inner` 守护失败转而把**新 anchor** 附加到旧 inner 上，外层 renderHistory 的 `inner` 局部变量被 `getInner()` 重新拉取时为新元素，但所有在循环中 appendChild 的 card（hypotheses/validation）仍挂在已被丢弃的旧 inner 上 → 视觉上消失。
+- 修复：`renderHistory` 和 `selectTask` 在重建 inner 时同步将 `resultAnchor = null`，让后续 upsert 路径走新建逻辑、锚到当前 inner。

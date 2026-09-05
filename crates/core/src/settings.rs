@@ -89,6 +89,12 @@ pub struct AppConfig {
     // ── Server ────────────────────────────────────────────────────
     pub server_host: String,
     pub server_port: u16,
+    /// Wall-clock budget for one server-driven research run. The full
+    /// goals-1..4 pipeline (literature → KG → hypotheses → debate →
+    /// validation plans → GEO downloads → notebook executions) routinely
+    /// exceeds an hour — the old fixed 60-min cap aborted live runs mid
+    /// analysis. Default 3 h, override via `RESEARCH_TIMEOUT_SECS`.
+    pub research_timeout_secs: u64,
 }
 
 impl AppConfig {
@@ -162,6 +168,7 @@ impl AppConfig {
             // ── Server ──
             server_host: Self::var("SERVER_HOST").unwrap_or_else(|| "0.0.0.0".into()),
             server_port: Self::parsed("SERVER_PORT", 3002),
+            research_timeout_secs: Self::parsed("RESEARCH_TIMEOUT_SECS", 3 * 3600),
         }
     }
 

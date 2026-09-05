@@ -177,15 +177,35 @@ async fn trace_handler(
     let task = state.tasks.get(&task_id).map(|t| t.clone());
 
     match task {
-        Some(task) => Json(serde_json::json!({
-            "task_id": task.id,
-            "brief": task.brief,
-            "status": task.status,
-            "created_at": task.created_at,
-            "event_log": task.event_log,
-            "stage_outputs": task.stage_outputs,
-            "message_count": task.messages.len(),
-        })),
+        Some(task) => {
+            // Research runs keep their append-only audit trail in the project
+            // manifest (`project.json` → `event_log`), not in agent events.
+            // Surface it so the trace panel has real content for them.
+            let mut event_log = task.event_log.clone();
+            if event_log.is_empty() {
+                let manifest: Option<serde_json::Value> = std::fs::read(
+                    task.result_dir.join("project.json"),
+                )
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+                if let Some(events) = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("event_log"))
+                    .and_then(|v| v.as_array())
+                {
+                    event_log = events.clone();
+                }
+            }
+            Json(serde_json::json!({
+                "task_id": task.id,
+                "brief": task.brief,
+                "status": task.status,
+                "created_at": task.created_at,
+                "event_log": event_log,
+                "stage_outputs": task.stage_outputs,
+                "message_count": task.messages.len(),
+            }))
+        }
         None => Json(serde_json::json!({
             "error": "task not found",
             "task_id": task_id,
@@ -566,12 +586,22 @@ async fn raw_image_handler(
 /// pipeline artifacts (hypotheses + debate verdicts) and emit a dedicated
 /// `hypotheses` WS event, also persisted into task messages so history
 /// replay re-renders the cards. Emits nothing when the artifacts are absent.
+/// Idempotent: skips when cards were already pushed for this task (the
+/// debate-phase completion hook fires first; the end-of-run call is the
+/// fallback for edge cases like a server restart mid-run).
 async fn emit_hypothesis_cards(
     socket: &Arc<Mutex<WsSink>>,
     state: &AppState,
     task_id: &str,
     task_dir: &std::path::Path,
 ) {
+    if let Some(t) = state.tasks.get(task_id) {
+        if t.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("hypotheses")
+        }) {
+            return;
+        }
+    }
     let read_json = |name: &str| -> Option<serde_json::Value> {
         let bytes = std::fs::read(task_dir.join(name)).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -583,9 +613,22 @@ async fn emit_hypothesis_cards(
     if hyp_list.is_empty() {
         return;
     }
-    let debate = read_json("debate_report.json")
+    let statement_of = |id: &str| -> String {
+        hyp_list
+            .iter()
+            .find(|h| h.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|h| h.get("statement"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(140)
+            .collect()
+    };
+    let debate = read_json("debate_report.json");
+    let per_hyp = debate
+        .as_ref()
         .and_then(|d| d.get("per_hypothesis").cloned());
-    let verdict_by_id: std::collections::HashMap<String, &serde_json::Value> = debate
+    let verdict_by_id: std::collections::HashMap<String, &serde_json::Value> = per_hyp
         .as_ref()
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -635,13 +678,152 @@ async fn emit_hypothesis_cards(
     if cards.is_empty() {
         return;
     }
+    // Cross-hypothesis comparison (judge's post-debate ruling): contradiction
+    // pairs with statements joined in, ranking rationale, strongest pick and
+    // merge suggestions — the debate phase's comparative conclusion.
+    let cross = debate.as_ref().and_then(|d| d.get("comparison")).and_then(|c| {
+        let contradictions = c
+            .get("contradictions_between")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| {
+                        let a = p.get("a").and_then(|v| v.as_str())?;
+                        let b = p.get("b").and_then(|v| v.as_str())?;
+                        Some(serde_json::json!({
+                            "a": { "id": a, "statement": statement_of(a) },
+                            "b": { "id": b, "statement": statement_of(b) },
+                            "reason": p.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if contradictions.is_empty()
+            && c.get("ranking_rationale").and_then(|v| v.as_str()).map_or(true, str::is_empty)
+            && c.get("merge_suggestions").and_then(|v| v.as_array()).map_or(true, Vec::is_empty)
+        {
+            return None;
+        }
+        let strongest_id = c
+            .get("strongest_hypothesis")
+            .or_else(|| c.get("strongest_id"))
+            .and_then(|v| v.as_str());
+        Some(serde_json::json!({
+            "contradictions": contradictions,
+            "ranking_rationale": c.get("ranking_rationale").and_then(|v| v.as_str()).unwrap_or(""),
+            "strongest": strongest_id.map(|id| serde_json::json!({
+                "id": id, "statement": statement_of(id),
+            })),
+            "merge_suggestions": c.get("merge_suggestions").cloned().unwrap_or(serde_json::json!([])),
+        }))
+    });
     let _ = ws_send(socket, serde_json::json!({
         "type": "hypotheses", "task_id": task_id, "hypotheses": cards,
+        "cross": cross,
     })).await;
     // Persist for history replay (renderHistory re-renders role=hypotheses).
     if let Some(mut t) = state.tasks.get_mut(task_id) {
         t.messages.push(serde_json::json!({
             "role": "hypotheses",
+            "content": serde_json::to_string(&cards).unwrap_or_default(),
+            "cross": cross,
+        }));
+    }
+}
+
+/// Push structured validation-plan cards when the validation phase completes:
+/// one card per plan (hypothesis statement, rationale, data-analysis tasks
+/// with dataset badges, wet-lab protocols). Persisted as a `role:"validation"`
+/// message for history replay. Idempotent per task.
+async fn emit_validation_cards(
+    socket: &Arc<Mutex<WsSink>>,
+    state: &AppState,
+    task_id: &str,
+    task_dir: &std::path::Path,
+) {
+    if let Some(t) = state.tasks.get(task_id) {
+        if t.messages
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("validation"))
+        {
+            return;
+        }
+    }
+    // Plan paths come from the auditable manifest (project.json).
+    let manifest: Option<serde_json::Value> = std::fs::read(task_dir.join("project.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let plan_paths: Vec<String> = manifest
+        .as_ref()
+        .and_then(|m| m.get("validation_plans"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if plan_paths.is_empty() {
+        return;
+    }
+    let hyp_by_id: std::collections::HashMap<String, String> = std::fs::read(
+        task_dir.join("hypotheses_refined_full.json")
+            .exists()
+            .then(|| task_dir.join("hypotheses_refined_full.json"))
+            .unwrap_or_else(|| task_dir.join("hypotheses_full.json")),
+    )
+    .ok()
+    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    .and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|h| {
+                    h.get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|id| (id.to_string(), h.get("statement").and_then(|s| s.as_str()).unwrap_or("").to_string()))
+                })
+                .collect()
+        })
+    })
+    .unwrap_or_default();
+
+    let mut cards: Vec<serde_json::Value> = Vec::new();
+    for (idx, rel) in plan_paths.iter().enumerate() {
+        // Manifest records absolute or project-relative paths; accept both.
+        let p = std::path::Path::new(rel);
+        let p = if p.is_absolute() { p.to_path_buf() } else { task_dir.join(rel) };
+        let Ok(plan) = std::fs::read(&p)
+            .map_err(|e| {
+                tracing::warn!(task_id = %task_id, plan = %p.display(), error = %e, "validation plan unreadable");
+            })
+            .and_then(|b| {
+                serde_json::from_slice::<serde_json::Value>(&b).map_err(|e| {
+                    tracing::warn!(task_id = %task_id, plan = %p.display(), error = %e, "validation plan unparseable");
+                })
+            })
+        else {
+            continue;
+        };
+        let hyp_id = plan.get("hypothesis_id").and_then(|v| v.as_str()).unwrap_or("");
+        cards.push(serde_json::json!({
+            "index": idx,
+            "hypothesis_id": hyp_id,
+            "statement": hyp_by_id.get(hyp_id).cloned().unwrap_or_default(),
+            "rationale": plan.get("rationale").and_then(|v| v.as_str()).unwrap_or(""),
+            "data_analysis_tasks": plan.get("data_analysis_tasks").cloned().unwrap_or(serde_json::json!([])),
+            "wet_lab_protocols": plan.get("wet_lab_protocols").cloned().unwrap_or(serde_json::json!([])),
+        }));
+    }
+    if cards.is_empty() {
+        return;
+    }
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "validation", "task_id": task_id, "plans": cards,
+    })).await;
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.messages.push(serde_json::json!({
+            "role": "validation",
             "content": serde_json::to_string(&cards).unwrap_or_default(),
         }));
     }
@@ -1230,24 +1412,26 @@ async fn handle_research_run(
     let cancel = CancellationToken::new();
     state.cancels.insert(task_id.clone(), cancel.clone());
 
-    // Fixed 7-phase plan — the pipeline emits matching stage keys.
+    // Fixed 8-phase plan — stage names MUST match the keys the loop
+    // orchestrator emits (`PHASES` in loop_orchestrator.rs); a mismatch
+    // leaves the pill stuck "pending" and caps the progress bar.
     let plan_stages: Vec<serde_json::Value> = vec![
         serde_json::json!({ "name": "literature", "handler": "research",
             "description": "文献检索：查询翻译 → PubMed 检索 → 摘要获取 → 相关性过滤",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
-        serde_json::json!({ "name": "kg_build", "handler": "research",
+        serde_json::json!({ "name": "kg", "handler": "research",
             "description": "知识图谱：实体/关系抽取 + canonical 合并",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
-        serde_json::json!({ "name": "link_prediction", "handler": "research",
+        serde_json::json!({ "name": "prediction", "handler": "research",
             "description": "链接预测：TransE 嵌入 + 疾病锚定候选外推",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
         serde_json::json!({ "name": "hypotheses", "handler": "research",
             "description": "致病机理假说生成（候选验证 + 机制解释）与排序",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
         serde_json::json!({ "name": "debate", "handler": "research",
-            "description": "假说辩论：证据-矛盾交锋（外部文献证据注入）+ 精炼",
+            "description": "假说辩论：证据-矛盾交锋（外部文献证据注入）+ 交叉比较 + 精炼",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
-        serde_json::json!({ "name": "validation_plans", "handler": "research",
+        serde_json::json!({ "name": "validation", "handler": "research",
             "description": "验证计划：数据分析任务（GEO 数据集落地）+ 湿实验方案",
             "sub_tasks": [], "tools": serde_json::json!([]) }),
         serde_json::json!({ "name": "analysis", "handler": "research",
@@ -1292,6 +1476,7 @@ async fn handle_research_run(
     let sink_cb = Arc::clone(socket);
     let state_cb = state.clone();
     let task_id_cb = task_id.clone();
+    let dir_cb = task_dir.clone();
     let main_rt = tokio::runtime::Handle::current();
     let on_progress: ResearchProgress = Arc::new(move |stage: &str, status: &str, detail: Option<&str>| {
         let payload = serde_json::json!({
@@ -1309,6 +1494,7 @@ async fn handle_research_run(
         let status = status.to_string();
         let detail = detail.map(|d| d.chars().take(400).collect::<String>());
         let task_id_key = task_id_cb.clone();
+        let task_dir_key = dir_cb.clone();
         // Spawn via the captured server-runtime handle: the callback runs on
         // the pipeline's dedicated thread, `Handle::current` there would fail.
         main_rt.spawn(async move {
@@ -1319,6 +1505,15 @@ async fn handle_research_run(
                     "stage": stage,
                     "summary": { "response_preview": detail.unwrap_or_else(|| format!("{stage} phase completed")) },
                 }));
+            }
+            // Mid-run structured cards: push the moment the artifacts land
+            // instead of waiting for the whole pipeline — the user sees the
+            // debated hypotheses before the validation gate asks accept/reject.
+            if status == "completed" && stage == "debate" {
+                emit_hypothesis_cards(&socket, &state, &task_id_key, &task_dir_key).await;
+            }
+            if status == "completed" && stage == "validation" {
+                emit_validation_cards(&socket, &state, &task_id_key, &task_dir_key).await;
             }
         });
     });
@@ -1387,7 +1582,11 @@ async fn handle_research_run(
         let _ = tx.send(summary);
         Ok::<(), String>(())
     });
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3600), join).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(state.config.research_timeout_secs),
+        join,
+    )
+    .await;
 
     state.cancels.remove(&task_id);
 
@@ -1424,7 +1623,10 @@ async fn handle_research_run(
             return;
         }
         Err(_) => {
-            let msg = "research pipeline timed out (60 min)".to_string();
+            let msg = format!(
+                "research pipeline timed out ({} min; raise RESEARCH_TIMEOUT_SECS for heavier corpora)",
+                state.config.research_timeout_secs / 60
+            );
             let _ = ws_send(socket, serde_json::json!({
                 "type": "error", "task_id": &task_id, "message": msg,
             })).await;
@@ -2892,7 +3094,13 @@ async fn finalize_task(
             }
             if ft.is_dir() {
                 collect_artifacts(&path, task_dir, depth + 1, out);
-            } else if name.ends_with(".md") || name.ends_with(".json") || name.ends_with(".ipynb") {
+            } else if name.ends_with(".md")
+                || name.ends_with(".json")
+                || name.ends_with(".ipynb")
+                // Figures (volcano plots, heatmaps, diagnostics) are first-class
+                // deliverables of the analysis phase — download badges for them.
+                || name.ends_with(".png")
+            {
                 if let Ok(rel) = path.strip_prefix(task_dir) {
                     out.push(rel.to_string_lossy().to_string());
                 }

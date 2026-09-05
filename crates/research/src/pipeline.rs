@@ -1638,9 +1638,13 @@ pub async fn run_research(
 
             let mut plans: Vec<(usize, miniagent_hypothesis::Hypothesis, miniagent_hypothesis::ValidationPlan)> =
                 Vec::new();
+            let total_plans = jobs.len();
             for (i, h, job) in jobs {
                 let head_name = kg.get_entity(&h.source_candidate.head).map(|e| e.name.as_str()).unwrap_or("?");
                 let tail_name = kg.get_entity(&h.source_candidate.tail).map(|e| e.name.as_str()).unwrap_or("?");
+                if let Some(cb) = on_progress.as_ref() {
+                    cb("validation", "running", Some(&format!("生成验证计划 {}/{}：{head_name} → {tail_name}", i + 1, total_plans)));
+                }
                 print!("   #{}. {head_name} → {tail_name} validation plan ... ", i + 1);
                 std::io::Write::flush(&mut std::io::stdout()).ok();
                 match job.await {
@@ -1648,6 +1652,9 @@ pub async fn run_research(
                         let n_da = plan.data_analysis_tasks.len();
                         let n_wl = plan.wet_lab_protocols.len();
                         println!("✅ {n_da} data-analysis task(s), {n_wl} wet-lab protocol(s)");
+                        if let Some(cb) = on_progress.as_ref() {
+                            cb("validation", "running", Some(&format!("✅ 计划 {}/{} 完成：{n_da} 个数据分析任务 + {n_wl} 个湿实验方案", i + 1, total_plans)));
+                        }
                         plans.push((i, h, plan));
                     }
                     // Both LLM attempts failed (observed live: a reasoning
@@ -1818,6 +1825,9 @@ pub async fn run_research(
                     && matches!(task.dataset_source, miniagent_hypothesis::DatasetSource::Geo)
                     && let Some(acc) = task.dataset_accession.as_deref().filter(|a| !a.is_empty())
                 {
+                    if let Some(cb) = on_progress.as_ref() {
+                        cb("analysis", "running", Some(&format!("⬇️ {} 下载 GEO 数据集 {acc} …", task.id)));
+                    }
                     match miniagent_analysis::download_geo_series_matrix(
                         acc,
                         &project_abs.join("data"),
@@ -1831,6 +1841,9 @@ pub async fn run_research(
                         }
                         Err(e) => println!("\n      ⚠️  GEO download {acc} failed: {e} (dry-run)"),
                     }
+                }
+                if let Some(cb) = on_progress.as_ref() {
+                    cb("analysis", "running", Some(&format!("▶ {} 执行中：{}（{}）", task.id, task.statistical_method, task.objective.chars().take(80).collect::<String>())));
                 }
                 print!("   ▶ {} [{}] ... ", task.id, task.statistical_method);
                 std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -1846,7 +1859,7 @@ pub async fn run_research(
                             println!("✅ {} output file(s) [{:?}]", res.output_files.len(), res.execution_backend);
                             ok_count += 1;
                         } else {
-                            println!("⚠️  {}", res.error.unwrap_or_default());
+                            println!("⚠️  {}", res.error.clone().unwrap_or_default());
                             fail_count += 1;
                         }
                         let repairs = res.provenance.repair_history.len();
@@ -1857,6 +1870,18 @@ pub async fn run_research(
                         println!("      notebook: {} (executed: {})", res.notebook_path.display(), res.notebook_executed);
                         if let Some(p) = res.provenance_path.as_ref() {
                             println!("      provenance: {}", p.display());
+                        }
+                        if let Some(cb) = on_progress.as_ref() {
+                            let outcome = if res.dry_run {
+                                format!("📝 {} dry-run：脚本 + notebook 已生成（无可执行数据）", task.id)
+                            } else if res.success {
+                                format!("✅ {} 完成：{} 个输出文件，notebook 已{}（{} 轮自修复）",
+                                    task.id, res.output_files.len(),
+                                    if res.notebook_executed { "执行" } else { "生成" }, repairs)
+                            } else {
+                                format!("⚠️ {} 失败：{}", task.id, res.error.as_deref().map(|e| e.chars().take(120).collect::<String>()).unwrap_or_default())
+                            };
+                            cb("analysis", "running", Some(&outcome));
                         }
                         // Unified audit manifest + structured trace log.
                         manifest.record_analysis(crate::AnalysisRef {
@@ -1884,7 +1909,12 @@ pub async fn run_research(
                             "analysis task executed",
                         );
                     }
-                    Err(e) => println!("❌ {e}"),
+                    Err(e) => {
+                        println!("❌ {e}");
+                        if let Some(cb) = on_progress.as_ref() {
+                            cb("analysis", "running", Some(&format!("❌ {} 执行异常：{e}", task.id)));
+                        }
+                    }
                 }
             }
         }
