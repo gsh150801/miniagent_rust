@@ -809,6 +809,41 @@ impl PipelineStage for DispatchStage {
     }
 }
 
+/// Extract the final deliverable from the agent's ReAct history: the last
+/// substantive assistant message (skip transitional narration like
+/// "Let me search…" and empty/thinking-only turns).
+///
+/// The ReAct loop ends when the model returns EndTurn — the last assistant
+/// message at that point IS the final deliverable. Earlier messages are
+/// process narration that must not leak into the report.
+fn extract_final_deliverable(history: &[Message]) -> String {
+    use miniagent_core::message::MessageRole;
+    for msg in history.iter().rev() {
+        if msg.role != MessageRole::Assistant {
+            continue;
+        }
+        let text = miniagent_core::json_util::strip_reasoning_tags(&msg.text_content());
+        let trimmed = text.trim();
+        // Skip empty or pure-transition narration (no substantive content).
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Skip short transitional phrases (< 80 chars, no structure).
+        if trimmed.chars().count() < 80
+            && !trimmed.contains('\n')
+            && (trimmed.starts_with("Let me")
+                || trimmed.starts_with("I'll")
+                || trimmed.starts_with("I will")
+                || trimmed.starts_with("Now let")
+                || trimmed.starts_with("Now I"))
+        {
+            continue;
+        }
+        return trimmed.to_string();
+    }
+    String::new()
+}
+
 /// Execute a single task (tactic layer).
 async fn execute_single_task(
     task: TaskUnit,
@@ -956,11 +991,11 @@ if !bundles.is_empty() {
             // 通用截断信号：模型仍想继续（ToolUse）但迭代预算耗尽——输出
             // 停留在调研中途，交付物从未写出。触发收尾合成兜底。
             let cut_off = !matches!(delta.stop_reason, miniagent_core::event::StopReason::EndTurn);
-            let mut output: String = history.iter()
-                .filter(|m| m.role == miniagent_core::message::MessageRole::Assistant)
-                .map(|m| m.text_content())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            // P-交付物提取：只取最后一条实质性 assistant 回复作为任务输出，
+            // 不拼接全部 assistant 消息——ReAct 循环中每步的"Let me search…"
+            // 过程叙述会混入交付物（live 实测：最终报告混杂了探索叙述、
+            // 引用修复过程与实际报告内容）。
+            let mut output: String = extract_final_deliverable(&history);
 
             // ── 收尾合成兜底 ─────────────────────────────────────────
             // 工具迭代上限触顶时，agent 的输出常停留在思维链中途（结尾是
