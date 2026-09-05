@@ -50,6 +50,11 @@ impl PipelineStage for RepairStage {
                 ))
                 .unwrap_or_default();
 
+            // 此前重试次数（同一 task_id 在 repair_analyses 中已出现的次数）
+            let prev_attempts = ctx.state.repair_analyses.iter()
+                .filter(|a| a.failed_task_id == result.task_id)
+                .count();
+
             let prompt = format!(
                 r#"You are the **Repair Analyst** in a multi-agent pipeline.
 Analyze the failed task below and determine root cause and fix.
@@ -60,6 +65,12 @@ Task ID: {task_id}
 
 ## Error Output
 {error_output}
+
+## Worker Output Preview (what the agent actually produced before failing)
+{output_preview}
+
+## Previous Repair Attempts
+{prev_attempts} — if ≥ 1, the same approach already failed before. You MUST suggest a DIFFERENT strategy (e.g. reduce scope, change search strategy, split into smaller steps, use a different tool).
 
 ## Root Cause Categories
 - **tool_error**: The tool failed or returned unexpected results (retry with different parameters)
@@ -88,6 +99,8 @@ Task ID: {task_id}
                 task_id = result.task_id,
                 task_detail = task_detail,
                 error_output = result.error.as_deref().unwrap_or("No error details"),
+                output_preview = crate::dispatch::preview_chars(&result.output, 2_000),
+                prev_attempts = prev_attempts,
             );
 
             let provider = ctx.agent.pro_provider();
@@ -116,13 +129,16 @@ Task ID: {task_id}
                     let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
 
                     serde_json::from_str::<RepairAnalysis>(&cleaned)
-                        .unwrap_or_else(|_| RepairAnalysis {
-                            failed_task_id: result.task_id.clone(),
-                            root_cause: "Unknown failure".into(),
-                            suggested_fix: "Retry the task".into(),
-                            requires_re_explore: false,
-                            requires_re_plan: false,
-                            suggested_new_approach: None,
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(task_id = %result.task_id, parse_error = %e, "repair JSON parse failed");
+                            RepairAnalysis {
+                                failed_task_id: result.task_id.clone(),
+                                root_cause: format!("解析失败（原始错误: {}）", result.error.as_deref().unwrap_or("unknown")),
+                                suggested_fix: "减少工具迭代次数或缩小任务范围后重试".into(),
+                                requires_re_explore: false,
+                                requires_re_plan: false,
+                                suggested_new_approach: None,
+                            }
                         })
                 }
                 Err(e) => RepairAnalysis {
@@ -204,12 +220,18 @@ Task ID: {task_id}
         Ok(StageOutput {
             updated_state: state,
             new_messages: messages,
-            summary: format!(
-                "Analyzed {} failed tasks. Re-explore: {}, re-plan: {}.",
-                failed_results.len(),
-                if has_re_explore { "yes" } else { "no" },
-                if has_re_plan { "yes" } else { "no" },
-            ),
+            summary: {
+                let causes: Vec<String> = all_analyses.iter()
+                    .map(|a| format!("{}: {}", a.failed_task_id, a.root_cause))
+                    .collect();
+                format!(
+                    "修复分析：{} 个失败任务。\n{}\n重探索: {}，重规划: {}。",
+                    failed_results.len(),
+                    causes.join("\n"),
+                    if has_re_explore { "需要" } else { "不需要" },
+                    if has_re_plan { "需要" } else { "不需要" },
+                )
+            },
         })
     }
 }

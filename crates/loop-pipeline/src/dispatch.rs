@@ -25,7 +25,7 @@ fn emit_task(ctx: &StageContext, status: &str, data: &serde_json::Value) {
 }
 
 /// Truncate a string to at most `max` chars (char-boundary safe) for transport.
-fn preview_chars(s: &str, max: usize) -> String {
+pub fn preview_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
