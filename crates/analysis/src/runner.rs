@@ -318,7 +318,10 @@ impl AnalysisRunner {
                     // outputs (goal 4 deliverable) without blocking success.
                     let (mut notebook_executed, mut backend) = (o.notebook_executed, o.backend);
                     if backend == ExecutionBackend::Python && !notebook_executed {
-                        if let Some(nb) = try_execute_notebook(&notebook_path) {
+                        let env_py = conda_bin
+                            .as_deref()
+                            .and_then(|cb| conda_env_python(cb, &opts.conda_env));
+                        if let Some(nb) = try_execute_notebook(&notebook_path, env_py.as_deref()) {
                             notebook_executed = nb;
                             if nb {
                                 backend = ExecutionBackend::Jupyter;
@@ -446,9 +449,48 @@ impl AnalysisRunner {
         working_dir: &Path,
         cancel: &CancellationToken,
     ) -> Result<ExecOutcome, AgentError> {
-        // Try Jupyter first. Overall wall-clock guard: the per-cell
-        // nbconvert timeout handles hanging cells, but nbconvert itself can
-        // stall (kernel startup, lock files) — 15 min is the hard ceiling.
+        // Try the conda env's own interpreter first (its kernel has the
+        // analysis packages installed); the system `jupyter` is only a
+        // fallback. Overall wall-clock guard: the per-cell nbconvert timeout
+        // handles hanging cells, but nbconvert itself can stall (kernel
+        // startup, lock files) — 15 min is the hard ceiling.
+        let env_py = conda_bin
+            .as_deref()
+            .and_then(|cb| conda_env_python(cb, env));
+        if let Some(py) = &env_py
+            && crate::notebook::ensure_notebook_deps(py)
+        {
+            let nb_path = notebook.to_path_buf();
+            let py = py.clone();
+            let nb_exec = tokio::task::spawn_blocking(move || {
+                crate::notebook::execute_notebook_with(Some(&py), &nb_path, Some(&nb_path), 600)
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(900), nb_exec).await {
+                Ok(Ok(Ok(nb))) if nb.exit_code == 0 => {
+                    return Ok(ExecOutcome {
+                        stdout: nb.stdout,
+                        stderr: nb.stderr,
+                        exit_code: Some(nb.exit_code),
+                        notebook_executed: true,
+                        backend: ExecutionBackend::Jupyter,
+                    });
+                }
+                Ok(Ok(Ok(nb))) => {
+                    tracing::warn!(
+                        task = %script.display(),
+                        "notebook execution via conda env failed (exit {}); falling back",
+                        nb.exit_code
+                    );
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(error = %e, "conda-env notebook execution errored; falling back");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "conda-env notebook task failed; falling back");
+                }
+                Err(_) => tracing::warn!("conda-env notebook execution timed out; falling back"),
+            }
+        }
         if crate::notebook::jupyter_available() {
             let nb_path = notebook.to_path_buf();
             let nb_exec = tokio::task::spawn_blocking(move || {
@@ -1029,12 +1071,43 @@ fn tail_of(s: &str, max_chars: usize) -> String {
 /// Best-effort in-place notebook execution used after a successful .py
 /// fallback run, so the delivered .ipynb carries outputs. Returns whether
 /// the notebook executed.
-fn try_execute_notebook(notebook_path: &Path) -> Option<bool> {
+fn try_execute_notebook(notebook_path: &Path, env_python: Option<&Path>) -> Option<bool> {
+    // Prefer the conda env interpreter: the system `jupyter` binary may be
+    // broken or missing while the env already holds the analysis packages.
+    if let Some(py) = env_python {
+        if crate::notebook::env_can_execute_notebooks(py) {
+            let nb = crate::notebook::execute_notebook_with(Some(py), notebook_path, Some(notebook_path), 600).ok()?;
+            return Some(nb.exit_code == 0);
+        }
+    }
     if !crate::notebook::jupyter_available() {
         return None;
     }
     let nb = crate::notebook::execute_notebook(notebook_path, Some(notebook_path), 600).ok()?;
     Some(nb.exit_code == 0)
+}
+
+/// Resolve the python interpreter of a named conda-family env by parsing
+/// `<conda_bin> env list` output. `None` when the env or its python is
+/// missing.
+fn conda_env_python(conda_bin: &str, env: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new(conda_bin)
+        .args(["env", "list"])
+        .output()
+        .ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.first() != Some(&env) {
+            continue;
+        }
+        if let Some(dir) = tokens.iter().find(|t| t.starts_with('/')) {
+            let py = std::path::Path::new(dir).join("bin/python");
+            if py.is_file() {
+                return Some(py);
+            }
+        }
+    }
+    None
 }
 
 /// Parse the top-level third-party modules imported by a Python script

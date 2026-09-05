@@ -42,13 +42,56 @@ pub fn execute_notebook(
     output_path: Option<&Path>,
     timeout_secs: u64,
 ) -> Result<NotebookResult, AgentError> {
+    execute_notebook_with(Option::<&Path>::None, notebook_path, output_path, timeout_secs)
+}
+
+/// Whether a Python interpreter can execute notebooks in-process
+/// (`import nbclient, ipykernel, nbformat` succeeds).
+pub fn env_can_execute_notebooks(py: &Path) -> bool {
+    std::process::Command::new(py)
+        .args(["-c", "import nbclient, ipykernel, nbformat"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Best-effort install of notebook-execution deps into the environment that
+/// owns `py`. Cheap no-op when the deps are already importable.
+pub fn ensure_notebook_deps(py: &Path) -> bool {
+    if env_can_execute_notebooks(py) {
+        return true;
+    }
+    std::process::Command::new(py)
+        .args([
+            "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+            "nbclient", "ipykernel", "nbformat", "nbconvert",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success() && env_can_execute_notebooks(py))
+        .unwrap_or(false)
+}
+
+/// Execute a notebook with an explicit interpreter: `<py> -m nbconvert …`.
+/// Preferred over the system `jupyter` binary, whose shebang frequently
+/// breaks after interpreter upgrades (observed: homebrew python@3.14
+/// removal left every notebook run silently skipped).
+pub fn execute_notebook_with(
+    interpreter: Option<&Path>,
+    notebook_path: &Path,
+    output_path: Option<&Path>,
+    timeout_secs: u64,
+) -> Result<NotebookResult, AgentError> {
     if !notebook_path.exists() {
         return Err(AgentError::invalid_config(format!(
             "notebook not found: {}",
             notebook_path.display()
         )));
     }
-    if !jupyter_available() {
+    if interpreter.is_none() && !jupyter_available() {
         return Err(AgentError::invalid_config(
             "jupyter is not installed; cannot execute notebook. \
              Install with `pip install jupyter` or export the notebook to a .py script."
@@ -62,9 +105,20 @@ pub fn execute_notebook(
 
     let started = std::time::Instant::now();
     let nbconvert_timeout = timeout_secs.max(1).to_string();
-    let output = std::process::Command::new("jupyter")
+    let mut cmd = match interpreter {
+        Some(py) => {
+            let mut c = std::process::Command::new(py);
+            c.args(["-m", "nbconvert"]);
+            c
+        }
+        None => {
+            let mut c = std::process::Command::new("jupyter");
+            c.arg("nbconvert");
+            c
+        }
+    };
+    let output = cmd
         .args([
-            "nbconvert",
             "--to",
             "notebook",
             "--execute",

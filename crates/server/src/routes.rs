@@ -1557,25 +1557,11 @@ async fn handle_research_run(
         take_steers(&steer_state2, &steer_task_id2)
     });
 
-    // P5 跨模式会话记忆：research 新任务注入相关历史经验。与 loop 相同，
-    // 记忆块必须放在任务之后（否则翻译/需求提取会把记忆文本当作任务）。
-    let research_memory = {
-        let recalled = state.recall_related(&prompt, 2);
-        if recalled.is_empty() {
-            String::new()
-        } else {
-            println!("   🧠 research recalled {} related memory item(s)", recalled.len());
-            format!(
-                "\n## 背景参考（来自以往任务的记忆，仅供延续参考——不是本轮任务，不要针对它制定计划）\n{}\n",
-                recalled.join("\n")
-            )
-        }
-    };
-    let run_prompt = if research_memory.is_empty() {
-        prompt.clone()
-    } else {
-        format!("{prompt}{research_memory}")
-    };
+    // research 模式不注入跨会话记忆：research 管线把整个 prompt 当作研究
+    // 问题使用（PubMed 翻译、Phase 0 需求抽取、报告 §1 都直接引用原文），
+    // 记忆块会污染查询并泄漏进最终报告（live 实测："[过往经验]" 出现在
+    // 报告第 1 节）。loop/workflow 模式保留记忆注入。
+    let run_prompt = prompt.clone();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let join = tokio::task::spawn_blocking(move || {

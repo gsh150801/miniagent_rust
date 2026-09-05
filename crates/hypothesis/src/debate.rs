@@ -182,7 +182,12 @@ impl HypothesisDebater {
             let mut refined = hypotheses.to_vec();
             if v.verdict == Verdict::Revise {
                 refined = self
-                    .refine_batch(&[(refined.into_iter().next().unwrap(), v.clone())], kg, cancel.clone())
+                    .refine_batch(
+                        &[(refined.into_iter().next().unwrap(), v.clone())],
+                        kg,
+                        &evidence,
+                        cancel.clone(),
+                    )
                     .await?;
             } else if v.verdict == Verdict::Reject {
                 refined.clear();
@@ -275,7 +280,10 @@ impl HypothesisDebater {
         // Phase C: refinement failure degrades to "keep the debated originals
         // with updated confidence" (the assembly loop already handles missing
         // refined entries) instead of discarding the whole debate outcome.
-        let mut refined_map = match self.refine_batch(&to_refine, kg, cancel.clone()).await {
+        let mut refined_map = match self
+            .refine_batch(&to_refine, kg, &evidence, cancel.clone())
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
@@ -649,6 +657,7 @@ Output ONLY valid JSON (no markdown fences):
         &self,
         to_refine: &[(Hypothesis, HypothesisVerdict)],
         kg: &KnowledgeGraph,
+        evidence: &std::collections::HashMap<uuid::Uuid, String>,
         cancel: CancellationToken,
     ) -> Result<Vec<Hypothesis>, AgentError> {
         if to_refine.is_empty() {
@@ -657,8 +666,17 @@ Output ONLY valid JSON (no markdown fences):
         let roster: Vec<String> = to_refine
             .iter()
             .map(|(h, v)| {
+                let evidence_block = evidence
+                    .get(&h.id)
+                    .map(|e| {
+                        format!(
+                            "\n   retrieved_evidence (cite these URLs/PMIDs where a point draws on them): {}",
+                            e.chars().take(4000).collect::<String>()
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "- id={}: {}\n   mechanism: {}\n   refinement_notes: {}",
+                    "- id={}: {}\n   mechanism: {}\n   refinement_notes: {}{evidence_block}",
                     h.id,
                     h.statement,
                     h.mechanism.as_deref().unwrap_or("(none)"),
@@ -677,8 +695,8 @@ Output ONLY valid JSON (no markdown fences):
 For EACH hypothesis (keyed by its `id`), output a refined object with:
 - `statement` — the improved, more precise / better-qualified hypothesis.
 - `mechanism` — an updated mechanism.
-- `supporting_evidence` — 1-3 strengthened supporting points.
-- `counter_evidence` — 1-3 acknowledged caveats.
+- `supporting_evidence` — 1-3 strengthened supporting points. When a point draws on the retrieved_evidence above, cite its URL or PMID in parentheses at the end of the point.
+- `counter_evidence` — 1-3 acknowledged caveats (cite URLs/PMIDs where applicable).
 - `confidence` — refined confidence in `[0,1]`.
 
 Output ONLY valid JSON (no markdown fences):
