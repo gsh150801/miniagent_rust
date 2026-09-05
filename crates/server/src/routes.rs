@@ -1076,9 +1076,18 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         }
     }
 
+    // P-断连续跑：WS 断开 ≠ 取消。运行中的任务脱离该连接继续执行
+    // （spawn 的 JoinHandle 直接丢弃，不 abort），事件已写入任务状态
+    // 与任务目录（project.json / metadata.json / compaction_history），
+    // 前端重连后通过 get_task 恢复全部进度。仅当用户显式发 cancel 才
+    // 中止任务。
     if let Some(handle) = running {
-        handle.abort();
-        let _ = handle.await;
+        // tokio::JoinHandle 无 detach —— spawn 一个后台任务 await 它，
+        // 防止 JoinHandle 被 drop 时任务被 abort，同时让管线自然结束。
+        tokio::spawn(async move {
+            let _ = handle.await;
+        });
+        tracing::info!("ws disconnected — running task detached, keeps executing");
     }
 }
 
