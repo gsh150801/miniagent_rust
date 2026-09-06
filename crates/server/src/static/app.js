@@ -1936,7 +1936,7 @@ async function loadFileTree(taskId) {
   } catch(err) { /* ignore */ }
 }
 
-const FILE_ICONS = { md:'&#128221;', json:'&#128295;', txt:'&#128196;', csv:'&#128202;', tsv:'&#128202;', py:'&#128012;', rs:'&#9881;', js:'&#9881;', html:'&#127760;', css:'&#127912;', log:'&#128221;', ipynb:'&#129300;', png:'&#127912;', jpg:'&#127912;', jpeg:'&#127912;', svg:'&#127912;', gif:'&#127912;', webp:'&#127912;' };
+const FILE_ICONS = { md:'&#128221;', json:'&#128295;', txt:'&#128196;', csv:'&#128202;', tsv:'&#128202;', py:'&#128012;', rs:'&#9881;', js:'&#9881;', html:'&#127760;', css:'&#127912;', log:'&#128221;', ipynb:'&#129300;', png:'&#127912;', jpg:'&#127912;', jpeg:'&#127912;', svg:'&#127912;', gif:'&#127912;', webp:'&#127912;' , xlsx:'&#128202;', xls:'&#128202;', xlsm:'&#128202;', xlsb:'&#128202;' };
 function fileIcon(node) {
   if (node.is_dir) return node.name === '.workflow' ? '&#9881;' : '&#128193;';
   return FILE_ICONS[node.ext?.toLowerCase()] || '&#128196;';
@@ -2143,6 +2143,10 @@ async function openPreview(path) {
       // 图片（notebook 图表、管线绘图）经 raw 路由内联渲染。
       className = 'pv-image';
       html = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;
+    } else if (['xlsx','xls','xlsm','xlsb'].includes(ext)) {
+      // Excel：服务端 calamine 解析为行数组；多 sheet 时显示切换标签。
+      className = 'rich pv-sheet';
+      html = renderExcelSheet(data, path);
     } else if (ext === 'ipynb') {
       const rendered = renderNotebook(data.content);
       if (rendered === null) {
@@ -2160,7 +2164,7 @@ async function openPreview(path) {
       html = escHtml(prettyJson(data.content));
     } else if (ext === 'csv' || ext === 'tsv') {
       className = 'rich';
-      html = csvToTable(data.content, ext === 'tsv' ? '\t' : ',');
+      html = delimitedToTable(data.content, ext === 'tsv' ? '\t' : ',', !!data.truncated);
     } else {
       className = 'pv-text';
       html = escHtml(data.content);
@@ -2184,13 +2188,98 @@ function prettyJson(s) {
   catch { return s; }
 }
 
-function csvToTable(text, sep) {
-  const lines = text.trim().split(/\r?\n/).filter(l => l.length);
-  if (!lines.length) return escHtml(text);
-  const rows = lines.map(l => l.split(sep));
+// RFC4180 感知的 CSV/TSV 行解析：处理引号包裹字段、字段内逗号/换行转义。
+// 返回二维数组；`stopOnShortRow` 用于截断文本（最后一行可能被切断）。
+function parseDelimited(text, sep, stopOnShortRow) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  const push = () => { row.push(field); field = ''; };
+  const pushRow = () => { push(); rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"' && field === '') {
+      inQuotes = true;
+    } else if (c === sep) {
+      push();
+    } else if (c === '\n') {
+      pushRow();
+    } else if (c === '\r') {
+      // skip (handled with \n)
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) pushRow();
+  // 截断文本的最后一行可能被 200KB 上限切断（字段数少于表头）→ 丢弃。
+  // 只在调用方声明 truncated 时启用，且只看最后一行，不影响正文字段。
+  if (stopOnShortRow && rows.length > 1
+      && rows[rows.length - 1].length < rows[0].length) {
+    rows.pop();
+  }
+  return rows.filter(r => r.length > 1 || (r[0] ?? '').trim() !== '');
+}
+
+function delimitedToTable(text, sep, truncated) {
+  const rows = parseDelimited(text, sep, !!truncated);
+  if (!rows.length) return '<div class="pv-empty">(empty table)</div>';
   const head = rows[0].map(c => `<th>${escHtml(c)}</th>`).join('');
-  const body = rows.slice(1, 200).map(r => `<tr>${r.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`).join('');
-  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  const body = rows.slice(1, 500).map(r =>
+    `<tr>${rows[0].map((_, j) => `<td>${escHtml(r[j] ?? '')}</td>`).join('')}</tr>`).join('');
+  const note = truncated
+    ? `<div class="preview-truncated">预览截断（仅前 ${Math.min(rows.length - 1, 499)} 行）。下载查看全部。</div>`
+    : '';
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>${note}`;
+}
+
+function csvToTable(text, sep) {
+  return delimitedToTable(text, sep, false);
+}
+
+// ── Excel 预览（服务端 calamine 解析的行数组）──────────────────
+function renderExcelSheet(data, path) {
+  const rows = data.rows || [];
+  if (!rows.length) return '<div class="pv-empty">(empty sheet)</div>';
+  const colCount = Math.max(...rows.map(r => r.length));
+  const head = rows[0].map(c => `<th>${escHtml(c)}</th>`).join('');
+  const body = rows.slice(1, 500).map(r =>
+    `<tr>${Array.from({length: colCount}, (_, j) => `<td>${escHtml(r[j] ?? '')}</td>`).join('')}</tr>`).join('');
+  let notes = '';
+  if (data.truncated_rows || data.truncated_cols) {
+    notes = `<div class="preview-truncated">预览截断：显示前 ${data.max_rows} 行 × ${data.max_cols} 列（实际 ${data.total_rows} 行 × ${data.total_cols} 列）。下载查看全部。</div>`;
+  }
+  const tabs = (data.sheets && data.sheets.length > 1)
+    ? `<div class="pv-sheettabs">${data.sheets.map(n =>
+        `<button class="pv-sheettab${n === data.sheet ? ' active' : ''}" onclick="previewSwitchSheet('${cssEscape(path)}', '${escHtml(n).replace(/'/g, '&#39;')}')">${escHtml(n)}</button>`).join('')}</div>`
+    : '';
+  return `${tabs}<div class="pv-sheetmeta">${escHtml(data.sheet)} · ${data.total_rows} 行 × ${data.total_cols} 列</div>
+    <div class="pv-sheettable"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${notes}`;
+}
+
+// 切换 Excel sheet：原位重取并重绘同一预览标签。
+async function previewSwitchSheet(path, sheet) {
+  const tab = openPreviews.find(t => t.path === path);
+  if (!tab) return;
+  applyPreviewContent(path, 'loading', '', 'Loading sheet…');
+  try {
+    const resp = await fetch(`/api/tasks/${currentTaskId}/preview/${encodeURIComponent(path)}?sheet=${encodeURIComponent(sheet)}`);
+    const data = await resp.json();
+    if (data.error) {
+      applyPreviewContent(path, 'error', 'pv-raw', escHtml(data.error));
+      return;
+    }
+    applyPreviewContent(path, 'ready', 'rich pv-sheet', renderExcelSheet(data, path), {
+      truncated: !!(data.truncated_rows || data.truncated_cols), size: data.size,
+    });
+  } catch (err) {
+    applyPreviewContent(path, 'error', 'pv-raw', `Failed to load sheet: ${escHtml(err.message)}`);
+  }
 }
 
 // ── Jupyter notebook preview（.ipynb 单元格级渲染）─────────────

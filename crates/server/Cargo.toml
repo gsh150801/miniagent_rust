@@ -29,3 +29,4 @@ anyhow.workspace = true
 chrono.workspace = true
 dashmap = "6"
 dotenvy.workspace = true
+calamine = "0.36.1"

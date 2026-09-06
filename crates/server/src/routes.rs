@@ -503,6 +503,7 @@ const TEXT_EXTS: &[&str] = &["md", "json", "txt", "csv", "tsv", "py", "rs", "js"
 async fn preview_handler(
     State(state): State<AppState>,
     Path((task_id, path)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result_dir = state
         .tasks
@@ -520,6 +521,22 @@ async fn preview_handler(
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let is_text = TEXT_EXTS.iter().any(|e| *e == ext) || ext.is_empty();
+
+    // Excel 表格（.xlsx/.xls/.xlsm/.xlsb）服务端解析为行数组：浏览器无法
+    // 直接渲染二进制工作簿，客户端 JS 解析体积/兼容性都差。默认第一个
+    // sheet，`?sheet=<名称>` 切换。行/列截断上限见 EXCEL_PREVIEW_*。
+    if matches!(ext.as_str(), "xlsx" | "xls" | "xlsm" | "xlsb") {
+        return match excel_preview(&resolved, query.get("sheet").map(|s| s.as_str())) {
+            Ok(v) => Ok(Json(v)),
+            Err(e) => Ok(Json(serde_json::json!({
+                "preview": true,
+                "is_text": false,
+                "size": size,
+                "ext": ext,
+                "error": format!("Excel 解析失败: {e}"),
+            }))),
+        };
+    }
 
     if !is_text {
         return Ok(Json(serde_json::json!({
@@ -827,6 +844,86 @@ async fn emit_validation_cards(
             "content": serde_json::to_string(&cards).unwrap_or_default(),
         }));
     }
+}
+
+/// Max rows/cols served for an Excel sheet preview (keep the JSON payload
+/// small; full data stays available via download).
+const EXCEL_PREVIEW_MAX_ROWS: usize = 500;
+const EXCEL_PREVIEW_MAX_COLS: usize = 60;
+
+/// Parse a workbook into a JSON preview: sheet list + row array of the
+/// selected (default: first) sheet. Trailing fully-empty rows/columns are
+/// trimmed so sparse sheets don't render as mostly blank tables.
+fn excel_preview(
+    path: &std::path::Path,
+    sheet_name: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    use calamine::Reader;
+    let mut workbook = calamine::open_workbook_auto(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    if sheet_names.is_empty() {
+        return Err("workbook has no sheets".into());
+    }
+    let selected = match sheet_name {
+        Some(name) if sheet_names.iter().any(|n| n == name) => name.to_string(),
+        Some(name) => {
+            return Err(format!(
+                "sheet `{name}` 不存在；可用: {}",
+                sheet_names.join(", ")
+            ))
+        }
+        None => sheet_names[0].clone(),
+    };
+    let range = workbook
+        .worksheet_range(&selected)
+        .map_err(|e| format!("sheet `{selected}`: {e}"))?;
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(range.height().min(EXCEL_PREVIEW_MAX_ROWS));
+    let mut max_col = 0usize;
+    let mut truncated_rows = false;
+    for (i, row) in range.rows().enumerate() {
+        if i >= EXCEL_PREVIEW_MAX_ROWS {
+            truncated_rows = true;
+            break;
+        }
+        let mut cells: Vec<String> = Vec::with_capacity(row.len().min(EXCEL_PREVIEW_MAX_COLS));
+        for (j, cell) in row.iter().enumerate() {
+            if j >= EXCEL_PREVIEW_MAX_COLS {
+                break;
+            }
+            let text = cell.to_string();
+            let non_empty = !text.trim().is_empty();
+            cells.push(text);
+            if non_empty && j + 1 > max_col {
+                max_col = j + 1;
+            }
+        }
+        rows.push(cells);
+    }
+    // Trim trailing empty rows and columns (calamine ranges are rectangular).
+    while rows.last().is_some_and(|r| r.iter().all(|c| c.trim().is_empty())) {
+        rows.pop();
+    }
+    rows.truncate(EXCEL_PREVIEW_MAX_ROWS);
+    let total_rows = range.height();
+    let total_cols = range.width();
+    let truncated_cols = max_col > 0 && max_col < total_cols.min(EXCEL_PREVIEW_MAX_COLS + 1) && total_cols > max_col;
+
+    Ok(serde_json::json!({
+        "preview": true,
+        "is_text": false,
+        "ext": path.extension().and_then(|e| e.to_str()).unwrap_or("xlsx").to_lowercase(),
+        "sheets": sheet_names,
+        "sheet": selected,
+        "rows": rows,
+        "total_rows": total_rows,
+        "total_cols": total_cols,
+        "max_rows": EXCEL_PREVIEW_MAX_ROWS,
+        "max_cols": EXCEL_PREVIEW_MAX_COLS,
+        "truncated_rows": truncated_rows,
+        "truncated_cols": truncated_cols,
+    }))
 }
 
 // ── Upload ──

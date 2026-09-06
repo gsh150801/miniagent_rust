@@ -988,3 +988,42 @@ details.hyp-sec summary { cursor: pointer; font-size: 12px; color: var(--text-se
 .msg-ask .ask-question{font-weight:600;margin-bottom:6px}
 .msg-ask .ask-answer{margin-top:6px;padding:6px 10px;background:rgba(39,174,96,.08);border-radius:6px;border-left:3px solid #27ae60}
 .msg-ask.answered{opacity:.75}
+
+/* ── Excel / 表格预览 ─────────────────────────────────────── */
+.pv-sheet { padding: 12px 16px; }
+.pv-sheettabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.pv-sheettab {
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pv-sheettab.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-color: var(--accent, #58a6ff);
+  font-weight: 600;
+}
+.pv-sheetmeta { font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; }
+.pv-sheettable { overflow: auto; max-height: 60vh; border: 1px solid var(--border); border-radius: 6px; }
+.pv-sheettable table { border-collapse: collapse; width: 100%; }
+.pv-sheettable th, .pv-sheettable td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pv-sheettable th {
+  background: var(--bg-secondary);
+  position: sticky;
+  top: 0;
+  font-weight: 600;
+  text-align: left;
+}
+.pv-sheettable tr:hover td { background: var(--bg-secondary); }
