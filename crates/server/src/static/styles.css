@@ -155,7 +155,7 @@ body.panel-dragging .sidebar,body.panel-dragging .right-panel{transition:none}
   border-radius:var(--radius-sm);font-size:12px;font-weight:600;display:none;align-items:center;gap:4px}
 .btn-cancel:hover{background:var(--red-soft);border-color:var(--red)}
 
-.stage-pills{display:flex;flex-wrap:wrap;gap:5px;align-items:center;max-width:50%;overflow:hidden}
+.stage-pills{display:flex;flex-wrap:nowrap;gap:5px;align-items:center;max-width:50%;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;padding-bottom:2px}
 .stage-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:11px;
   background:var(--bg3);color:var(--text2);font-size:11px;font-weight:600;border:1px solid transparent;
   white-space:nowrap;transition:background .18s,color .18s,border-color .18s}
@@ -1027,3 +1027,50 @@ details.hyp-sec summary { cursor: pointer; font-size: 12px; color: var(--text-se
   text-align: left;
 }
 .pv-sheettable tr:hover td { background: var(--bg-secondary); }
+
+/* ── 多智能体审查可见化：Critic+Judge 区块 / 评估·裁决卡 ──── */
+.sub-exec-review{margin-top:8px;border-top:1px dashed var(--border);padding-top:6px;font-size:12.5px}
+.sub-exec-review summary{cursor:pointer;color:var(--text-secondary);font-weight:600;user-select:none}
+.sub-exec-review summary::-webkit-details-marker{display:none}
+.review-sec{margin-top:6px}
+.review-text{white-space:pre-wrap;word-break:break-word;color:var(--text-primary);line-height:1.55;background:rgba(127,127,127,.05);border-radius:6px;padding:6px 8px;margin-top:2px}
+.tag-mini.review-ok{background:rgba(63,185,80,.12);color:#2da44e}
+.tag-mini.review-bad{background:rgba(229,83,75,.12);color:#e5534b}
+.eval-grid{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;margin:4px 0 6px;color:var(--text-primary)}
+.adj-block{border:1px solid var(--border);border-left:4px solid #8957e5;border-radius:8px;padding:8px 10px;margin-top:6px;background:var(--bg-secondary)}
+.adj-title{font-size:12.5px;font-weight:700;margin-bottom:4px}
+.adj-summary{font-size:12.5px;line-height:1.55;color:var(--text-primary)}
+.adj-side{margin-top:6px}
+.adj-side summary{cursor:pointer;font-size:12px;color:var(--text-secondary);font-weight:600}
+.adj-side .review-text{margin-top:4px}
+
+/* ── 假说合并操作（debate 实际执行的 merge/drop/revise）────── */
+.merge-ops-block{margin-top:10px}
+.merge-op{display:flex;align-items:center;gap:8px;padding:5px 10px;border-radius:6px;margin-bottom:5px;font-size:12.5px;background:var(--bg-secondary);border:1px solid var(--border)}
+.merge-op-kind{font-size:10.5px;font-weight:700;text-transform:uppercase;border-radius:4px;padding:1px 6px;letter-spacing:.4px}
+.merge-op.merge-merge .merge-op-kind{background:rgba(88,166,255,.15);color:#58a6ff}
+.merge-op.merge-drop .merge-op-kind{background:rgba(229,83,75,.12);color:#e5534b}
+.merge-op.merge-revise .merge-op-kind{background:rgba(210,153,34,.15);color:#d29922}
+.merge-op-desc{color:var(--text-primary);line-height:1.5}
+.cross-pair-sides{margin-top:4px;display:flex;flex-direction:column;gap:2px;font-size:11.5px;color:var(--text-secondary)}
+.hyp-rounds{font-size:11px;color:var(--text-secondary);font-weight:400;margin-left:8px}
+
+/* ── 验证卡：变量设计 + 数据集落地备注 ─────────────────────── */
+.da-vars{display:flex;gap:12px;flex-wrap:wrap;margin:3px 0;font-size:11.5px;color:var(--text-secondary)}
+.da-var b{margin-right:4px;color:var(--text-primary)}
+.da-note{margin-top:5px;font-size:11.5px;line-height:1.5;color:var(--text-secondary);background:rgba(127,127,127,.06);border-radius:6px;padding:4px 8px}
+
+/* ── 数据分析结果卡（目标4 执行结局）───────────────────────── */
+.ana-list{display:flex;flex-direction:column;gap:8px}
+.ana-task{border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--bg-secondary)}
+.ana-task.ok{border-left:4px solid #3fb950}
+.ana-task.dry{border-left:4px solid #d29922}
+.ana-task.bad{border-left:4px solid #e5534b}
+.ana-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ana-backend{font-size:11.5px;color:var(--text-secondary)}
+.ana-links{margin-left:auto;display:flex;gap:6px}
+.ana-link{border:1px solid var(--accent,#58a6ff);color:var(--accent,#58a6ff);background:transparent;border-radius:6px;padding:2px 8px;font-size:11.5px;cursor:pointer}
+.ana-link:hover{background:var(--accent-soft,rgba(91,108,255,.1))}
+.ana-outputs{margin-top:5px;font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ana-meta{margin-top:4px;font-size:11px;color:var(--text-secondary);font-family:ui-monospace,'SF Mono',Menlo,monospace}
+.ana-warn{margin-top:5px;font-size:11.5px;line-height:1.5;color:#9a6700;background:rgba(210,153,34,.12);border-radius:6px;padding:4px 8px}

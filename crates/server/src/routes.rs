@@ -692,6 +692,11 @@ async fn emit_hypothesis_cards(
                     .and_then(|v| v.get("refinement_notes"))
                     .and_then(|v| v.as_str())
                     .unwrap_or(""),
+                // Opponent's independent recommendation — visible
+                // disagreement with the judge is audit-relevant.
+                "opponent_recommendation": verdict
+                    .and_then(|v| v.get("opponent_recommendation"))
+                    .and_then(|v| v.as_str()),
             }))
         })
         .collect();
@@ -738,9 +743,19 @@ async fn emit_hypothesis_cards(
             "merge_suggestions": c.get("merge_suggestions").cloned().unwrap_or(serde_json::json!([])),
         }))
     });
+    // Executed merge/drop/revise ops + refinement rounds: what the debate
+    // actually changed, not just what the judge suggested. The CLI report
+    // prints these; the web cards previously showed suggestions only.
+    let merge_ops_applied = debate.as_ref()
+        .and_then(|d| d.get("merge_ops_applied").cloned())
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));
+    let debate_rounds = debate.as_ref()
+        .and_then(|d| d.get("rounds").and_then(|v| v.as_u64()));
     let _ = ws_send(socket, serde_json::json!({
         "type": "hypotheses", "task_id": task_id, "hypotheses": cards,
         "cross": cross,
+        "merge_ops_applied": merge_ops_applied,
+        "rounds": debate_rounds,
     })).await;
     // Persist for history replay (renderHistory re-renders role=hypotheses).
     if let Some(mut t) = state.tasks.get_mut(task_id) {
@@ -748,6 +763,8 @@ async fn emit_hypothesis_cards(
             "role": "hypotheses",
             "content": serde_json::to_string(&cards).unwrap_or_default(),
             "cross": cross,
+            "merge_ops_applied": merge_ops_applied,
+            "rounds": debate_rounds,
         }));
     }
 }
@@ -853,6 +870,125 @@ async fn emit_validation_cards(
 /// small; full data stays available via download).
 const EXCEL_PREVIEW_MAX_ROWS: usize = 500;
 const EXCEL_PREVIEW_MAX_COLS: usize = 60;
+
+/// Push structured analysis-outcome cards when the analysis phase completes:
+/// one card per executed data-analysis task (status, execution backend,
+/// notebook/provenance paths as task-relative links the UI can preview,
+/// output files, self-repair rounds, exit code). Persisted as a
+/// `role:"analysis"` message for history replay. Idempotent per task.
+async fn emit_analysis_cards(
+    socket: &Arc<Mutex<WsSink>>,
+    state: &AppState,
+    task_id: &str,
+    task_dir: &std::path::Path,
+) {
+    if let Some(t) = state.tasks.get(task_id) {
+        if t.messages
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("analysis"))
+        {
+            return;
+        }
+    }
+        let manifest: Option<serde_json::Value> = std::fs::read(task_dir.join("project.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let analyses = manifest
+        .as_ref()
+        .and_then(|m| m.get("analyses"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if analyses.is_empty() {
+        return;
+    }
+    // Provenance 里的输入警告（脚本自报合成数据/错配）提升为卡片字段：
+    // 结果卡的 ⚠️ 与报告 §7 一致，合成数据演示不会被当成真实结论。
+    let warnings_of = |a: &serde_json::Value| -> Vec<String> {
+        a.get("input_warnings")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|w| w.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Task-relative path helper: the Files tree and preview API address files
+    // relative to the task's result dir.
+    let rel = |p: &str, task_dir: &std::path::Path| -> String {
+        let path = std::path::Path::new(p);
+        let base = std::fs::canonicalize(task_dir).unwrap_or_else(|_| task_dir.to_path_buf());
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            task_dir.join(path)
+        };
+        let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+        abs.strip_prefix(&base)
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| abs.display().to_string())
+    };
+    let mut cards: Vec<serde_json::Value> = Vec::new();
+    for a in &analyses {
+        let task_ref = a.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let prov_json = a
+            .get("provenance_path")
+            .and_then(|v| v.as_str())
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let prov = prov_json.as_ref();
+        let notebook_rel = a
+            .get("notebook_path")
+            .and_then(|v| v.as_str())
+            .map(|p| rel(p, task_dir));
+        let prov_rel = a
+            .get("provenance_path")
+            .and_then(|v| v.as_str())
+            .map(|p| rel(p, task_dir));
+        let outputs: Vec<String> = prov
+            .and_then(|p| p.get("outputs"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| o.get("path").and_then(|v| v.as_str()))
+                    .map(|p| rel(p, task_dir))
+                    .collect()
+            })
+            .unwrap_or_default();
+        cards.push(serde_json::json!({
+            "task_id": task_ref,
+            "hypothesis_id": a.get("hypothesis_id"),
+            "success": a.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "execution_backend": a.get("execution_backend").and_then(|v| v.as_str()).unwrap_or(""),
+            "notebook_path": notebook_rel,
+            "notebook_executed": prov
+                .and_then(|p| p.get("notebook_executed")).and_then(|v| v.as_bool()),
+            "provenance_path": prov_rel,
+            "outputs": outputs,
+            "repair_rounds": prov
+                .and_then(|p| p.get("repair_history"))
+                .and_then(|v| v.as_array()).map(|a| a.len()),
+            "exit_code": prov
+                .and_then(|p| p.get("exit_code")).and_then(|v| v.as_i64()),
+            "duration_secs": prov
+                .and_then(|p| p.get("duration")).and_then(|v| v.get("secs")).and_then(|v| v.as_f64()),
+            "script_hash": prov
+                .and_then(|p| p.get("script_hash")).and_then(|v| v.as_str())
+                .map(|s| s.chars().take(12).collect::<String>()),
+            "input_warnings": warnings_of(a),
+        }));
+    }
+    let _ = ws_send(socket, serde_json::json!({
+        "type": "analysis", "task_id": task_id, "analyses": cards,
+    })).await;
+    if let Some(mut t) = state.tasks.get_mut(task_id) {
+        t.messages.push(serde_json::json!({
+            "role": "analysis",
+            "content": serde_json::to_string(&cards).unwrap_or_default(),
+        }));
+    }
+}
 
 /// Parse a workbook into a JSON preview: sheet list + row array of the
 /// selected (default: first) sheet. Trailing fully-empty rows/columns are
@@ -1671,6 +1807,9 @@ async fn handle_research_run(
             if status == "completed" && stage == "validation" {
                 emit_validation_cards(&socket, &state, &task_id_key, &task_dir_key).await;
             }
+            if status == "completed" && stage == "analysis" {
+                emit_analysis_cards(&socket, &state, &task_id_key, &task_dir_key).await;
+            }
         });
     });
 
@@ -1900,6 +2039,27 @@ async fn drain_progress_channel(
                             "response_preview": d.get("output").and_then(|v| v.as_str()).unwrap_or("").chars().take(600).collect::<String>(),
                             "error": d.get("error").cloned().unwrap_or(serde_json::json!(null)),
                             "tokens_used": d.get("tokens_used").cloned().unwrap_or(serde_json::json!(0)),
+                            "wave": d.get("wave").cloned().unwrap_or(serde_json::json!(null)),
+                        },
+                    }));
+                }
+                // Worker→Critic→Judge review results (status == "reviewed"):
+                // persisted under their own stage so reloads restore the
+                // review section inside the subtask execution card.
+                if name == "task" && status == "reviewed"
+                    && let Some(ref d) = data
+                    && let Some(mut task) = state.tasks.get_mut(&task_id)
+                {
+                    task.stage_outputs.push(serde_json::json!({
+                        "stage": "review",
+                        "summary": {
+                            "task_id": d.get("task_id").cloned().unwrap_or(serde_json::json!("")),
+                            "title": d.get("title").cloned().unwrap_or(serde_json::json!("")),
+                            "role": d.get("role").cloned().unwrap_or(serde_json::json!("")),
+                            "critique": d.get("critique").cloned().unwrap_or(serde_json::json!("")),
+                            "judge_verdict": d.get("judge_verdict").cloned().unwrap_or(serde_json::json!("")),
+                            "judge_passed": d.get("judge_passed").cloned().unwrap_or(serde_json::json!(true)),
+                            "improvements": d.get("improvements").cloned().unwrap_or(serde_json::json!([])),
                         },
                     }));
                 }

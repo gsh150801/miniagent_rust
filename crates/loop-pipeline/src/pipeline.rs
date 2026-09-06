@@ -434,7 +434,27 @@ impl LoopPipeline {
                 }
             };
             ctx.state = output.updated_state;
-            let eval_summary = serde_json::json!({"summary": output.summary});
+            // Evaluation completed payload: the human summary plus the full
+            // structured evaluation — progress, failed tasks, next action and
+            // (when the three-way adjudicator ran) its verdict, both sides'
+            // cases, unmet items and repair suggestions. The UI renders this
+            // as an evaluation/adjudication card so multi-agent review is
+            // visible instead of living only in logs.
+            let eval_detail = ctx.state.evaluations.last().map(|e| {
+                serde_json::json!({
+                    "overall_progress_pct": e.overall_progress_pct,
+                    "tasks_completed": e.tasks_completed,
+                    "tasks_failed": e.tasks_failed,
+                    "tasks_pending": e.tasks_pending,
+                    "next_action": e.next_action,
+                    "unmet_goals": e.unmet_goals,
+                    "adjudication": e.adjudication,
+                })
+            }).unwrap_or(serde_json::Value::Null);
+            let eval_summary = serde_json::json!({
+                "summary": output.summary,
+                "evaluation": eval_detail,
+            });
             ctx.state.stage_outputs.push(crate::types::StageOutputRecord {
                 stage: "evaluate".into(),
                 summary: eval_summary.clone(),

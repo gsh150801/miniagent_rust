@@ -466,6 +466,10 @@ fn parse_data_analysis_task(idx: usize, v: &serde_json::Value) -> DataAnalysisTa
             .get("dataset_accession")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
+        dataset_note: v
+            .get("dataset_note")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
         cohort_definition: as_string(v, "cohort_definition"),
         variables: parse_variables(v.get("variables")),
         statistical_method: as_string(v, "statistical_method"),

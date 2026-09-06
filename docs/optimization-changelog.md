@@ -2540,3 +2540,32 @@ core/kg/loop-pipeline/provider/telemetry/skill/tool/workflow/planning/memory/hyp
 - 现象：基线任务切到 verification run（前端实测），消息流只剩 user + 一条空 assistant，5 张假说卡 + 2 张验证卡 + 交叉比较**全部缺失**，仅右侧 pill 树正常。`/api/tasks/{id}` 返回 8 条 messages 含 hypotheses/validation，payload 完整。
 - 根因：模块级 `resultAnchor` 在 `renderHistory` 第 742 行重建 `.messages-inner` 时被孤立引用到旧 inner；后续 `trackPhase/upsertExecCard → ensureResultAnchor` 因 `parentNode === inner` 守护失败转而把**新 anchor** 附加到旧 inner 上，外层 renderHistory 的 `inner` 局部变量被 `getInner()` 重新拉取时为新元素，但所有在循环中 appendChild 的 card（hypotheses/validation）仍挂在已被丢弃的旧 inner 上 → 视觉上消失。
 - 修复：`renderHistory` 和 `selectTask` 在重建 inner 时同步将 `resultAnchor = null`，让后续 upsert 路径走新建逻辑、锚到当前 inner。
+
+## Round 41: 多智能体协作可见化 + 前端展示补全（四目标 e2e 第二轮）
+
+**背景**：对照四目标再跑基线 e2e（research 模式，阿尔茨海默 Tau×神经炎症），聚焦多智能体协作展示、前端展示、长程任务恢复三方面差距，前后端同步修复。
+
+### 多智能体协作可见化（目标 1）
+- **Critic+Judge 审查事件化**：loop dispatch 的难度分层三方审查（Worker→Critic→Judge）此前只写日志/state，前端零可见。现每个经审查子任务 emit `reviewed` 子任务事件（critique 摘要/judge 裁定/是否通过/改进建议，字符截断防大 payload），server 持久化为 `stage:"review"` stage_outputs，前端在子任务执行卡内渲染折叠审查区块 + todo 列表审查徽标，重载可恢复。
+- **评估·三方裁决卡**：evaluate completed 事件 data 携带完整评估（进度/完成/失败/下一步路由 + adjudication：verdict/advocate 陈述/unmet/suggestions/summary），前端渲染"评估与三方裁决"卡（每轮循环同卡更新）。
+- **子任务卡波次徽标**：dispatch 早已 emit `wave` 字段但前端丢弃——现在执行卡 meta 显示 `W2 · 1.2k tokens`，并行波次结构可见。
+
+### 前端展示补全（目标 2/3/4）
+- **假说卡增强**：`hypotheses` 事件新增 `merge_ops_applied`（实际执行的 merge/drop/revise 操作，区别于"仅建议"）与 `rounds`（精炼轮数）；每假说新增反方独立意见徽章（Opponent 与 Judge 不一致时高亮）；矛盾对展开显示双方陈述。
+- **验证卡增强**：DA 任务行新增变量设计（自变量/因变量/协变量）与 `dataset_note`（GEO 落地核验备注：✅ 已校验 / 🚫 被拒重选 / ⚠️ 保守保留），后端 `DataAnalysisTask.dataset_note` 字段随计划 JSON 流转。
+- **数据分析结果卡（新增 `analysis` WS 事件 + role:analysis 回放）**：analysis 阶段 completed 即推——每 DA 任务状态徽章（成功/dry-run/失败）、执行后端、notebook/provenance 一键预览跳转（事件委托，无内联 JS 注入面）、输出文件、自修复轮数、exit code、耗时、脚本哈希、输入警告（合成数据演示显式降级）。
+- **阶段 notes 累积**：trackPhase 从"覆盖 summary"改为累积 notes（≤12 条）——逐个分析任务的结局、逐次裁决意见都保留，不再只剩最后一条；Pipeline Phases 重载后从 stage_outputs 恢复。
+
+### 长程任务与稳健性（目标 1）
+- **resume 事件卫生**：断点恢复运行时每个 loop 子任务都会重发 `literature/running` 陈旧事件，把已完成 pill 打回 running（e2e 事件流实证）。resume 分支不再 phase_begin，pill 状态保持真实。
+- **跨任务事件串台修复**：`stream`/`status`/`task_started` 补齐任务过滤（与 complete/error/plan 同一防线）——并发运行的后台任务不再把 token/状态注入当前会话、不再劫持视图。
+- **断线重连恢复**：WS 重连后自动重发 `get_task` 重建当前任务视图（消息/计划/阶段产物/文件树），流式气泡不再永久冻结、输入不再锁死。
+- **右面板渲染节流**：每秒计时器只更新 `#elapsedText` 文本，不再整面板 innerHTML 重建（折叠状态/滚动位置不再被重置）。
+- **escHtml 引号转义**：补 `"`/`'` 转义，消除内联属性注入面；stage pills 溢出改为横向滚动。
+
+### 分析诚实性（目标 4，与 input_warnings 特性合流）
+- `AnalysisResult`/`ProvenanceRecord`/`AnalysisRef` 贯通 `input_warnings`：脚本自报合成数据/输入错配（生成提示强制诚实声明）→ scan_input_warnings 扫描 stdout/stderr 标记 → provenance.json / project.json / 用户报告 §7 / 分析结果卡四处一致显示 ⚠️，合成数据演示不再被当成真实生物学结论。
+
+### 验证
+- `cargo check --workspace --tests` 0 错误；`cargo test --release --workspace` 383 通过 0 失败；`node --check app.js` 通过。
+- 第二轮 e2e（research 全流程 + loop 多智能体）事件流验证：reviewed 事件、评估裁决卡、merge_ops_applied、dataset_note、analysis 结果卡、重载恢复。

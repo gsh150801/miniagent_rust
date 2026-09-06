@@ -720,9 +720,26 @@ impl PipelineStage for DispatchStage {
         for entry in &critique_entries {
             if !entry.judge_passed
                 && let Some(result) = all_results.iter_mut().find(|r| r.task_id == entry.task_id) {
-                    result.success = false;
-                    result.error = Some(format!("Quality check failed: {}", entry.judge_verdict));
-                }
+                result.success = false;
+                result.error = Some(format!("Quality check failed: {}", entry.judge_verdict));
+            }
+        }
+
+        // Worker→Critic→Judge 审查结果对前端可见：每个经过审查的任务发一条
+        // `reviewed` 子任务事件（critique 摘要 + judge 裁定 + 改进建议），
+        // 多智能体分层审查不再是黑盒。字符串截断防大 payload。
+        for entry in &critique_entries {
+            let task_spec = plan.tasks.iter().find(|t| t.id == entry.task_id);
+            emit_task(ctx, "reviewed", &serde_json::json!({
+                "task_id": entry.task_id,
+                "title": task_spec.map(|t| preview_chars(&t.description, 120)).unwrap_or_else(|| entry.task_id.clone()),
+                "role": "critic+judge",
+                "critique": preview_chars(&entry.critique, 1200),
+                "judge_verdict": preview_chars(&entry.judge_verdict, 600),
+                "judge_passed": entry.judge_passed,
+                "improvements": entry.improvements.iter()
+                    .map(|s| preview_chars(s, 300)).collect::<Vec<_>>(),
+            }));
         }
 
         // Update task results in the plan

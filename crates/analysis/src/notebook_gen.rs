@@ -350,6 +350,7 @@ mod tests {
             objective: "Measure BRCA1 differential expression".into(),
             dataset_source: DatasetSource::Geo,
             dataset_accession: Some("GSE12345".into()),
+            dataset_note: None,
             cohort_definition: "tumor vs normal".into(),
             variables: AnalysisVariables {
                 independent: vec!["BRCA1".into()],

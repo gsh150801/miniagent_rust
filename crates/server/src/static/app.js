@@ -36,7 +36,17 @@ function connect() {
   setConnState('connecting');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
-  ws.onopen = () => { setConnState('connected'); showToast('Connected', false, 'success'); loadTasks(); loadSkills(); loadSettings(); };
+  ws.onopen = () => {
+    const wasDown = !wsConnected;
+    setConnState('connected');
+    showToast('Connected', false, 'success');
+    loadTasks(); loadSkills(); loadSettings();
+    // 重连恢复：断线期间错过的事件不可重放，但 get_task 能重建当前任务的
+    // 完整视图（消息/计划/阶段产物/文件树）——流式气泡不再永久冻结。
+    if (wasDown && currentTaskId && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'get_task', task_id: currentTaskId }));
+    }
+  };
   ws.onmessage = (e) => {
     try { handleMsg(JSON.parse(e.data)); }
     catch(err) { handleMsg({ type: 'stream', text: e.data }); }
@@ -69,8 +79,15 @@ function syncTaskMeta(taskId, patch) {
 
 function handleMsg(msg) {
   switch(msg.type) {
-    case 'status': addSystemMsg(msg.message); break;
+    // 后台任务的状态提示不得注入当前会话（并发任务串台）。
+    case 'status':
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      addSystemMsg(msg.message);
+      break;
     case 'task_started':
+      // 只在当前无选中任务或就是本任务时接管视图——后台启动的任务
+      // 不得劫持用户正在查看的会话（与 complete/error 同一防线）。
+      if (currentTaskId && msg.task_id && msg.task_id !== currentTaskId) break;
       currentTaskId = msg.task_id;
       isRunning = true;
       // Backend may have attached a status/brief snapshot — apply it so the
@@ -122,7 +139,11 @@ function handleMsg(msg) {
       renderAsk(msg.task_id, msg.question, msg.options || []);
       break;
     case 'stage_output': showStageOutput(msg.stage, msg.summary); break;
-    case 'stream': appendStream(msg.text); break;
+    // 流式输出按任务过滤：并发任务的 token 不得混入当前会话。
+    case 'stream':
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      appendStream(msg.text);
+      break;
     case 'agent_event': handleAgentEvent(msg); break;
     case 'complete': {
       // 列表状态无条件同步（其他任务的完成也要反映在侧栏）。
@@ -162,7 +183,10 @@ function handleMsg(msg) {
       // 与 plan/progress 相同的任务过滤——切到历史任务时不被新事件污染。
       if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       if (Array.isArray(msg.hypotheses) && msg.hypotheses.length) {
-        showHypothesisCards(msg.hypotheses, null, msg.cross);
+        showHypothesisCards(msg.hypotheses, null, msg.cross, {
+          merge_ops_applied: msg.merge_ops_applied,
+          rounds: msg.rounds,
+        });
       }
       break;
     case 'validation':
@@ -170,6 +194,14 @@ function handleMsg(msg) {
       if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       if (Array.isArray(msg.plans) && msg.plans.length) {
         showValidationCards(msg.plans);
+      }
+      break;
+    case 'analysis':
+      // 数据分析结果卡（目标4）：每个 DA 任务的执行结局 + notebook/
+      // provenance 跳转 + 自修复轮数。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      if (Array.isArray(msg.analyses) && msg.analyses.length) {
+        showAnalysisCards(msg.analyses);
       }
       break;
     case 'task_messages': renderHistory(msg); break;
@@ -893,12 +925,22 @@ function renderHistory(msg) {
       } else if (m.role === 'hypotheses') {
         try {
           const cards = JSON.parse(String(m.content ?? '[]'));
-          if (Array.isArray(cards) && cards.length) showHypothesisCards(cards, inner, m.cross || null);
+          if (Array.isArray(cards) && cards.length) {
+            showHypothesisCards(cards, inner, m.cross || null, {
+              merge_ops_applied: m.merge_ops_applied,
+              rounds: m.rounds,
+            });
+          }
         } catch { /* legacy/corrupt entry — skip */ }
       } else if (m.role === 'validation') {
         try {
           const plans = JSON.parse(String(m.content ?? '[]'));
           if (Array.isArray(plans) && plans.length) showValidationCards(plans, inner);
+        } catch { /* legacy/corrupt entry — skip */ }
+      } else if (m.role === 'analysis') {
+        try {
+          const analyses = JSON.parse(String(m.content ?? '[]'));
+          if (Array.isArray(analyses) && analyses.length) showAnalysisCards(analyses, inner);
         } catch { /* legacy/corrupt entry — skip */ }
       } else if (m.role === 'assistant') {
         const content = String(m.content ?? '');
@@ -951,18 +993,28 @@ function renderHistory(msg) {
 
   // Restore stage output cards. Persisted per-subtask summaries
   // (stage === 'subtask') rebuild the todo list + expandable execution cards;
-  // known loop/research pipeline phases go through trackPhase so the right
-  // panel's Pipeline Phases section survives reloads; everything else renders
-  // as the classic stage-output card.
+  // review records (stage === 'review') re-attach the Critic+Judge block;
+  // phase-level outputs (literature/kg/…/evaluate) go through trackPhase so
+  // the right panel's Pipeline Phases section survives reloads.
   if (msg.stage_outputs && msg.stage_outputs.length > 0) {
-    const planStageNames = new Set((currentPlan?.stages || []).map(s => s.name));
     for (const so of msg.stage_outputs) {
       if (so.stage === 'subtask' && so.summary) {
         restoreSubtask(so.summary);
+      } else if (so.stage === 'review' && so.summary && so.summary.task_id) {
+        const st = subtasks[so.summary.task_id];
+        if (st) {
+          st.review = so.summary;
+          renderExecCardFor(st);
+        }
+      } else if (so.summary && so.summary.response_preview
+          && !(currentPlan?.stages || []).some(s => s.name === so.stage)) {
+        // 阶段级记录（非 plan 阶段）→ Pipeline Phases 恢复。
+        trackPhase(so.stage, msg.status === 'failed' ? 'failed' : 'completed', {
+          summary: String(so.summary.response_preview),
+        });
       }
-      // 阶段级 stage_output（explore/clarify/plan/dispatch/evaluate…）
-      // 不重播为中间面板卡——用户只需要具体操作（worker 工具事件）。
     }
+    if (phases.length) renderProgressView();
   }
 
   // Restore file tree
@@ -1212,7 +1264,12 @@ function makeDownloads(taskId, files) {
 function startElapsed() {
   taskStartTime = Date.now();
   stopElapsed();
-  elapsedTimer = setInterval(renderProgressView, 1000);
+  // 只更新耗时文本：每秒重建整个右面板会重置用户手动展开/折叠的
+  // 区块并丢失滚动位置。
+  elapsedTimer = setInterval(() => {
+    const el = document.getElementById('elapsedText');
+    if (el) el.textContent = '⏱ ' + elapsedStr();
+  }, 1000);
 }
 function stopElapsed() {
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
@@ -1458,6 +1515,12 @@ if (typeof document !== 'undefined') {
       sel.addEventListener('change', (e) => setMode(e.target.value));
       setMode(sel.value || 'workflow');
     }
+    // 分析结果卡里的 notebook/provenance 跳转：事件委托（data-preview
+    // 属性携带路径，无内联 JS 字符串拼接，天然免疫引号注入）。
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.ana-link');
+      if (btn && btn.dataset.preview) openPreview(btn.dataset.preview);
+    });
   });
 }
 
@@ -1578,9 +1641,19 @@ function handleProgressMsg(msg) {
 
   if (stage === 'task') {
     if (data && data.task_id) {
-      upsertSubtask({ ...data, status });
-      stageStatus[data.task_id] = status;
-      updateStagePill(data.task_id, status);
+      if (status === 'reviewed') {
+        // Worker→Critic→Judge 审查结果：并入对应子任务的执行卡
+        //（不改执行状态，只附加审查区块）。
+        const st = subtasks[data.task_id];
+        if (st) {
+          st.review = data;
+          renderExecCardFor(st);
+        }
+      } else {
+        upsertSubtask({ ...data, status });
+        stageStatus[data.task_id] = status;
+        updateStagePill(data.task_id, status);
+      }
     }
     renderProgressView();
     return;
@@ -1590,8 +1663,56 @@ function handleProgressMsg(msg) {
   updateStagePill(stage, status);
   stageStatus[stage] = status;
   trackPhase(stage, status, data);
+  // evaluate 完成事件带完整评估（含三方裁决 advocate→challenger→arbiter）
+  // → 在聊天面板渲染/更新"评估·裁决"卡，多智能体结论可见。
+  if (stage === 'evaluate' && status === 'completed' && data && data.evaluation) {
+    upsertEvalCard(data.evaluation);
+  }
   syncTaskMeta(msg.task_id, { status: status === 'failed' ? 'failed' : 'running' });
   renderProgressView();
+}
+
+// ── 评估·三方裁决卡（loop 模式 evaluate 阶段结论）──
+// 每轮循环更新同一张卡（id 固定）：进度/失败数/下一步路由 + 裁决书。
+const ADJ_VERDICT_META = {
+  complete: { label: 'Complete', cls: 'ok', icon: '&#9989;' },
+  needs_repair: { label: 'Needs Repair', cls: 'warn', icon: '&#128295;' },
+  unclear: { label: 'Unclear', cls: 'idle', icon: '&#10068;' },
+};
+function upsertEvalCard(ev) {
+  const adj = ev.adjudication || null;
+  const verdict = adj ? (ADJ_VERDICT_META[String(adj.verdict || '').toLowerCase()] || ADJ_VERDICT_META.unclear) : null;
+  const unmet = Array.isArray(adj?.unmet) ? adj.unmet : [];
+  const sugg = Array.isArray(adj?.suggestions) ? adj.suggestions : [];
+  const bodyHtml = `
+    <div class="eval-grid">
+      <span><b>进度：</b>${Math.round(ev.overall_progress_pct ?? 0)}%</span>
+      <span><b>完成：</b>${ev.tasks_completed ?? 0}</span>
+      <span><b>失败：</b>${ev.tasks_failed ?? 0}</span>
+      ${ev.next_action ? `<span><b>下一步：</b>${escHtml(ev.next_action)}</span>` : ''}
+    </div>
+    ${adj ? `
+      <div class="adj-block">
+        <div class="adj-title">⚖️ 三方裁决（advocate → challenger → arbiter）</div>
+        ${adj.summary ? `<div class="adj-summary">${escHtml(adj.summary)}</div>` : ''}
+        ${adj.advocate ? `<details class="adj-side"><summary>正方（Advocate）陈述</summary><div class="review-text">${escHtml(adj.advocate)}</div></details>` : ''}
+        ${unmet.length ? `<div class="hyp-sec-title">未满足项（Challenger 提出）</div><ul class="hyp-list hyp-contrast">${unmet.map(u => `<li>${escHtml(u)}</li>`).join('')}</ul>` : ''}
+        ${sugg.length ? `<div class="hyp-sec-title">修复建议（Arbiter）</div><ul class="hyp-list hyp-support">${sugg.map(u => `<li>${escHtml(u)}</li>`).join('')}</ul>` : ''}
+      </div>` : ''}`;
+  upsertExecCard('eval-adjudication', {
+    title: '评估与三方裁决',
+    role: 'arbiter',
+    status: 'completed',
+    preview: verdict ? `${verdict.label} — ${(adj.summary || '').slice(0, 80)}` : `进度 ${Math.round(ev.overall_progress_pct ?? 0)}%`,
+    bodyHtml,
+    meta: '',
+  });
+  const card = document.getElementById('eval-adjudication');
+  if (card) {
+    const badge = card.querySelector('.stage-badge');
+    if (badge && verdict) { badge.textContent = verdict.label; }
+    card.querySelector('.sub-exec')?.classList.add('has-adj');
+  }
 }
 
 // Track a live pipeline phase (loop phases / research phases). Stages that
@@ -1607,12 +1728,19 @@ function trackPhase(stage, status, data) {
   }
   let p = phases.find(x => x.name === stage);
   if (!p) {
-    p = { name: stage, label: PIPELINE_PHASES[stage] || stage, status, summary: null, ts: Date.now() };
+    p = { name: stage, label: PIPELINE_PHASES[stage] || stage, status, summary: null, notes: [], ts: Date.now() };
     phases.push(p);
   }
   p.status = status;
   p.ts = Date.now();
-  if (summary) p.summary = summary;
+  if (summary) {
+    // 累积而非覆盖：同一阶段内的多条过程说明（如逐个数据分析任务的
+    // 执行结局、三方裁决意见）都保留下来，只有最后一条进 summary。
+    if (!p.notes) p.notes = [];
+    if (p.notes[p.notes.length - 1] !== summary) p.notes.push(summary);
+    if (p.notes.length > 12) p.notes = p.notes.slice(-12);
+    p.summary = summary;
+  }
   // 非 plan 阶段（如 steer）也不生成中间面板卡。
 }
 
@@ -1627,23 +1755,48 @@ function upsertSubtask(d) {
   if (d.title) st.title = d.title;
   if (d.role) st.role = d.role;
   if (d.difficulty) st.difficulty = d.difficulty;
+  if (d.wave != null) st.wave = d.wave;
+  if (d.review) st.review = d.review;
   st.status = d.status || st.status;
   st.reused = !!d.reused;
   if (d.output != null) st.output = d.output;
   if (d.error != null) st.error = d.error;
   if (d.tokens_used != null) st.tokens = d.tokens_used;
   st.ts = Date.now();
-  upsertExecCard('st-' + id, {
-    title: st.title || id,
+  renderExecCardFor(st);
+}
+
+// Shared renderer for one subtask's chat execution card (live + restore).
+function renderExecCardFor(st) {
+  const metaBits = [];
+  if (st.wave) metaBits.push(`W${st.wave}`);
+  if (st.tokens) metaBits.push(`${st.tokens} tokens`);
+  upsertExecCard('st-' + st.id, {
+    title: st.title || st.id,
     role: st.role,
     status: st.status,
     reused: st.reused,
     preview: mdPlain(st.status === 'failed' ? (st.error || '子任务执行失败') : (st.output || ''), 140),
-    bodyHtml: st.status === 'failed'
+    bodyHtml: (st.status === 'failed'
       ? `<div class="sub-exec-error">${escHtml(st.error || '子任务执行失败')}</div>${st.output ? md(st.output) : ''}`
-      : md(st.output || ''),
-    meta: st.tokens ? `${st.tokens} tokens` : '',
+      : md(st.output || '')) + reviewBlockHtml(st.review),
+    meta: metaBits.join(' · '),
   });
+}
+
+// Worker→Critic→Judge 审查区块（子任务执行卡内折叠展示）。
+function reviewBlockHtml(review) {
+  if (!review || !review.critique && !review.judge_verdict) return '';
+  const passed = review.judge_passed !== false;
+  const verdict = `<span class="tag-mini review-${passed ? 'ok' : 'bad'}">judge ${passed ? '通过' : '未过'}</span>`;
+  const improvements = Array.isArray(review.improvements) && review.improvements.length
+    ? `<div class="hyp-sec-title">改进建议</div><ul class="hyp-list">${review.improvements.map(x => `<li>${escHtml(x)}</li>`).join('')}</ul>` : '';
+  return `<details class="sub-exec-review">
+    <summary>&#128269; Critic+Judge 审查 ${verdict}</summary>
+    ${review.critique ? `<div class="review-sec"><span class="hyp-sec-title">Critic 意见</span><div class="review-text">${escHtml(review.critique)}</div></div>` : ''}
+    ${review.judge_verdict ? `<div class="review-sec"><span class="hyp-sec-title">Judge 裁定</span><div class="review-text">${escHtml(review.judge_verdict)}</div></div>` : ''}
+    ${improvements}
+  </details>`;
 }
 
 // Restore one persisted subtask summary (from task.stage_outputs) after a
@@ -1662,17 +1815,8 @@ function restoreSubtask(summary) {
   st.error = summary.error || null;
   st.tokens = summary.tokens_used || st.tokens || 0;
   st.reused = !!summary.reused;
-  upsertExecCard('st-' + id, {
-    title: st.title || id,
-    role: st.role,
-    status: st.status,
-    reused: st.reused,
-    preview: mdPlain(st.status === 'failed' ? (st.error || '') : (st.output || ''), 140),
-    bodyHtml: st.status === 'failed'
-      ? `<div class="sub-exec-error">${escHtml(st.error || '子任务执行失败')}</div>${st.output ? md(st.output) : ''}`
-      : md(st.output || ''),
-    meta: st.tokens ? `${st.tokens} tokens` : '',
-  });
+  if (summary.wave != null) st.wave = summary.wave;
+  renderExecCardFor(st);
 }
 
 // ── Middle panel: expandable subtask execution summary cards ──
@@ -1796,7 +1940,7 @@ function renderProgressView() {
   let html = `<div class="progress-card">
     <div class="progress-stage">${escHtml(currentLabel)} <span class="stage-status ${currentStatus}">${currentStatus === 'running' ? 'running' : currentStatus === 'completed' ? 'done' : ''}</span></div>
     <div class="progress-bar-wrap"><div class="progress-bar" style="width:${pct}%"></div></div>
-    <div class="progress-meta"><span>${doneLabel ? doneLabel + ' ' + (isLoop || (!stages.length && phases.length) ? '子任务' : 'stages') + ' &middot; ' : ''}${pct}%</span><span>&#9201; ${elapsedStr()}</span></div>
+    <div class="progress-meta"><span>${doneLabel ? doneLabel + ' ' + (isLoop || (!stages.length && phases.length) ? '子任务' : 'stages') + ' &middot; ' : ''}${pct}%</span><span id="elapsedText">&#9201; ${elapsedStr()}</span></div>
     <div class="activity-summary">
       <span class="act-stat" title="Tool calls">&#128295; ${activityStats.tools}</span>
       ${activityStats.toolErrors ? `<span class="act-stat err" title="Tool errors">&#9888; ${activityStats.toolErrors}</span>` : ''}
@@ -1814,7 +1958,14 @@ function renderProgressView() {
         : p.status === 'running' ? '<span class="check-spin"></span>'
         : p.status === 'failed' ? '&#10007;'
         : '&#9675;';
-      html += `<div class="stree-stage ${p.status} ${p.summary ? 'expanded' : ''}">
+      // 累积的过程 notes 逐条展示（如每个数据分析任务的结局、
+      // 三方裁决意见）——不再只留最后一条。
+      const notes = Array.isArray(p.notes) && p.notes.length
+        ? p.notes.map(n => `<div class="stree-stage-desc">${escHtml(n)}</div>`).join('') : '';
+      const body = (p.summary || notes)
+        ? `<div class="stree-stage-body">${p.summary && (!notes || p.notes[p.notes.length - 1] !== p.summary) ? `<div class="stree-stage-desc">${escHtml(p.summary)}</div>` : ''}${notes}</div>`
+        : '';
+      html += `<div class="stree-stage ${p.status} ${(p.summary || notes) ? 'expanded' : ''}">
         <div class="stree-stage-head" onclick="this.parentElement.classList.toggle('expanded')">
           <span class="check ${p.status}">${icon}</span>
           <span class="name">${escHtml(p.label || p.name)}</span>
@@ -1822,7 +1973,7 @@ function renderProgressView() {
           <span class="stage-badge ${p.status}">${p.status}</span>
           <span class="chevron">&#9654;</span>
         </div>
-        ${p.summary ? `<div class="stree-stage-body"><div class="stree-stage-desc">${escHtml(p.summary)}</div></div>` : ''}
+        ${body}
       </div>`;
     }
   }
@@ -1834,10 +1985,14 @@ function renderProgressView() {
       const s = stages[si];
       // Loop mode: real per-subtask status from progress events. Workflow
       // mode: derive from the stage status as before.
-      let status, subStatusNote = '';
+      let status, subStatusNote = '', reviewBadge = '';
       if (isLoop) {
         status = subtasks[s.name]?.status || 'pending';
         const st = subtasks[s.name];
+        if (st && st.review) {
+          const passed = st.review.judge_passed !== false;
+          reviewBadge = `<span class="tag-mini review-${passed ? 'ok' : 'bad'}" title="Critic+Judge 审查">&#128269; ${passed ? '审查通过' : '审查未过'}</span>`;
+        }
         if (st && (st.output || st.error)) {
           subStatusNote = `<div class="stree-stage-desc">${escHtml(mdPlain(st.status === 'failed' ? '✗ ' + (st.error || '') : (st.output || '')))}</div>`;
         }
@@ -1881,7 +2036,7 @@ function renderProgressView() {
           <span class="check ${stageCls}">${stageIcon}</span>
           <span class="stage-idx">${si + 1}</span>
           <span class="name">${escHtml(s.name)}</span>
-          ${roleLabel}${tierBadge}
+          ${roleLabel}${tierBadge}${reviewBadge}
           <span class="stage-badge ${stageCls}">${status}</span>
           <span class="chevron">&#9654;</span>
         </div>
@@ -2385,20 +2540,28 @@ function bulletList(items, cls) {
     `<li>${escHtml(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')}</ul>`;
 }
 
-function showHypothesisCards(cards, container, cross) {
+function showHypothesisCards(cards, container, cross, extra) {
   const el = container || document.querySelector('#messages .messages-inner');
   if (!el) return;
   const wrap = document.createElement('div');
   wrap.className = 'msg msg-ai hyp-cards-msg';
+  const mergeOps = Array.isArray(extra?.merge_ops_applied) ? extra.merge_ops_applied : [];
+  const rounds = typeof extra?.rounds === 'number' ? extra.rounds : null;
   const cardsHtml = cards.map((h, i) => {
     const verdict = VERDICT_META[h.verdict?.toLowerCase()] || VERDICT_META.undebated;
     const conf = Math.round((h.confidence ?? 0) * 100);
     const confAfter = (typeof h.confidence_after === 'number')
       ? Math.round(h.confidence_after * 100) : null;
+    // 反方独立意见（与裁判不一致时高亮：审计相关）。
+    const oppRec = typeof h.opponent_recommendation === 'string' ? h.opponent_recommendation.toLowerCase() : null;
+    const oppBadge = oppRec
+      ? `<span class="tag-mini ${oppRec !== (h.verdict || '').toLowerCase() ? 'review-bad' : 'review-ok'}" title="Opponent 独立建议">反方: ${escHtml(oppRec)}</span>`
+      : '';
     return `<div class="hyp-card verdict-${verdict.cls}">
       <div class="hyp-head">
         <span class="hyp-idx">H${i + 1}</span>
         <span class="hyp-verdict ${verdict.cls}">${verdict.icon} ${verdict.label}</span>
+        ${oppBadge}
         <span class="hyp-conf" title="debate confidence">
           <span class="hyp-conf-bar"><span style="width:${conf}%"></span></span>
           <span class="hyp-conf-num">${conf}%</span>
@@ -2413,9 +2576,32 @@ function showHypothesisCards(cards, container, cross) {
       ${h.refinement_notes ? `<div class="hyp-notes"><span class="hyp-sec-title">Refinement</span>${escHtml(h.refinement_notes)}</div>` : ''}
     </div>`;
   }).join('');
-  wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#128300; 致病机理假说（${cards.length} 条，含辩论裁决）</div><div class="hyp-cards">${cardsHtml}</div>${renderCrossComparison(cross, cards)}</div>`;
+  const roundsTag = rounds != null ? `<span class="hyp-rounds">${rounds} 轮精炼</span>` : '';
+  wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#128300; 致病机理假说（${cards.length} 条，含辩论裁决）${roundsTag}</div><div class="hyp-cards">${cardsHtml}</div>${renderCrossComparison(cross, cards)}${renderMergeOpsApplied(mergeOps)}</div>`;
   el.appendChild(wrap);
   scrollBottom();
+}
+
+// ── 已执行的假说合并操作（debate merge_ops_applied）─────────────
+// 裁判的 merge/drop/revise 建议被结构化并真正应用——这里展示"实际执行
+// 了什么"，与"仅建议"的合并建议区分（审计闭环）。
+function renderMergeOpsApplied(ops) {
+  if (!ops.length) return '';
+  const rows = ops.map(op => {
+    const kindRaw = String(op.op || op.action || op.kind || '').toLowerCase();
+    const kind = kindRaw === 'merge' ? 'merge' : kindRaw === 'drop' ? 'drop' : 'revise';
+    const desc = op.reason || op.rationale || op.description || op.summary || '';
+    const ids = [op.source, op.a, op.into, op.target, op.b].filter(x => x).join(' → ');
+    return `<div class="merge-op merge-${kind}">
+      <span class="merge-op-kind">${kind}</span>
+      ${ids ? `<span class="mono-chip">${escHtml(ids)}</span>` : ''}
+      <span class="merge-op-desc">${escHtml(desc)}</span>
+    </div>`;
+  }).join('');
+  return `<div class="merge-ops-block">
+    <div class="cross-title">&#9878;&#65039; 已执行的合并操作（${ops.length} 条，置信度只降不升）</div>
+    ${rows}
+  </div>`;
 }
 
 // ── 辩论交叉比较（judge 的跨假说裁决）──────────────────────────
@@ -2432,10 +2618,15 @@ function renderCrossComparison(cross, cards) {
   const merges = Array.isArray(cross.merge_suggestions) ? cross.merge_suggestions : [];
   const rationale = cross.ranking_rationale || '';
   if (!contradictions.length && !rationale && !cross.strongest && !merges.length) return '';
+  const cardStatement = (id) => (cards.find(c => c.id === id) || {}).statement || '';
   const contraHtml = contradictions.map(c => `
     <div class="cross-pair">
       <span class="cross-vs">${escHtml(hypShortRef(c.a?.id, cards))} vs ${escHtml(hypShortRef(c.b?.id, cards))}</span>
       <span class="cross-reason">${escHtml(c.reason || '')}</span>
+      ${c.a?.statement || c.b?.statement ? `<div class="cross-pair-sides">
+        <div><b>${escHtml(hypShortRef(c.a?.id, cards))}：</b>${escHtml((c.a?.statement || '').slice(0, 110))}…</div>
+        <div><b>${escHtml(hypShortRef(c.b?.id, cards))}：</b>${escHtml((c.b?.statement || '').slice(0, 110))}…</div>
+      </div>` : ''}
     </div>`).join('');
   return `<div class="cross-compare">
     <div class="cross-title">&#9878;&#65039; 交叉比较（跨假说裁决）</div>
@@ -2461,6 +2652,15 @@ function datasetBadge(src) {
   return `<span class="ds-badge ds-${escHtml(String(src.kind || 'other'))}">${escHtml(label)}</span>`;
 }
 
+// 变量设计行：自变量/因变量/协变量（数据分析任务的可复现要素）。
+function variablesHtml(v) {
+  if (!v || typeof v !== 'object') return '';
+  const part = (label, arr) => (Array.isArray(arr) && arr.length)
+    ? `<span class="da-var"><b>${label}</b>${escHtml(arr.join('、'))}</span>` : '';
+  const html = part('自变量', v.independent) + part('因变量', v.dependent) + part('协变量', v.covariates);
+  return html ? `<div class="da-vars">${html}</div>` : '';
+}
+
 function showValidationCards(plans, container) {
   const el = container || document.querySelector('#messages .messages-inner');
   if (!el) return;
@@ -2480,11 +2680,13 @@ function showValidationCards(plans, container) {
           <span class="da-prio" title="priority">${Math.round((t.priority ?? 0.5) * 100)}%</span>
         </div>
         <div class="da-obj">${escHtml(t.objective || '')}</div>
+        ${variablesHtml(t.variables)}
         <div class="da-meta">
           ${t.cohort_definition ? `<span><b>队列：</b>${escHtml(t.cohort_definition)}</span>` : ''}
           ${t.expected_outcome ? `<span><b>预期：</b>${escHtml(t.expected_outcome)}</span>` : ''}
           ${t.deliverable ? `<span><b>交付：</b>${escHtml(t.deliverable)}</span>` : ''}
         </div>
+        ${t.dataset_note ? `<div class="da-note">${escHtml(t.dataset_note)}</div>` : ''}
       </div>`).join('');
     const wlHtml = wls.map(w => `
       <details class="wl-proto">
@@ -2513,6 +2715,57 @@ function showValidationCards(plans, container) {
     </div>`;
   }).join('');
   wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#129514; 验证任务计划（${plans.length} 个假说 · ${totalDa} 个数据分析任务 · ${totalWl} 个湿实验方案）</div><div class="hyp-cards">${cardsHtml}</div></div>`;
+  el.appendChild(wrap);
+  scrollBottom();
+}
+
+// ── 数据分析结果卡（目标4：端到端执行结局）─────────────────────
+// analysis 阶段完成后端推送 type=analysis 事件：每个数据分析任务一张
+// 结果行——状态/执行后端/notebook（可点击打开预览标签）/溯源 JSON/
+// 输出文件/自修复轮数/退出码。计划卡（validation）与结果卡闭环。
+const ANALYSIS_BACKEND_LABEL = {
+  jupyter: 'Jupyter（notebook 带真实输出）',
+  python: 'Python 脚本',
+  dry_run: 'Dry-run（脚本+notebook 已生成）',
+};
+function showAnalysisCards(analyses, container) {
+  const el = container || document.querySelector('#messages .messages-inner');
+  if (!el) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg msg-ai ana-cards-msg';
+  const linkBtn = (path, label, icon) => path ? `<button class="ana-link" data-preview="${escHtml(path)}" title="${escHtml(path)}">${icon} ${escHtml(label)}</button>` : '';
+  const rows = analyses.map(a => {
+    const ok = a.success === true;
+    const dry = String(a.execution_backend || '') === 'dry_run';
+    const badge = dry ? '<span class="stage-badge warn">dry-run</span>'
+      : ok ? '<span class="stage-badge completed">成功</span>'
+      : '<span class="stage-badge failed">失败</span>';
+    const backend = ANALYSIS_BACKEND_LABEL[a.execution_backend] || a.execution_backend || '';
+    const outputs = Array.isArray(a.outputs) && a.outputs.length
+      ? `<div class="ana-outputs"><b>输出：</b>${a.outputs.map(o => `<span class="mono-chip" title="${escHtml(o)}">${escHtml(o.split('/').pop())}</span>`).join(' ')}</div>` : '';
+    const warns = Array.isArray(a.input_warnings) && a.input_warnings.length
+      ? `<div class="ana-warn">&#9888; 输入警告（合成数据演示，非真实生物学结论）：${a.input_warnings.map(w => escHtml(w)).join('；')}</div>` : '';
+    const metaBits = [];
+    if (a.repair_rounds) metaBits.push(`自修复 ${a.repair_rounds} 轮`);
+    if (a.exit_code != null) metaBits.push(`exit ${a.exit_code}`);
+    if (a.duration_secs != null) metaBits.push(`${Math.round(a.duration_secs)}s`);
+    if (a.script_hash) metaBits.push(`sha ${a.script_hash}`);
+    return `<div class="ana-task ${ok ? 'ok' : dry ? 'dry' : 'bad'}">
+      <div class="ana-head">
+        <span class="da-id">${escHtml(a.task_id || '')}</span>
+        ${badge}
+        ${backend ? `<span class="ana-backend">${escHtml(backend)}</span>` : ''}
+        <span class="ana-links">
+          ${linkBtn(a.notebook_path, a.notebook_executed ? 'notebook（已执行）' : 'notebook', '&#129504;')}
+          ${linkBtn(a.provenance_path, 'provenance', '&#128279;')}
+        </span>
+      </div>
+      ${outputs}
+      ${warns}
+      ${metaBits.length ? `<div class="ana-meta">${escHtml(metaBits.join(' · '))}</div>` : ''}
+    </div>`;
+  }).join('');
+  wrap.innerHTML = `<div class="msg-bubble rich"><div class="hyp-cards-title">&#128218; 数据分析执行结果（${analyses.length} 个任务）</div><div class="ana-list">${rows}</div></div>`;
   el.appendChild(wrap);
   scrollBottom();
 }
@@ -2574,7 +2827,13 @@ async function viewProvenance() {
 
 // ── Helpers ──
 function scrollBottom() { const el = document.getElementById('messages'); el.scrollTop = el.scrollHeight; }
-function escHtml(s) { const d = document.createElement('div'); d.textContent = (s == null ? '' : s); return d.innerHTML; }
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = (s == null ? '' : s);
+  // 引号也要转义：该函数的输出会被插进属性值/内联处理器上下文，
+  // 只转 <>& 会留下 ' 和 " 的注入面。
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 const esc = escHtml;
 function showToast(msg, isError, cls) {
   const el = document.getElementById('toast');

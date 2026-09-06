@@ -85,7 +85,7 @@
 | 跨项目 KG store 累积 | ✅ | `kg_store.json` 合并历史实体/关系扩大链路预测候选 |
 | 链路预测（TransE + 路径 + GIVE） | ✅ | 疾病锚定过滤候选 |
 | 假说生成 + 启发式排序 | ✅ | LLM 评估 plausibility，空响应/不可信自动跳过 |
-| 对抗辩论（4 角色含 rebuttal） | ✅ | 正方立论 → 反方驳论 → 正方 rebuttal → 裁决；证据要点强制带 URL/PMID |
+| 对抗辩论（4 角色含 rebuttal） | ✅ | 正方立论 → 反方驳论 → 正方 rebuttal → 裁决；证据要点强制带 URL/PMID；反方独立意见与已执行合并操作前端可见 |
 | 跨假说对比 + 精炼 | ✅ | 矛盾对比、排序理由、merge 建议 |
 | **假说合并执行**（merge/drop/revise） | ✅ | 裁判建议结构化为操作并真正应用；置信度只降不升、证据并集、≤3 操作 |
 | 验证计划生成 + GEO 落地 | ⚠️ | GEO accession 自动校验落地；**TCGA/ArrayExpress/ENA/PPMI/custom_url 无下载器 → dry-run** |
@@ -94,13 +94,14 @@
 | 引用逐条核验 | ✅ | 链接抽取 → 双向语料比对 → esummary 标题比对；标题错配 → fail |
 | 报告分节 LLM 审核 | ✅ | 按 `##` 分节窗口审核，全报告覆盖，节选不再误报截断 |
 | 报告章节过渡 | ✅ | 各节承接叙述（含动态数量），去机械拼装感 |
-| Loop 多智能体并行 | ✅ | 波次并行 + 上游输出注入 + critic/judge + 三方裁决 |
+| Loop 多智能体并行 | ✅ | 波次并行 + 上游输出注入 + critic/judge（审查结果事件化，前端审查区块）+ 三方裁决（评估·裁决卡） |
 | 服务重启自动续跑 | ⚠️ | research 模式支持 manifest resume（同一 project-dir 重跑）；loop 模式仅 follow-up 间接触发，**无自动续跑** |
 | 预览：Markdown/JSON/CSV/TSV | ✅ | CSV/TSV 为 RFC4180 感知解析（引号字段/多行字段/截断半行丢弃） |
 | 预览：`.ipynb`（含输出/图表） | ✅ | 单元格级渲染：markdown/code/输出/错误回溯 |
 | 预览：Excel（.xlsx/.xls/.xlsm/.xlsb） | ✅ | calamine 服务端解析，多 sheet 切换，500×60 截断 |
 | 预览：图片（png/jpg/svg/gif/webp） | ✅ | raw 路由内联渲染 |
-| 结构化假说/辩论卡片 | ✅ | 专用 WS 事件 + 历史重绘；置信度变化、rebuttal、跨假说矛盾 |
+| 结构化假说/辩论卡片 | ✅ | 专用 WS 事件 + 历史重绘；置信度变化、rebuttal、跨假说矛盾、已执行合并操作、反方独立意见 |
+| 数据分析结果卡 | ✅ | 每 DA 任务执行结局（成功/dry-run/失败）+ notebook/provenance 一键预览 + 自修复轮数 + 输入警告（合成数据演示显式降级） |
 | Provenance 溯源面板 | ✅ | 脚本哈希/seed/conda 包版本/git commit/repair 历史 |
 | 跨供应商回退 + 账户熔断 | ✅ | DeepSeek→StepFun→MiniMax；401/402/403 进程内禁用 |
 | 跨会话记忆注入 | ⚠️ | loop/workflow 模式 ✅；research 模式刻意不注入（防查询污染） |

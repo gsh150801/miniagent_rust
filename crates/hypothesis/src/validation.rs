@@ -65,6 +65,7 @@ impl ValidationPlan {
                 ),
                 dataset_source: DatasetSource::Geo,
                 dataset_accession: None,
+                dataset_note: None,
                 cohort_definition: "disease vs control".into(),
                 variables: AnalysisVariables {
                     independent: vec![format!("{gene} expression")],
@@ -110,6 +111,11 @@ pub struct DataAnalysisTask {
     /// Concrete accession / path / URL when known (e.g. `"GSE12345"`).
     #[serde(default)]
     pub dataset_accession: Option<String>,
+    /// Provenance of the accession: how it was grounded (verified against GEO
+    /// metadata / re-searched after rejection / kept with a caveat). Populated
+    /// by the pipeline's dataset-grounding pass, rendered by the UI.
+    #[serde(default)]
+    pub dataset_note: Option<String>,
     /// How to define the cohorts / comparison groups.
     pub cohort_definition: String,
     /// Variables involved in the analysis.
@@ -208,6 +214,7 @@ mod tests {
                 objective: "Quantify BRCA1 differential expression".into(),
                 dataset_source: DatasetSource::Geo,
                 dataset_accession: Some("GSE12345".into()),
+                dataset_note: None,
                 cohort_definition: "tumor vs adjacent normal".into(),
                 variables: AnalysisVariables {
                     independent: vec!["BRCA1 expression".into()],
