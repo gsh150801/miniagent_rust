@@ -124,7 +124,13 @@ function handleMsg(msg) {
     case 'stage_output': showStageOutput(msg.stage, msg.summary); break;
     case 'stream': appendStream(msg.text); break;
     case 'agent_event': handleAgentEvent(msg); break;
-    case 'complete':
+    case 'complete': {
+      // 列表状态无条件同步（其他任务的完成也要反映在侧栏）。
+      syncTaskMeta(msg.task_id, msg.status === 'failed' ? 'failed' : 'completed');
+      // 中间面板只响应当前查看的任务——否则后台完成的任务会把
+      // currentTaskId 抢走（finishStream 里会设置），用户正在看的
+      // 任务被"劫持"，后续事件全部追加到错误的会话（live bug）。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       stopElapsed();
       stageStatus = {};
       liveToolOps.clear();
@@ -132,17 +138,19 @@ function handleMsg(msg) {
       // the task completed (the list would show a bogus ✓ until refresh).
       if (msg.status === 'failed') {
         finishStreamError('任务执行失败（详见服务器日志 / project.json 事件日志）');
-        syncTaskMeta(msg.task_id, { status: 'failed' });
       } else {
         finishStream(msg.task_id, msg.files);
-        syncTaskMeta(msg.task_id, { status: 'completed' });
       }
       renderProgressView();
       break;
+    }
     case 'error':
+      syncTaskMeta(msg.task_id, { status: 'failed' });
+      // 只干扰当前查看的任务（与 complete 同理：后台失败的任务
+      // 不应覆盖用户正在看的会话）。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
       stopElapsed();
       finishStreamError(msg.message);
-      syncTaskMeta(msg.task_id, { status: 'failed' });
       renderProgressView();
       break;
     case 'tasks':
@@ -243,7 +251,7 @@ function appendToolOpCard(callId, tool, input) {
     card.querySelector('.op-chev').innerHTML = showing ? '&#9654;' : '&#9660;';
   });
   inner.appendChild(card);
-  scrollBottom();
+  if (!replaying) scrollBottom();
   return card;
 }
 
@@ -758,6 +766,7 @@ function selectTask(id) {
   currentPlan = null;
   activityFeed = [];
   activityStats = { tools: 0, toolErrors: 0, skills: 0, subtasks: 0, iterations: 0 };
+  liveToolOps.clear();
   resultAnchor = null;
   resetSubtaskState();
   renderProgressView();
@@ -768,17 +777,41 @@ function selectTask(id) {
 
 // Replay an event_log array (each entry: {ts, event: {...AgentEvent}}) into
 // the in-memory activity feed + stats so the right panel matches what the
-// backend actually emitted.
+// backend actually emitted. P-前端改进：同时按时间序重建中间面板的工具
+// 操作卡（requested 建卡 → completed 填结果），修复"任务完成后/切换
+// 任务后对话面板看不到工具调用"——此前回放只喂右侧活动流。
+let replaying = false;
+
 function replayEventLog(eventLog) {
   if (!Array.isArray(eventLog) || eventLog.length === 0) return;
-  for (const entry of eventLog) {
-    const ev = (entry && entry.event) || entry;
-    if (!ev || !ev.type) continue;
-    const ts = entry.ts ? Date.parse(entry.ts) || Date.now() : Date.now();
-    // Reuse the live handler logic, but suppress DOM re-render until the batch finishes.
-    ingestAgentEvent(ev, ts, false);
+  replaying = true;
+  try {
+    for (const entry of eventLog) {
+      const ev = (entry && entry.event) || entry;
+      if (!ev || !ev.type) continue;
+      const ts = entry.ts ? Date.parse(entry.ts) || Date.now() : Date.now();
+      // Right-panel feed/stats (suppressed re-render; batch at the end).
+      ingestAgentEvent(ev, ts, false);
+      // Middle-panel operation cards.
+      if (ev.type === 'tool_call_requested' || ev.type === 'tool_call_completed') {
+        const cid = String(ev.call_id ?? '');
+        if (!cid) continue;
+        if (ev.type === 'tool_call_requested') {
+          if (!liveToolOps.has(cid)) {
+            const el = appendToolOpCard(cid, ev.tool_name || 'unknown',
+              typeof ev.input === 'string' ? null : ev.input);
+            liveToolOps.set(cid, el);
+          }
+        } else {
+          fillToolOpResult(cid, ev.tool_name || 'unknown', ev.output, ev.duration_ms, ev.is_error);
+        }
+      }
+    }
+  } finally {
+    replaying = false;
   }
   renderProgressView();
+  scrollBottom();
 }
 
 // Push one agent event into the local feed/stats WITHOUT re-rendering.
@@ -837,6 +870,7 @@ function renderHistory(msg) {
   // re-attach to the freshly-rendered inner instead of orphaning here.
   resultAnchor = null;
   resetSubtaskState();
+  liveToolOps.clear();
   const inner = el.querySelector('.messages-inner');
 
   // Sync the middle panel status from the freshly-loaded task snapshot. This

@@ -1136,6 +1136,23 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                             "file_tree": file_tree,
                             "event_log": task.event_log.clone(),
                         });
+                        // 服务重启后内存 event_log 清空；从磁盘 JSONL 审计
+                        // 尾部恢复（限 400 条：足够前端回放活动流与工具操作
+                        // 卡，又不会让超大日志撑爆 WS 帧）。
+                        if task.event_log.is_empty() {
+                            let log_path = task.result_dir.join("event_log.jsonl");
+                            if let Ok(raw) = std::fs::read_to_string(&log_path) {
+                                let lines: Vec<&str> = raw.lines().collect();
+                                let tail = lines.len().saturating_sub(400);
+                                let recovered: Vec<serde_json::Value> = lines[tail..]
+                                    .iter()
+                                    .filter_map(|l| serde_json::from_str(l).ok())
+                                    .collect();
+                                if !recovered.is_empty() {
+                                    response["event_log"] = serde_json::json!(recovered);
+                                }
+                            }
+                        }
                         if !task.messages.is_empty() {
                             response["messages"] = serde_json::json!(task.messages);
                         }
