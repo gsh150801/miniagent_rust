@@ -92,6 +92,11 @@ pub struct AnalysisResult {
     pub provenance_path: Option<PathBuf>,
     pub provenance: ProvenanceRecord,
     pub error: Option<String>,
+    /// Honesty declarations detected in the executed script's own output
+    /// (synthetic fallback, input mismatch). Surfaced to the pipeline so the
+    /// report/front-end can flag the run instead of presenting it as a
+    /// clean result. Empty on dry-runs/failures.
+    pub input_warnings: Vec<String>,
 }
 
 pub struct AnalysisRunner {
@@ -213,6 +218,7 @@ impl AnalysisRunner {
                 false,
                 ExecutionBackend::DryRun,
                 vec![],
+                vec![],
             );
             let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
             return Ok(AnalysisResult {
@@ -230,6 +236,7 @@ impl AnalysisRunner {
                     "dry-run: no local data available (source={:?}); script + notebook generated for manual execution",
                     task.dataset_source
                 )),
+                input_warnings: Vec::new(),
             });
         }
 
@@ -334,8 +341,17 @@ impl AnalysisRunner {
                         started_at, instant.elapsed(), Some(0), &o.stdout, &o.stderr, &conda_bin,
                         conda_used, Some(&notebook_path), notebook_executed, backend,
                         repair_history,
+                    scan_input_warnings(&o.stdout, &o.stderr),
                     );
                     let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
+                    let input_warnings = scan_input_warnings(&o.stdout, &o.stderr);
+                    if !input_warnings.is_empty() {
+                        tracing::warn!(
+                            task = %task.id,
+                            warnings = ?input_warnings,
+                            "analysis output declares synthetic/mismatched input"
+                        );
+                    }
                     return Ok(AnalysisResult {
                         task_id: task.id.clone(),
                         success: true,
@@ -348,6 +364,7 @@ impl AnalysisRunner {
                         provenance_path: Some(provenance_path),
                         provenance,
                         error: None,
+                        input_warnings,
                     });
                 }
                 Ok(o) => {
@@ -378,7 +395,7 @@ impl AnalysisRunner {
         let provenance = self.finalize_provenance(
             task, hypothesis_ref, &script_path, &local_data_path, &task_dir, opts, started_at,
             instant.elapsed(), Some(1), "", &last_error, &conda_bin, conda_used,
-            Some(&notebook_path), false, ExecutionBackend::Python, repair_history,
+            Some(&notebook_path), false, ExecutionBackend::Python, repair_history, vec![],
         );
         let provenance_path = self.persist_provenance(&task_dir, &provenance)?;
         Ok(AnalysisResult {
@@ -396,6 +413,7 @@ impl AnalysisRunner {
                 "analysis failed after {MAX_ATTEMPTS} attempts: {}",
                 tail_of(&last_error, 300)
             )),
+            input_warnings: Vec::new(),
         })
     }
 
@@ -419,7 +437,7 @@ impl AnalysisRunner {
     ) -> AnalysisResult {
         let provenance = self.finalize_provenance(
             task, hypothesis_ref, script_path, local_data, task_dir, opts, started_at, elapsed,
-            None, "", error, &None, false, Some(notebook_path), false, backend, repair_history,
+            None, "", error, &None, false, Some(notebook_path), false, backend, repair_history, vec![],
         );
         let provenance_path = self.persist_provenance(task_dir, &provenance).ok();
         AnalysisResult {
@@ -434,6 +452,7 @@ impl AnalysisRunner {
             provenance_path,
             provenance,
             error: Some(error.to_string()),
+            input_warnings: Vec::new(),
         }
     }
 
@@ -770,6 +789,7 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
         notebook_executed: bool,
         backend: ExecutionBackend,
         repair_history: Vec<RepairAttempt>,
+        input_warnings: Vec<String>,
     ) -> ProvenanceRecord {
         let inputs: Vec<FileRecord> = local_data
             .iter()
@@ -822,7 +842,8 @@ Output ONLY the Python code, no markdown fences, no explanation."#,
             }
             .to_string(),
             repair_history,
-        }
+                input_warnings,
+}
     }
 
     fn persist_provenance(
@@ -971,6 +992,41 @@ fn detect_conda() -> Option<String> {
 }
 
 // ── Self-repair helpers ─────────────────────────────────────────
+
+/// Markers that generated scripts print when they detect the provided data
+/// does not match the task (the generation prompt mandates honest
+/// declarations). A match is escalated from "note inside cell output" to a
+/// task-level warning so reports never present a synthetic-data run as a
+/// clean result.
+const INPUT_WARNING_MARKERS: &[&str] = &[
+    "\"synthetic_data_used\": true",
+    "synthetic_data_used: true",
+    "input mismatch",
+    "data mismatch",
+    "dataset mismatch",
+    "input does not match",
+];
+
+fn scan_input_warnings(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for src in [stdout, stderr] {
+        let lower = src.to_lowercase();
+        for marker in INPUT_WARNING_MARKERS {
+            let m = marker.to_lowercase();
+            if let Some(pos) = lower.find(&m) {
+                let snippet: String = src[pos.saturating_sub(40)..]
+                    .chars()
+                    .take(180)
+                    .collect();
+                let snippet = snippet.replace('\n', " ");
+                if !out.iter().any(|w: &String| w.contains(marker)) {
+                    out.push(format!("[{marker}] …{snippet}…"));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// One completion call against any provider, returning concatenated text.
 async fn complete_code_text(
@@ -1368,6 +1424,27 @@ fn collect_outputs(task_dir: &Path, script: &Path, notebook: &Path) -> Vec<PathB
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn detects_synthetic_and_mismatch_markers() {
+        let stdout = "[load] metadata keys: 0\nNOTE: Input mismatch — synthesizing PD cohort.\nRESULT = {\"synthetic_data_used\": true, \"n_total\": 100}\n";
+        let w = scan_input_warnings(stdout, "");
+        assert!(w.iter().any(|x| x.contains("input mismatch")), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("synthetic_data_used")), "{w:?}");
+    }
+
+    #[test]
+    fn clean_output_has_no_warnings() {
+        assert!(scan_input_warnings("RESULT = {\"pvalue\": 0.01}", "").is_empty());
+        assert!(scan_input_warnings("", "").is_empty());
+    }
+
+    #[test]
+    fn dedupes_repeated_markers() {
+        let stdout = "input mismatch\ninput mismatch\ninput mismatch";
+        let w = scan_input_warnings(stdout, "");
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
     use super::*;
     use std::io::Write;
 
@@ -1482,6 +1559,7 @@ mod tests {
             objective: "test".into(),
             dataset_source: DatasetSource::Geo,
             dataset_accession: Some("GSE1".into()),
+            dataset_note: None,
             cohort_definition: "x".into(),
             variables: Default::default(),
             statistical_method: "t-test".into(),

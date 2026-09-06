@@ -354,8 +354,10 @@ pub async fn run_research(
     let (phase1_dur, phase2_dur) = if let Some(p) = resumed_papers.filter(|p| !p.is_empty()) {
         paper_texts = p;
         phase_end(&on_progress, &mut prev_phase);
-        prev_phase = Some("literature");
-        phase_begin(&on_progress, "literature");
+        // Resumed corpus: do NOT phase_begin("literature") — the stage is
+        // instantly skipped, and emitting "running" for it regresses the
+        // already-completed phase pill in the UI (every loop subtask re-enters
+        // this path, so the stale event fired once per subtask).
         println!("━━━ Phase 1–2: ↻ resumed — {} abstracts from {} ━━━",
             paper_texts.len(), papers_path.display());
         (std::time::Duration::default(), std::time::Duration::default())
@@ -1811,6 +1813,22 @@ pub async fn run_research(
             }
         }
 
+        // 下载后校验的缓存与判定器（同一 accession 只取一次 GEO 元数据、
+        // 只做一次 LLM 样本类型判定）。
+        let mut summary_cache: std::collections::HashMap<String, Option<crate::geo_verify::GeoSeriesSummary>> =
+            std::collections::HashMap::new();
+        let mut sample_verdict_cache: std::collections::HashMap<String, Option<crate::geo_verify::CheckVerdict>> =
+            std::collections::HashMap::new();
+        let verify_flash = make_providers(config).0;
+        let verify_client = reqwest::Client::builder()
+            .user_agent("miniagent/0.1")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("verify http client");
+        let verify_api_key = std::env::var("PUBMED_API_KEY").unwrap_or_default();
+        let mut forced_dry_run: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         for (plan_idx, plan) in validation_plans.iter().enumerate() {
             let work_dir = project_abs.join("analysis").join(format!("plan_{plan_idx}"));
             for task in &plan.data_analysis_tasks {
@@ -1837,7 +1855,81 @@ pub async fn run_research(
                     {
                         Ok(path) => {
                             println!("\n      ⬇️  {acc} → {}", path.display());
-                            task_opts.local_data = Some(path);
+                            // ── 下载后二次校验：文件内 organism + 样本类型 ──
+                            // grounding 校验针对 GEO 官方记录；这里针对实际
+                            // 落盘的文件（防下载错文件/清洗错行）。
+                            let summary = if let Some(cached) = summary_cache.get(acc) {
+                                cached.clone()
+                            } else {
+                                let fetched = crate::geo_verify::fetch_geo_summary(
+                                    acc,
+                                    &verify_client,
+                                    &verify_api_key,
+                                    cancel.child_token(),
+                                )
+                                .await
+                                .ok();
+                                summary_cache.insert(acc.to_string(), fetched.clone());
+                                fetched
+                            };
+                            let meta = crate::geo_verify::parse_series_matrix_meta(&path);
+                            let mut reject_reason: Option<String> = None;
+                            match &meta {
+                                None => {
+                                    reject_reason = Some("无法解析下载文件的 ATTR_Sample_* 元数据行".into());
+                                }
+                                Some(m) => {
+                                    let org =
+                                        crate::geo_verify::matrix_organism_check(m, summary.as_ref());
+                                    if !org.compatible {
+                                        reject_reason = Some(org.reason);
+                                    }
+                                }
+                            }
+                            // 样本类型/细胞类型 LLM 判定（每 accession 一次）
+                            if reject_reason.is_none()
+                                && let Some(m) = &meta
+                            {
+                                let verdict = if let Some(cached) = sample_verdict_cache.get(acc) {
+                                    cached.clone()
+                                } else {
+                                    let v = crate::geo_verify::llm_sample_type_check(
+                                        task,
+                                        m,
+                                        verify_flash.as_ref(),
+                                        cancel.child_token(),
+                                    )
+                                    .await;
+                                    sample_verdict_cache.insert(acc.to_string(), v.clone());
+                                    v
+                                };
+                                if let Some(v) = &verdict
+                                    && !v.compatible
+                                {
+                                    reject_reason = Some(format!("样本类型不匹配: {}", v.reason));
+                                }
+                            }
+                            match reject_reason {
+                                Some(reason) => {
+                                    let msg = format!(
+                                        "🚫 {} 数据集 {} 未通过下载后校验（{reason}）→ 强制 dry-run",
+                                        task.id, acc
+                                    );
+                                    println!("      {msg}");
+                                    if let Some(cb) = on_progress.as_ref() {
+                                        cb("analysis", "running", Some(&msg));
+                                    }
+                                    manifest.log_event(
+                                        "analysis_input_rejected",
+                                        msg.chars().skip(2).collect::<String>(),
+                                    );
+                                    forced_dry_run.insert(task.id.clone(), reason);
+                                    // 不设置 local_data → runner 自然 dry-run
+                                }
+                                None => {
+                                    task_opts.local_data = Some(path);
+                                }
+                            }
                         }
                         Err(e) => println!("\n      ⚠️  GEO download {acc} failed: {e} (dry-run)"),
                     }
@@ -1854,6 +1946,18 @@ pub async fn run_research(
                     Ok(res) => {
                         if res.dry_run {
                             println!("📝 dry-run (script + notebook generated)");
+                            // 下载后校验被拒的任务：把拒绝原因带进 dry-run 说明，
+                            // 不让"数据错配"与"无数据"混为一谈。
+                            if let Some(reason) = forced_dry_run.get(&res.task_id).cloned() {
+                                println!("      ↳ 原因：{reason}");
+                                manifest.log_event(
+                                    "analysis_forced_dry_run",
+                                    format!("{}: {reason}", res.task_id),
+                                );
+                                if let Some(cb) = on_progress.as_ref() {
+                                    cb("analysis", "running", Some(&format!("📝 {} dry-run 原因：{reason}", res.task_id)));
+                                }
+                            }
                             dry_count += 1;
                         } else if res.success {
                             println!("✅ {} output file(s) [{:?}]", res.output_files.len(), res.execution_backend);
@@ -1870,6 +1974,25 @@ pub async fn run_research(
                         println!("      notebook: {} (executed: {})", res.notebook_path.display(), res.notebook_executed);
                         if let Some(p) = res.provenance_path.as_ref() {
                             println!("      provenance: {}", p.display());
+                        }
+                        // 脚本自报的输入错配/合成数据声明 → 任务级警告：
+                        // 事件日志 + 前端进度 + 报告 §7 都可见，不再只躺在
+                        // notebook 的 cell 输出里。
+                        if !res.input_warnings.is_empty() {
+                            for w in &res.input_warnings {
+                                println!("      ⚠️ input warning: {w}");
+                            }
+                            let w0 = res.input_warnings.join("；");
+                            manifest.log_event(
+                                "analysis_input_warning",
+                                format!("{}: {}", res.task_id, w0),
+                            );
+                            if let Some(cb) = on_progress.as_ref() {
+                                cb("analysis", "running", Some(&format!(
+                                    "⚠️ {} 输入警告：脚本自报使用了合成数据或检测到数据错配（详见 provenance.json 的 input_warnings）",
+                                    res.task_id
+                                )));
+                            }
                         }
                         if let Some(cb) = on_progress.as_ref() {
                             let outcome = if res.dry_run {
@@ -1891,6 +2014,7 @@ pub async fn run_research(
                             provenance_path: res.provenance_path.clone(),
                             success: res.success,
                             execution_backend: format!("{:?}", res.execution_backend).to_lowercase(),
+                            input_warnings: res.input_warnings.clone(),
                         });
                         tracing::info!(
                             target: "tool_call",
@@ -2405,11 +2529,93 @@ async fn ground_plan_datasets(
     use miniagent_tool::traits::Tool;
 
     let mut grounded = Vec::new();
+    let client = reqwest::Client::builder()
+        .user_agent("miniagent/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok();
+    let api_key = std::env::var("PUBMED_API_KEY").unwrap_or_default();
     for task in &mut plan.data_analysis_tasks {
-        if task.dataset_accession.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-            continue; // already concrete
+        let is_geo = matches!(task.dataset_source, DatasetSource::Geo);
+        // ── 既有 accession 主题校验 ─────────────────────────────
+        // 计划生成 LLM 可能凭参数记忆写出"看似合理"的 accession（live 实测：
+        // 帕金森肠脑轴任务拿到了疟原虫 RNA-seq、阿尔茨海默皮层、牛转录组——
+        // 编号真实存在但与任务毫无关系）。存在性≠相关性，这里用 GEO 官方
+        // 元数据做物种硬规则 + LLM 主题/样本/细胞类型三重判断，不过关就
+        // 清空 accession 走搜索重选；重选也失败则留空（任务将诚实 dry-run）。
+        if is_geo
+            && task.dataset_accession.as_deref().map(|a| !a.trim().is_empty()).unwrap_or(false)
+        {
+            let acc = task.dataset_accession.clone().unwrap_or_default();
+            let summary = match client.as_ref() {
+                Some(c) => {
+                    crate::geo_verify::fetch_geo_summary(&acc, c, &api_key, cancel.child_token())
+                        .await
+                        .ok()
+                }
+                None => None,
+            };
+            match summary {
+                Some(summary) => {
+                    let lex = crate::geo_verify::lexical_check(task, &summary);
+                    if !lex.compatible {
+                        let msg = format!("{} accession {} 被拒: {}", task.id, acc, lex.reason);
+                        println!("      🚫 {msg} → 重新检索");
+                        grounded.push(msg);
+                        task.dataset_accession = None; // 落入下方搜索重选
+                        task.dataset_note = Some(format!("🚫 原 accession {acc} 被拒（{reason}）——已重新检索", reason = lex.reason));
+                    } else {
+                        let topic = crate::geo_verify::llm_topic_check(
+                            task,
+                            hypothesis_statement,
+                            &summary,
+                            flash.as_ref(),
+                            cancel.child_token(),
+                        )
+                        .await;
+                        match topic {
+                            Some(v) if !v.compatible => {
+                                let msg = format!(
+                                    "{} accession {} 主题不符: {} → 重新检索",
+                                    task.id, acc, v.reason
+                                );
+                                println!("      🚫 {msg}");
+                                grounded.push(msg);
+                                task.dataset_accession = None;
+                                task.dataset_note = Some(format!("🚫 原 accession {acc} 主题不符（{}）——已重新检索", v.reason));
+                            }
+                            Some(v) => {
+                                grounded
+                                    .push(format!("{} 已校验 {} ✅ {}", task.id, acc, v.reason));
+                                task.dataset_note = Some(format!("✅ 已对 GEO 官方元数据校验：{}", v.reason));
+                                continue; // 校验通过，保留
+                            }
+                            None => {
+                                // LLM 不可用：物种硬规则已通过，保守保留；
+                                // 下载后的文件级校验仍会兜底。
+                                grounded.push(format!(
+                                    "{} 保留 {}（LLM 主题校验不可用，物种硬规则通过）",
+                                    task.id, acc
+                                ));
+                                task.dataset_note = Some("⚠️ 物种硬规则通过；LLM 主题校验不可用，依赖下载后校验兜底".to_string());
+                                continue;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // GEO 元数据拉不到：保留 accession（存在性已被接受），
+                    // 下载后的文件级校验仍会兜底。
+                    grounded.push(format!(
+                        "{} 保留 {}（GEO 元数据不可达，依赖下载后校验）",
+                        task.id, acc
+                    ));
+                    task.dataset_note = Some("⚠️ GEO 元数据不可达——保留 accession，依赖下载后校验兜底".to_string());
+                    continue;
+                }
+            }
         }
-        if !matches!(task.dataset_source, DatasetSource::Geo) {
+        if !is_geo {
             continue; // only GEO can be grounded via the GEO search API
         }
         let query = geo_query_from_parts(&task.objective, hypothesis_statement);
@@ -2430,6 +2636,7 @@ async fn ground_plan_datasets(
         };
         let listing: String = out.content.chars().take(4000).collect();
         let Some(first) = first_geo_accession(&listing) else {
+            task.dataset_note = Some("⚠️ GEO 检索无兼容数据集——任务将以 dry-run 方式生成脚本与 notebook".to_string());
             continue;
         };
         let acc = match pick_compatible_geo(&listing, task, hypothesis_statement, flash.as_ref(), &cancel).await {
@@ -2437,6 +2644,7 @@ async fn ground_plan_datasets(
             None => first, // LLM scoring failed — legacy first-hit fallback
         };
         task.dataset_accession = Some(acc.clone());
+        task.dataset_note = Some(format!("🔎 通过 GEO 检索按主题兼容性选定 {acc}（查询：{query}）"));
         grounded.push(format!("{} → {} ({})", task.id, acc, query));
     }
     grounded

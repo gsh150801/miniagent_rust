@@ -14,6 +14,7 @@
 pub mod pipeline;
 pub mod loop_orchestrator;
 pub mod review;
+pub mod geo_verify;
 pub use loop_orchestrator::run_research_in_loop;
 pub use pipeline::{run_research, ResearchOptions, ResearchProgress};
 
@@ -75,6 +76,10 @@ pub struct AnalysisRef {
     /// "jupyter" | "python" | "dry_run".
     #[serde(default)]
     pub execution_backend: String,
+    /// Honesty declarations detected in the executed analysis output
+    /// (synthetic-data fallback, input mismatch). Rendered as ⚠️ in §7.
+    #[serde(default)]
+    pub input_warnings: Vec<String>,
 }
 
 /// A timestamped audit event on the manifest timeline.
@@ -848,7 +853,13 @@ impl ProjectManifest {
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
                         .unwrap_or("—");
-                    let status = if a.success { "✅ 成功" } else { "❌ 失败" };
+                    let status = if !a.input_warnings.is_empty() {
+                        "⚠️ 成功（输入警告）"
+                    } else if a.success {
+                        "✅ 成功"
+                    } else {
+                        "❌ 失败"
+                    };
                     md.push_str(&format!(
                         "| {} | {} | {} | `{}` | `{}` |\n",
                         a.task_id,
@@ -859,6 +870,22 @@ impl ProjectManifest {
                     ));
                 }
                 md.push('\n');
+                // 输入警告逐条列出：脚本自报合成数据/错配的任务在这里显式
+                // 降级为"演示性结果"，避免被当成真实生物学结论引用。
+                let warned: Vec<&AnalysisRef> = group
+                    .iter()
+                    .copied()
+                    .filter(|a| !a.input_warnings.is_empty())
+                    .collect();
+                if !warned.is_empty() {
+                    md.push_str("**⚠️ 输入警告（结果为合成数据演示，非真实生物学结论）：**\n\n");
+                    for a in warned {
+                        for w in &a.input_warnings {
+                            md.push_str(&format!("- `{}`: {}\n", a.task_id, w));
+                        }
+                    }
+                    md.push('\n');
+                }
                 md.push_str("每个 `analysis.ipynb` 包含该任务的全部计算步骤、注释与图表，可在 Jupyter 中重放；`provenance.json` 记录脚本哈希、输入输出文件、运行环境与执行时间。\n\n");
             }
         }
@@ -1348,6 +1375,7 @@ impl AnalysisRef {
             provenance_path: None,
             success: false,
             execution_backend: String::new(),
+            input_warnings: Vec::new(),
         }
     }
 }
@@ -1373,6 +1401,7 @@ mod tests {
             provenance_path: None,
             success,
             execution_backend: if success { "jupyter".into() } else { "python".into() },
+            input_warnings: Vec::new(),
         };
         m.record_analysis(base(false)); // first attempt failed
         m.record_analysis(base(true)); // repair round succeeded
@@ -1570,6 +1599,7 @@ mod tests {
             provenance_path: Some("analysis/plan_1/analysis/DA-1/provenance.json".into()),
             success: true,
             execution_backend: "jupyter".into(),
+            input_warnings: vec![],
         });
 
         let path = m.write_user_report("brief_test").unwrap();

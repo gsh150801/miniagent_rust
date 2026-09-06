@@ -57,6 +57,12 @@ pub struct ProvenanceRecord {
     /// on the first try.
     #[serde(default)]
     pub repair_history: Vec<RepairAttempt>,
+    /// Task-level honesty warnings surfaced from the executed script's own
+    /// output — e.g. the generated code detected an input mismatch and fell
+    /// back to a synthetic cohort (`synthetic_data_used: true`). Empty when
+    /// the analysis ran on the provided data without such declarations.
+    #[serde(default)]
+    pub input_warnings: Vec<String>,
 }
 
 /// One repair iteration of an analysis task.
@@ -254,6 +260,7 @@ mod tests {
             notebook_executed: true,
             execution_backend: "jupyter".into(),
             repair_history: vec![],
+            input_warnings: vec![],
         };
         let json = rec.to_json_pretty().unwrap();
         assert!(json.contains("\"task_id\": \"DA-1\""));
