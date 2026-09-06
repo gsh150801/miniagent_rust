@@ -1,6 +1,11 @@
 ---
 name: bids
 description: >
+  Brain Imaging Data Structure (BIDS) — the community standard for organizing
+  neuroscience and biomedical datasets (11 modalities: MRI/PET/microscopy,
+  EEG/MEG/iEEG, NIRS, behavioral). Covers BIDS directory/naming conventions,
+  PyBIDS querying, bids-validator compliance checks, and DICOM conversion via
+  HeuDiConv/dcm2bids for OpenNeuro/DANDI-ready datasets.
 triggers:
   - bids
 tools_needed:

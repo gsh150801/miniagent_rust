@@ -541,6 +541,9 @@ async fn preview_handler(
     if !is_text {
         return Ok(Json(serde_json::json!({
             "preview": false,
+            // ext 必须带上：前端对图片扩展名走 raw 路由内联 <img> 渲染，
+            // 缺 ext 时图片被误判为不可预览的二进制（live: png 预览失败）。
+            "ext": ext,
             "size": size,
             "is_text": false,
         })));

@@ -2169,14 +2169,16 @@ async function openPreview(path) {
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/preview/${encodeURIComponent(path)}`);
     const data = await resp.json();
-    if (!data.preview) {
+    const ext0 = (data.ext || '').toLowerCase();
+    const isImageExt = ['png','jpg','jpeg','gif','svg','webp'].includes(ext0);
+    if (!data.preview && !isImageExt) {
       applyPreviewContent(path, 'ready', 'pv-raw',
         `Binary file (${fmtSize(data.size)}).<br>Use download to access it.`);
       return;
     }
-    const ext = (data.ext || '').toLowerCase();
+    const ext = ext0;
     let className = '', html = '';
-    if (['png','jpg','jpeg','gif','svg','webp'].includes(ext)) {
+    if (isImageExt) {
       // 图片（notebook 图表、管线绘图）经 raw 路由内联渲染。
       className = 'pv-image';
       html = `<img class="pv-img" src="/api/tasks/${currentTaskId}/raw/${encodeURIComponent(path)}" alt="${escHtml(path)}">`;

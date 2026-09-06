@@ -138,11 +138,32 @@ fn split_frontmatter(content: &str) -> Result<(String, String), String> {
 fn parse_frontmatter(yaml_like: &str) -> Result<SkillMetadata, String> {
     let mut meta = SkillMetadata::default();
     let mut current_array: Option<(&str, Vec<String>)> = None;
+    // YAML 折叠/字面量标量（description: > / |）收集状态。
+    // 此前逐行解析把 ">" 当成值、丢弃缩进续行，15 个 skill 的
+    // description 退化成单个 ">" 字符（live: 技能列表无描述文本）。
+    let mut multi: Option<(String, char, Vec<String>, usize)> = None;
 
     for line in yaml_like.lines() {
+        let indent = line.len() - line.trim_start().len();
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
+        }
+
+        // 多行标量收集中的结束判定：缩进回到 key 的层级（或更浅）
+        // 即遇到下一个顶级字段，flush 后按普通行继续处理。
+        if let Some((ref mkey, style, ref mut lines, base_indent)) = multi {
+            if indent <= base_indent {
+                let joined = match style {
+                    '>' => lines.join(" "),
+                    _ => lines.join("\n"),
+                };
+                set_meta_field(&mut meta, &mkey, &serde_json::Value::String(joined))?;
+                multi = None;
+            } else {
+                lines.push(trimmed.to_string());
+                continue;
+            }
         }
 
         // Check if we're continuing an array
@@ -165,6 +186,14 @@ fn parse_frontmatter(yaml_like: &str) -> Result<SkillMetadata, String> {
             let key = key.trim();
             let value = value.trim().trim_matches('"');
 
+            // YAML 块标量指示符：> 折叠（换行折叠为空格）、| 字面量
+            //（保留换行），含 chomping 变体（>- |+ 等）。
+            let first = value.chars().next().unwrap_or('\0');
+            if matches!(first, '>' | '|') && value.len() <= 2 {
+                multi = Some((key.to_string(), first, Vec::new(), indent));
+                continue;
+            }
+
             if value.is_empty() {
                 // Start of an array
                 current_array = Some((key, Vec::new()));
@@ -174,7 +203,14 @@ fn parse_frontmatter(yaml_like: &str) -> Result<SkillMetadata, String> {
         }
     }
 
-    // Flush last array
+    // Flush trailing multi-line scalar / array
+    if let Some((mkey, style, lines, _)) = multi {
+        let joined = match style {
+            '>' => lines.join(" "),
+            _ => lines.join("\n"),
+        };
+        set_meta_field(&mut meta, &mkey, &serde_json::Value::String(joined))?;
+    }
     if let Some((field_name, values)) = current_array {
         set_meta_field(&mut meta, field_name, &serde_json::Value::Array(
             values.into_iter().map(serde_json::Value::String).collect()
@@ -273,4 +309,41 @@ fn parse_examples(body: &str) -> Vec<SkillExample> {
     }
 
     examples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 折叠标量（description: >）：缩进续行折叠为单行空格连接。
+    /// 此前被逐行解析器退化成 ">" 字面量（live: 15 个技能无描述）。
+    #[test]
+    fn folded_description_joins_continuation_lines() {
+        let md = "---\nname: batch-correction\ndescription: >\n  Batch-effect detection: when to\n  correct, and the classic mistake\ntriggers:\n  - ComBat\n---\n# Body\n";
+        let bundle = parse_skill_file("test", md).unwrap();
+        assert_eq!(bundle.metadata.name, "batch-correction");
+        assert!(bundle.metadata.description.starts_with("Batch-effect detection:"),
+            "got: {:?}", bundle.metadata.description);
+        assert!(bundle.metadata.description.contains("classic mistake"),
+            "continuation lines must be folded in: {:?}", bundle.metadata.description);
+        assert!(!bundle.metadata.description.contains('\n'), "folded style joins with spaces");
+        assert_eq!(bundle.metadata.triggers, vec!["ComBat".to_string()],
+            "array after multi-line scalar must still parse");
+    }
+
+    /// 字面量标量（description: |）：保留换行。
+    #[test]
+    fn literal_description_preserves_newlines() {
+        let md = "---\nname: x\ndescription: |\n  line one\n  line two\n---\nbody\n";
+        let bundle = parse_skill_file("test", md).unwrap();
+        assert_eq!(bundle.metadata.description, "line one\nline two");
+    }
+
+    /// 单行 description 不受影响。
+    #[test]
+    fn single_line_description_still_works() {
+        let md = "---\nname: y\ndescription: Simple one-liner\n---\nbody\n";
+        let bundle = parse_skill_file("test", md).unwrap();
+        assert_eq!(bundle.metadata.description, "Simple one-liner");
+    }
 }
