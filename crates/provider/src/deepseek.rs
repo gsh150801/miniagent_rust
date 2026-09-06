@@ -486,6 +486,12 @@ impl LlmProvider for DeepSeekClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if crate::factory::is_account_error(status) {
+                crate::factory::ban_family(
+                    crate::factory::CodegenFamily::DeepSeek,
+                    &format!("{}: {}", status, body.chars().take(120).collect::<String>()),
+                );
+            }
             return Err(AgentError::provider(format!(
                 "API error {status}: {body}"
             )));
@@ -553,6 +559,12 @@ impl LlmProvider for DeepSeekClient {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                if crate::factory::is_account_error(status) {
+                    crate::factory::ban_family(
+                        crate::factory::CodegenFamily::DeepSeek,
+                        &format!("{}: {}", status, body.chars().take(120).collect::<String>()),
+                    );
+                }
                 let _ = tx
                     .send(Err(AgentError::provider(format!(
                         "API error {status}: {body}"

@@ -421,6 +421,12 @@ impl LlmProvider for StepFunClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if crate::factory::is_account_error(status) {
+                crate::factory::ban_family(
+                    crate::factory::CodegenFamily::StepFun,
+                    &format!("{}: {}", status, body.chars().take(120).collect::<String>()),
+                );
+            }
             return Err(AgentError::provider(format!(
                 "StepFun API error {status}: {body}"
             )));
@@ -486,6 +492,12 @@ impl LlmProvider for StepFunClient {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                if crate::factory::is_account_error(status) {
+                    crate::factory::ban_family(
+                        crate::factory::CodegenFamily::StepFun,
+                        &format!("{}: {}", status, body.chars().take(120).collect::<String>()),
+                    );
+                }
                 let _ = tx
                     .send(Err(AgentError::provider(format!(
                         "StepFun API error {status}: {body}"

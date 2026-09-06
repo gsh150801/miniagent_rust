@@ -106,6 +106,16 @@ pub fn codegen_fallback_provider(config: &AppConfig) -> Option<Box<dyn LlmProvid
 /// try them in order: when the first fallback ALSO fails (observed live:
 /// MiniMax hit its token cap while the DeepSeek account was out of balance),
 /// the next family still rescues the task.
+/// Pure selection: ordered families minus banned ones. Split from the
+/// constructor so the ban filtering is unit-testable without building
+/// clients.
+fn fallback_chain(active: CodegenFamily, available: [bool; 3]) -> Vec<CodegenFamily> {
+    pick_fallback_order(active, available)
+        .into_iter()
+        .filter(|f| !is_family_banned(*f))
+        .collect()
+}
+
 pub fn codegen_fallback_providers(config: &AppConfig) -> Vec<Box<dyn LlmProvider>> {
     use crate::deepseek::DeepSeekFlash;
     use crate::minimax::MiniMaxFlash;
@@ -124,7 +134,7 @@ pub fn codegen_fallback_providers(config: &AppConfig) -> Vec<Box<dyn LlmProvider
         config.minimax_api_key.is_some(),
     ];
     let mut out: Vec<Box<dyn LlmProvider>> = Vec::new();
-    for family in pick_fallback_order(active, available) {
+    for family in fallback_chain(active, available) {
         match family {
             CodegenFamily::DeepSeek => {
                 if let Some(key) = config.deepseek_api_key.as_ref() {
@@ -148,10 +158,59 @@ pub fn codegen_fallback_providers(config: &AppConfig) -> Vec<Box<dyn LlmProvider
 
 /// Vendor families usable for cross-family code generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CodegenFamily {
+pub enum CodegenFamily {
     DeepSeek,
     StepFun,
     MiniMax,
+}
+
+/// Process-global ban list for vendor families whose accounts are unusable —
+/// 401 (bad key) / 402 (out of balance) / 403 (forbidden). Live incident: the
+/// fallback chain walked DeepSeek → 402 "Insufficient Balance" → StepFun →
+/// 400 "no active step plan subscription" on EVERY MiniMax transient
+/// failure, because fallback selection only checked key PRESENCE. Mirrors
+/// the web_search backend health-disable pattern. Bans last for the process
+/// lifetime: an unpaid account does not recover mid-run.
+static FAMILY_BANS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn family_bit(family: CodegenFamily) -> u8 {
+    match family {
+        CodegenFamily::DeepSeek => 1 << 0,
+        CodegenFamily::StepFun => 1 << 1,
+        CodegenFamily::MiniMax => 1 << 2,
+    }
+}
+
+/// Ban a vendor family for the remainder of this process (billing/auth
+/// failure observed). Idempotent.
+pub fn ban_family(family: CodegenFamily, reason: &str) {
+    use std::sync::atomic::Ordering;
+    FAMILY_BANS.fetch_or(family_bit(family), Ordering::SeqCst);
+    let name = match family {
+        CodegenFamily::DeepSeek => "deepseek",
+        CodegenFamily::StepFun => "stepfun",
+        CodegenFamily::MiniMax => "minimax",
+    };
+    tracing::warn!(
+        family = name,
+        reason = %reason,
+        "provider family BANNED for the rest of this process (auth/billing error); fallback chain will skip it"
+    );
+}
+
+/// Whether a family is currently banned.
+pub fn is_family_banned(family: CodegenFamily) -> bool {
+    use std::sync::atomic::Ordering;
+    FAMILY_BANS.load(Ordering::SeqCst) & family_bit(family) != 0
+}
+
+/// True when the HTTP status is an account-level failure that will not
+/// recover on retry within this run.
+pub fn is_account_error(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        401 | 402 | 403
+    )
 }
 
 /// Pure fallback selection: prefer DeepSeek, then StepFun, then MiniMax —
@@ -227,6 +286,39 @@ pub fn resolve_debate_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use CodegenFamily as F;
+
+    fn codegen_fallback_providers_for_test(active: CodegenFamily, available: [bool; 3]) -> Vec<CodegenFamily> {
+        fallback_chain(active, available)
+    }
+
+    #[test]
+    fn account_error_bans_family_out_of_fallback_chain() {
+        // 402/401/403 must ban the family for the process lifetime; the
+        // fallback builder then skips it. (Live incident: every MiniMax
+        // transient failure walked into an out-of-balance DeepSeek 402.)
+        assert!(is_account_error(reqwest::StatusCode::from_u16(402).unwrap()));
+        assert!(is_account_error(reqwest::StatusCode::from_u16(401).unwrap()));
+        assert!(!is_account_error(reqwest::StatusCode::from_u16(429).unwrap()));
+        assert!(!is_account_error(reqwest::StatusCode::from_u16(400).unwrap()));
+
+        // Start from a clean slate for DeepSeek.
+        let before = is_family_banned(F::DeepSeek);
+        ban_family(F::DeepSeek, "test: 402 Insufficient Balance");
+        assert!(is_family_banned(F::DeepSeek), "ban is visible immediately");
+
+        // The ban affects the BUILT chain, not the pure order function.
+        let chain = codegen_fallback_providers_for_test(F::MiniMax, [true, true, true]);
+        assert!(
+            !chain.contains(&F::DeepSeek),
+            "banned family must be filtered from the fallback chain: {chain:?}"
+        );
+        assert!(chain.contains(&F::StepFun));
+        if !before {
+            // best effort unban for other tests in the same process
+            FAMILY_BANS.fetch_and(!family_bit(F::DeepSeek), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn codegen_fallback_prefers_other_family() {
