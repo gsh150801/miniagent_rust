@@ -107,6 +107,12 @@ pub struct DebateOutcome {
     pub refined: Vec<Hypothesis>,
     /// Number of refinement rounds applied.
     pub rounds: usize,
+    /// Merge/drop/revise operations actually applied to `refined` from the
+    /// judge's merge suggestions (structured + executed). Empty when none
+    /// were applicable or the structuring call failed. Serialized into
+    /// `debate_report.json["merge_ops_applied"]` for audit.
+    #[serde(default)]
+    pub merge_ops: Vec<serde_json::Value>,
 }
 
 // ───────────────────────────── debater ─────────────────────────────
@@ -171,6 +177,7 @@ impl HypothesisDebater {
                 comparison: CrossComparison::default(),
                 refined: vec![],
                 rounds: 0,
+                merge_ops: vec![],
             });
         }
         if hypotheses.len() == 1 {
@@ -199,6 +206,7 @@ impl HypothesisDebater {
                 comparison: CrossComparison::default(),
                 refined,
                 rounds: 1,
+                merge_ops: vec![],
             });
         }
 
@@ -323,6 +331,12 @@ impl HypothesisDebater {
                 }
             }
         }
+        // 执行裁判的 merge_suggestions：结构化成 merge/drop/revise 操作并
+        // 应用到精炼集（此前只展示不执行）。失败降级为原集合。
+        let (mut refined, merge_ops) = self
+            .apply_merge_suggestions(refined, &comparison.merge_suggestions, cancel)
+            .await;
+
         refined.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
@@ -334,6 +348,7 @@ impl HypothesisDebater {
             comparison,
             refined,
             rounds,
+            merge_ops,
         })
     }
 
@@ -988,6 +1003,243 @@ fn parse_index_uuid(v: &serde_json::Value, hypotheses: &[Hypothesis]) -> Option<
 
 // ─────────────────────── audit persistence ───────────────────────
 
+// ── Merge suggestions → structured operations ──────────────────
+/// The judge's Phase-B `merge_suggestions` used to be display-only. This
+/// section makes them executable: one LLM call converts the prose into
+/// typed ops (merge/drop/revise), then a pure function applies them to the
+/// refined set with conservative guards (≤3 ops, confidence only ever goes
+/// down, ids must resolve, merged hypothesis preserves evidence).
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeOp {
+    /// `merge` | `drop` | `revise`
+    pub op: String,
+    pub targets: Vec<uuid::Uuid>,
+    #[serde(default)]
+    pub statement: String,
+    #[serde(default)]
+    pub mechanism: Option<String>,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Parse the structuring call's JSON into ops, dropping malformed entries.
+pub fn parse_merge_ops(root: &serde_json::Value) -> Vec<MergeOp> {
+    root.get("ops")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(3) // guard: no runaway restructuring
+                .filter_map(|o| serde_json::from_value::<MergeOp>(o.clone()).ok())
+                .filter(|o| match o.op.as_str() {
+                    "merge" => o.targets.len() >= 2 && !o.statement.trim().is_empty(),
+                    "drop" => o.targets.len() == 1,
+                    "revise" => o.targets.len() == 1 && !o.statement.trim().is_empty(),
+                    _ => false,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply parsed ops to the refined set. Returns the new set plus a JSON
+/// audit trail (one entry per applied op). Targets referencing hypotheses
+/// consumed by an earlier op are skipped; a merge takes the minimum
+/// confidence of its targets and the op's own (if >0) so confidence can
+/// only decrease; evidence is unioned, never discarded.
+pub fn apply_merge_ops(
+    refined: Vec<Hypothesis>,
+    ops: &[MergeOp],
+) -> (Vec<Hypothesis>, Vec<serde_json::Value>) {
+    let mut items = refined;
+    let mut audit = Vec::new();
+    for op in ops {
+        if items.len() <= 1 {
+            break; // never collapse the set to nothing
+        }
+        // All targets must still exist.
+        if !op.targets.iter().all(|t| items.iter().any(|h| h.id == *t)) {
+            continue;
+        }
+        match op.op.as_str() {
+            "drop" if op.targets.len() == 1 => {
+                let t = op.targets[0];
+                let Some(pos) = items.iter().position(|h| h.id == t) else { continue };
+                // Only drop if something remains afterwards.
+                if items.len() - 1 < 1 {
+                    continue;
+                }
+                let removed = items.remove(pos);
+                audit.push(serde_json::json!({
+                    "op": "drop",
+                    "targets": [t.to_string()],
+                    "result_id": null,
+                    "rationale": op.rationale,
+                    "dropped_statement": removed.statement.chars().take(160).collect::<String>(),
+                }));
+            }
+            "revise" if op.targets.len() == 1 => {
+                let t = op.targets[0];
+                let Some(h) = items.iter_mut().find(|h| h.id == t) else { continue };
+                h.statement = op.statement.clone();
+                if let Some(m) = op.mechanism.clone().filter(|m| !m.trim().is_empty()) {
+                    h.mechanism = Some(m);
+                }
+                if op.confidence > 0.0 && op.confidence < h.confidence {
+                    h.confidence = op.confidence;
+                }
+                audit.push(serde_json::json!({
+                    "op": "revise",
+                    "targets": [t.to_string()],
+                    "result_id": t.to_string(),
+                    "rationale": op.rationale,
+                }));
+            }
+            "merge" if op.targets.len() >= 2 => {
+                let targets: Vec<Hypothesis> = op
+                    .targets
+                    .iter()
+                    .filter_map(|t| items.iter().find(|h| h.id == *t).cloned())
+                    .collect();
+                if targets.len() < 2 {
+                    continue;
+                }
+                let min_conf = targets
+                    .iter()
+                    .map(|h| h.confidence)
+                    .fold(op.confidence.max(0.0), f64::min);
+                let mut merged = targets[0].clone();
+                merged.id = uuid::Uuid::new_v4();
+                merged.statement = op.statement.clone();
+                if let Some(m) = op.mechanism.clone().filter(|m| !m.trim().is_empty()) {
+                    merged.mechanism = Some(m);
+                }
+                merged.confidence = min_conf.max(0.0).min(1.0);
+                merged.supporting_evidence = union_evidence(&targets, true);
+                merged.counter_evidence = union_evidence(&targets, false);
+                // Keep the target with the higher score as the source anchor.
+                merged.source_candidate = targets
+                    .iter()
+                    .max_by(|a, b| a.source_candidate.score.partial_cmp(&b.source_candidate.score).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|h| h.source_candidate.clone())
+                    .unwrap_or_else(|| targets[0].source_candidate.clone());
+                items.retain(|h| !op.targets.contains(&h.id));
+                if items.len() + 1 < 1 {
+                    continue;
+                }
+                let result_id = merged.id.to_string();
+                let stmt_head = merged.statement.chars().take(160).collect::<String>();
+                items.push(merged);
+                audit.push(serde_json::json!({
+                    "op": "merge",
+                    "targets": op.targets.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                    "result_id": result_id,
+                    "rationale": op.rationale,
+                    "statement_head": stmt_head,
+                }));
+            }
+            _ => {}
+        }
+    }
+    (items, audit)
+}
+
+/// Order-preserving union of supporting (or counter) evidence across the
+/// merge targets — `Vec::dedup` only collapses consecutive duplicates,
+/// which silently kept "shared" twice when targets' evidence interleaved.
+fn union_evidence(targets: &[Hypothesis], supporting: bool) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for t in targets {
+        let src = if supporting {
+            &t.supporting_evidence
+        } else {
+            &t.counter_evidence
+        };
+        for e in src {
+            if !all.contains(e) {
+                all.push(e.clone());
+            }
+        }
+    }
+    all
+}
+
+impl HypothesisDebater {
+    /// Convert the judge's free-form merge suggestions into structured ops
+    /// and apply them. Degrades to no-op (empty audit) on any failure so a
+    /// broken structuring call never loses the refined set.
+    async fn apply_merge_suggestions(
+        &self,
+        refined: Vec<Hypothesis>,
+        suggestions: &[String],
+        cancel: CancellationToken,
+    ) -> (Vec<Hypothesis>, Vec<serde_json::Value>) {
+        if suggestions.is_empty() || refined.len() < 2 {
+            return (refined, vec![]);
+        }
+        let roster: String = refined
+            .iter()
+            .map(|h| format!("- [id={}]: {}（置信度 {:.2}）", h.id, h.statement, h.confidence))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bullets: String = suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            r#"You are the debate chair. The judge produced free-form merge suggestions after comparing the hypotheses. Convert them into EXECUTABLE structured operations.
+
+Hypotheses (id → statement, confidence):
+{roster}
+
+Judge's merge suggestions:
+{bullets}
+
+Rules:
+- Only reference ids from the roster above.
+- op: "merge" (exactly 2 targets → one combined hypothesis), "drop" (1 target), "revise" (1 target, new statement).
+- For "merge": write a combined statement that preserves BOTH mechanistic claims and any acknowledged caveats; set confidence = min of the targets' confidences.
+- For "revise": the statement must stay falsifiable — no broadening into a catch-all claim.
+- At most 3 ops. Skip any suggestion you cannot map faithfully; an empty ops list is valid.
+
+Output ONLY valid JSON (no markdown fences):
+{{
+  "ops": [{{"op":"merge|drop|revise","targets":["<uuid>"],"statement":"...","mechanism":"...","confidence":0.0,"rationale":"..."}}]
+}}"#
+        );
+        let request = CompletionRequest {
+            system: "You are a precise debate chair. Output ONLY valid JSON.".into(),
+            messages: vec![Message::user(&prompt)],
+            tools: vec![],
+            config: miniagent_core::config::InferenceConfig {
+                temperature: Some(0.1),
+                max_tokens: Some(4_000),
+                ..Default::default()
+            },
+        };
+        let Ok(resp) = complete_json_with_retry(
+            self.judge.as_ref(),
+            "You are a precise debate chair. Output ONLY valid JSON.",
+            &prompt,
+            "merge structuring",
+            cancel,
+        )
+        .await
+        else {
+            return (refined, vec![]);
+        };
+        let ops = parse_merge_ops(&resp);
+        if ops.is_empty() {
+            return (refined, vec![]);
+        }
+        apply_merge_ops(refined, &ops)
+    }
+}
+
 /// Write a human-readable `debate_report.json` for auditability.
 ///
 /// Entity names are resolved from the KG so the report is self-contained.
@@ -1043,6 +1295,7 @@ pub fn persist_debate_report(
         "per_hypothesis": per,
         "comparison": comparison,
         "refined": refined,
+        "merge_ops_applied": outcome.merge_ops,
     });
 
     if let Some(parent) = path.parent() {
@@ -1275,6 +1528,77 @@ mod tests {
     }
 
     #[test]
+    fn parse_merge_ops_filters_malformed() {
+        let root: serde_json::Value = serde_json::from_str(
+            r#"{"ops":[
+                {"op":"merge","targets":["11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222"],"statement":"combined","confidence":0.4,"rationale":"r"},
+                {"op":"revise","targets":["44444444-4444-4444-4444-444444444444"],"statement":"revised","confidence":0.2},
+                {"op":"merge","targets":["33333333-3333-3333-3333-333333333333"],"statement":"single-target-merge"},
+                {"op":"drop","targets":[],"statement":"x"},
+                {"op":"nonsense","targets":["44444444-4444-4444-4444-444444444444"]}
+            ]}"#,
+        )
+        .unwrap();
+        let ops = parse_merge_ops(&root);
+        assert_eq!(ops.len(), 2); // valid merge + valid revise
+        assert_eq!(ops[0].op, "merge");
+        assert_eq!(ops[1].op, "revise");
+    }
+
+    #[test]
+    fn apply_merge_ops_merges_min_confidence_and_unions_evidence() {
+        let (kg, d, g) = kg_with("AD", "APOE");
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let mut h1 = hyp(id1, "H1 statement", 0.7, d, g);
+        h1.confidence = 0.7;
+        h1.supporting_evidence = vec!["e1".into(), "shared".into()];
+        let mut h2 = hyp(id2, "H2 statement", 0.5, d, g);
+        h2.confidence = 0.5;
+        h2.supporting_evidence = vec!["e2".into(), "shared".into()];
+        h2.counter_evidence = vec!["c1".into()];
+        let ops = vec![MergeOp {
+            op: "merge".into(),
+            targets: vec![id1, id2],
+            statement: "merged statement".into(),
+            mechanism: Some("merged mechanism".into()),
+            confidence: 0.9, // above min → min wins
+            rationale: "same mechanism".into(),
+        }];
+        let (out, audit) = apply_merge_ops(vec![h1, h2], &ops);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert_ne!(m.id, id1);
+        assert_eq!(m.confidence, 0.5, "confidence takes the min");
+        assert!(m.supporting_evidence.contains(&"e1".to_string()) && m.supporting_evidence.contains(&"e2".to_string()));
+        assert_eq!(m.supporting_evidence.iter().filter(|e| *e == "shared").count(), 1, "evidence deduped");
+        assert_eq!(m.counter_evidence, vec!["c1".to_string()]);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["op"], "merge");
+        let _ = kg;
+    }
+
+    #[test]
+    fn apply_merge_ops_respects_guards() {
+        let (kg, d, g) = kg_with("AD", "APOE");
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let h1 = hyp(id1, "H1", 0.7, d, g);
+        let h2 = hyp(id2, "H2", 0.5, d, g);
+        // Unknown target id → skipped; drop of everything → capped at 1 item.
+        let ops = vec![
+            MergeOp { op: "drop".into(), targets: vec![uuid::Uuid::new_v4()], statement: String::new(), mechanism: None, confidence: 0.0, rationale: "x".into() },
+            MergeOp { op: "drop".into(), targets: vec![id1], statement: String::new(), mechanism: None, confidence: 0.0, rationale: "drop first".into() },
+            MergeOp { op: "drop".into(), targets: vec![id2], statement: String::new(), mechanism: None, confidence: 0.0, rationale: "would empty the set".into() },
+        ];
+        let (out, audit) = apply_merge_ops(vec![h1, h2], &ops);
+        assert_eq!(out.len(), 1, "set never collapses to zero");
+        assert_eq!(out[0].id, id2);
+        assert_eq!(audit.len(), 1);
+        let _ = kg;
+    }
+
+    #[test]
     fn persist_report_writes_valid_json() {
         let (kg, d, g) = kg_with("AD", "APOE");
         let id = uuid::Uuid::new_v4();
@@ -1292,6 +1616,7 @@ mod tests {
             comparison: CrossComparison { strongest_id: Some(id), ..Default::default() },
             refined: vec![hyp(id, "APOE drives AD", 0.8, d, g)],
             rounds: 1,
+            merge_ops: vec![],
         };
         let dir = std::env::temp_dir().join("miniagent_debate_report_test");
         let path = dir.join("debate_report.json");

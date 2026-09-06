@@ -366,6 +366,10 @@ impl ProjectManifest {
 
         // ── 3. Knowledge-graph overview ──────────────────────────────────
         md.push_str("## 3. 知识图谱概要\n\n");
+        md.push_str(&format!(
+            "上一节的 {} 篇文献是整条推理链的证据底座：本节的实体/关系图谱即由逐篇摘要抽取而来，随后在图上做链路预测以外推尚未被文献直接连接的假说候选。阅读本节时，可把每条高置信关系理解为\"至少一篇被引用文献的明确陈述\"。\n\n",
+            papers_value.as_ref().map(|p| p.len()).unwrap_or(0)
+        ));
         let kg_value = kg_json
             .as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
@@ -441,6 +445,7 @@ impl ProjectManifest {
 
         // ── 4. Hypotheses ───────────────────────────────────────────────
         md.push_str("## 4. 致病机理假说\n\n");
+        md.push_str("上一节的图谱回答\"文献直接说了什么\"；本节回答\"文献之间尚未连接的部分暗示什么\"。链路预测在图上外推出候选关系，经 LLM 结合文献证据评估后形成假说——它们是**待验证的猜想**而非结论，其可信度由下一节的对抗辩论进一步校准。\n\n");
         let hyp_ids: Vec<String> = self.hypotheses.iter().map(|h| h.id.to_string()).collect();
         if hyp_ids.is_empty() {
             md.push_str("（未生成假说；详见 `project.json` 的失败事件。）\n\n");
@@ -514,6 +519,7 @@ impl ProjectManifest {
             .as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
         md.push_str("## 5. 假说辩论与裁决\n\n");
+        md.push_str("假说生成阶段天然偏向\"支持\"；本节引入对抗视角——正方立论、反方驳论、正方再反驳、裁判裁决，并跨假说对比找出互斥与互补之处。阅读 5.2 的反驳要点与 rebuttal 交锋，比只看置信度更能判断一个假说的成色。\n\n");
         if let Some(ref report) = debate_value {
             // `rounds` is a count (integer); legacy fixtures may still write
             // an array — accept either.
@@ -614,6 +620,36 @@ impl ProjectManifest {
                         md.push_str(&format!("**裁判总结**：\n\n{}\n\n", summary));
                     }
                 }
+                // 已执行的合并/放弃/修改操作（结构化并真正应用到了 §4 的
+                // 精炼假说集）；未列出的建议仅保留为建议。
+                if let Some(applied) = report.get("merge_ops_applied").and_then(|v| v.as_array()) {
+                    if !applied.is_empty() {
+                        md.push_str(&format!("### 5.5 已执行的假说合并操作（{} 项）\n\n", applied.len()));
+                        md.push_str("下列操作已实际应用到第 4 节的精炼假说集（置信度只降不升；证据取并集；原假说 id 保留在 targets 供溯源）：\n\n");
+                        for (i, op) in applied.iter().enumerate() {
+                            let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("?");
+                            let targets = op
+                                .get("targets")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.iter().filter_map(|t| t.as_str()).map(short).collect::<Vec<_>>().join(" + "))
+                                .unwrap_or_default();
+                            let result = op
+                                .get("result_id")
+                                .and_then(|v| v.as_str())
+                                .map(|r| format!("→ <code>{}</code>", short(r)))
+                                .unwrap_or_else(|| "→ 移除".into());
+                            let rationale = op.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+                            md.push_str(&format!(
+                                "{}. **{}** `{} {}` — {}\n\n",
+                                i + 1,
+                                kind,
+                                targets,
+                                result,
+                                rationale
+                            ));
+                        }
+                    }
+                }
             }
         } else {
             md.push_str("（未找到 `debate_report.json`，可能未启用辩论阶段。）\n\n");
@@ -621,6 +657,7 @@ impl ProjectManifest {
 
         // ── 6. Validation plans ──────────────────────────────────────────
         md.push_str("## 6. 验证计划\n\n");
+        md.push_str("辩论把假说从\"听起来有理\"推到\"证据能扛住多少推敲\"；本节把幸存的假说翻译成**可执行的验证任务**——每个数据分析任务绑定真实数据集与统计方法，每个湿实验方案给出对照组与时间线。优先级沿辩论后的置信度排序。\n\n");
         // First executable action across all plans — quoted by the TL;DR.
         let mut first_action: Option<String> = None;
         if self.validation_plans.is_empty() {
@@ -771,6 +808,7 @@ impl ProjectManifest {
 
         // ── 7. Data-analysis delivery ───────────────────────────────────
         md.push_str("## 7. 数据分析交付\n\n");
+        md.push_str("上一节计划中的数据分析任务在本节实际执行：脚本由 LLM 生成、在沙箱化的 Python 环境运行、失败自动重试修复，全过程连同输入输出哈希记录在 provenance 中。每个任务的 notebook 可在 Jupyter 中一键重放。\n\n");
         if self.analyses.is_empty() {
             md.push_str("（未运行任何数据分析任务。可使用 `--analyze` 启用。）\n\n");
         } else {
@@ -828,6 +866,7 @@ impl ProjectManifest {
         // ── 8. Citation index ────────────────────────────────────────────
         if let Some(ref papers) = papers_value {
             md.push_str(&format!("## 8. 引用索引（{} 篇）\n\n", papers.len()));
+            md.push_str("正文各节出现的每个 PubMed 链接都指向下列语料之一；审核节对全部链接做了逐条元数据核验（声称标题 vs PubMed 官方标题）。\n\n");
             md.push_str("<details><summary>展开 / 折叠引用列表</summary>\n\n");
             md.push_str("| # | PMID | 标题 |\n|---|---|---|\n");
             for (i, p) in papers.iter().enumerate() {
@@ -849,6 +888,7 @@ impl ProjectManifest {
 
         // ── 9. Audit pointers ────────────────────────────────────────────
         md.push_str("## 9. 审计与复现\n\n");
+        md.push_str("以上各节的所有数字与结论均可在下列产物中复核——报告本体只是这棵证据树的可读视图。\n\n");
         md.push_str("- `project.json` — 全流水线阶段状态 + append-only 事件日志（机器可读）\n");
         md.push_str("- `run_report.md` — 阶段时长表 + 事件时间线（运维可读）\n");
         md.push_str("- `kg.json` — 完整知识图谱（实体 + 关系）\n");

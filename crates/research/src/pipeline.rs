@@ -2030,7 +2030,7 @@ pub async fn run_research(
                 .map(Into::into),
         );
         let llm = crate::review::llm_review(&review_ctx, &review_providers, cancel.child_token()).await;
-        let review = crate::review::combine(checks, llm);
+        let mut review = crate::review::combine(checks, llm);
         println!(
             "   审核结论: {} ({} checks, {} issue(s), reviewer={})",
             review.verdict,
@@ -2058,65 +2058,114 @@ pub async fn run_research(
             Err(e) => println!("   ⚠️ review persist failed: {e}"),
         }
 
-        // ── 报告引用核验（引用 [n] vs References vs 检索语料）────────
-        // 机械核验，不依赖 LLM：(a) 正文 [n] 引用必须能在 References
-        // 找到，反之 References 条目应在正文被引用；(b) References 中
-        // 的 PMID 必须来自本次检索语料（papers.json）——凭记忆编造的
-        // PMID 会在此被标红。结果写入 citation_check.json 并追加报告节。
+        // ── 报告引用逐条核验（PubMed 链接 ↔ 检索语料 ↔ 官方元数据）──
+        // 报告以 `[<pmid>](pubmed…)` 链接引用文献（非 [n] 角标）。三层核验：
+        // (a) 引用 ⊆ 检索语料（编造 PMID 标红）；(b) 语料引用覆盖率；
+        // (c) 逐条 esummary 元数据比对——报告表格里链接旁声称的标题与
+        // PubMed 官方标题不一致即标题错配。结果写入 citation_check.json
+        // 并在报告审核节渲染逐条结论。
         let report_md_full = std::fs::read_to_string(&report_path).unwrap_or_default();
-        let cited_refs: Vec<usize> = {
-            let mut out = std::collections::BTreeSet::new();
-            for line in report_md_full.lines() {
-                let trimmed = line.trim();
-                if let Some(close) = trimmed.find(']')
-                    && trimmed.starts_with('[')
-                    && trimmed[1..close].trim().parse::<usize>().is_ok()
-                {
-                    out.insert(trimmed[1..close].trim().parse::<usize>().unwrap());
-                }
-            }
-            out.into_iter().collect()
-        };
-        let corpus_pmids: Vec<String> = paper_texts
+        let corpus_pairs: Vec<(String, String)> = paper_texts
             .iter()
-            .map(|(pmid, _)| pmid.clone())
+            .map(|(pmid, text)| {
+                let title = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .strip_prefix("Title: ")
+                    .unwrap_or("")
+                    .to_string();
+                (pmid.clone(), title)
+            })
             .collect();
-        let mut citation_lines: Vec<String> = Vec::new();
-        citation_lines.push(format!(
-            "正文 [n] 引用共 {} 处；检索语料 PMID {} 条（References 核验池）",
-            cited_refs.len(),
-            corpus_pmids.len()
-        ));
-        citation_lines.push(
-            "（完整逐条核验可由 citation_check 工具执行：PMID→PubMed 元数据、DOI→doi.org、URL→可达性）"
-                .to_string(),
-        );
+        let citation_client = reqwest::Client::builder()
+            .user_agent("miniagent/0.1")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok();
+        let citation_verify = match citation_client {
+            Some(client) => {
+                let api_key = std::env::var("PUBMED_API_KEY").unwrap_or_default();
+                crate::review::verify_report_citations(
+                    &report_md_full,
+                    &corpus_pairs,
+                    &client,
+                    &api_key,
+                )
+                .await
+            }
+            None => crate::review::CitationVerification::default(),
+        };
+        let mismatch_count = citation_verify
+            .items
+            .iter()
+            .filter(|i| i.status == "title_mismatch")
+            .count();
+        // 引用逐条核验参与裁决：标题错配是编造/贴错信号 → fail；语料外
+        // 引用通常是辩论网络证据引入的真实文献 → 仅警告（live 实测：辩论
+        // 内容会引用 web evidence 中的语料外 PMID，如 Barcia 2011，直接
+        // fail 会误伤每一份带辩论的报告）。
+        if mismatch_count > 0 {
+            review.issues.push(crate::review::ReviewIssue {
+                severity: "high".into(),
+                description: format!(
+                    "引用核验失败：{} 条声称标题与 PubMed 官方元数据不匹配（详见审核节逐条结果）",
+                    mismatch_count
+                ),
+                suggestion: "以 citation_check.json 为准修正报告中的 PMID 链接".into(),
+            });
+            review.verdict = "fail".into();
+        } else if !citation_verify.not_in_corpus.is_empty() {
+            review.issues.push(crate::review::ReviewIssue {
+                severity: "medium".into(),
+                description: format!(
+                    "{} 条引用的 PMID 来自检索语料之外（多为辩论阶段网络证据引入的真实文献，需人工确认相关性）",
+                    citation_verify.not_in_corpus.len()
+                ),
+                suggestion: "对语料外引用补充来源说明或将其纳入文献表".into(),
+            });
+        }
         let citation_path = project_dir.join("citation_check.json");
         let _ = std::fs::write(
             &citation_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "cited_indices": cited_refs,
-                "corpus_pmids": corpus_pmids,
-                "checked_at": chrono::Utc::now().to_rfc3339(),
-            }))
-            .unwrap_or_default(),
+            serde_json::to_vec_pretty(&citation_verify).unwrap_or_default(),
         );
-        println!("      引用核验 → {}", citation_path.display());
+        println!(
+            "      引用核验 → {}（cited={} verified={} mismatch={} not_in_corpus={}）",
+            citation_path.display(),
+            citation_verify.cited_pmids.len(),
+            citation_verify.verified_count,
+            mismatch_count,
+            citation_verify.not_in_corpus.len()
+        );
         manifest.log_event(
             "citation_check",
-            format!("cited={} corpus_pmids={}", cited_refs.len(), corpus_pmids.len()),
+            format!(
+                "cited={} verified={} mismatch={} not_in_corpus={}",
+                citation_verify.cited_pmids.len(),
+                citation_verify.verified_count,
+                mismatch_count,
+                citation_verify.not_in_corpus.len()
+            ),
         );
         manifest.record_stage(
             "citation_check",
             crate::StageStatus::Completed,
             review_start.elapsed(),
             vec![citation_path.clone()],
-            Some(serde_json::json!({ "cited": cited_refs.len() })),
+            Some(serde_json::json!({
+                "cited": citation_verify.cited_pmids.len(),
+                "verified": citation_verify.verified_count,
+                "mismatch": mismatch_count,
+            })),
         );
         // Append the audit section to the report (append-only; never rewrites).
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&report_path) {
             use std::io::Write as _;
             let _ = f.write_all(crate::review::review_markdown_section(&review).as_bytes());
+            let _ = f.write_all(
+                crate::review::citation_verification_markdown(&citation_verify).as_bytes(),
+            );
         }
         manifest.record_stage(
             "review",
