@@ -20,7 +20,8 @@ impl GlobTool {
 impl Tool for GlobTool {
     fn name(&self) -> &str { "glob" }
     fn description(&self) -> &str {
-        "Find files matching a glob pattern. Returns sorted by modification time (newest first)."
+        "Find files matching a glob pattern. Returns sorted by modification time (newest first). \
+         Result list is capped (~32KB) — narrow the pattern if your target files are missing."
     }
     fn class(&self) -> ToolClass { ToolClass::ReadOnly }
     fn input_schema(&self) -> serde_json::Value {
@@ -72,8 +73,13 @@ impl Tool for GlobTool {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let raw = format!("{} files matching '{pattern}':\n\n{output}", files.len());
+        let (capped, offloaded) = crate::output_cap::cap_tool_output("glob", &raw, &_ctx.working_dir);
+        if offloaded {
+            tracing::info!(pattern, "glob output capped and offloaded to file");
+        }
         Ok(ToolOutput {
-            content: format!("{} files matching '{pattern}':\n\n{output}", files.len()),
+            content: capped,
             metadata: None,
         })
     }

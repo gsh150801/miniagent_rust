@@ -27,17 +27,14 @@ const KEEP_RECENT_MSGS: usize = 5;
 /// Max consecutive all-error tool rounds before breaking the agent loop
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
 
-/// Rough token estimate using UTF-8 byte count.
+/// 近似 token 估算（CJK 感知，含 ToolUse input）。
 ///
-/// 参考 cc-python-claude 的 token_estimation.py：用 UTF-8 字节数而非字符数。
-/// 英文 ~4 bytes/token，中文 UTF-8 编码后 ~3 bytes/字（每字约 1.5 token），
-/// 用 bytes/4 对中英混合更准确。旧的 chars/3 对纯中文严重低估（中文 1 char ≈ 1.5 token，
-/// chars/3 算成 0.33 token/char，偏差 4.5x）。
+/// 委托给 core::budget 的共享实现：CJK 按 1 token/字（旧 bytes/4 对
+/// 中文低估 3-4 倍，导致 trim 触发太晚——live：估算 96K 时实际已
+/// 40 万+ token，MiniMax 直接拒绝请求），ToolUse 的 input JSON 计入
+/// （write 任务的全部交付内容都在参数里，text_content() 看不见）。
 fn estimate_history_tokens(history: &[Message]) -> usize {
-    history
-        .iter()
-        .map(|m| m.text_content().len() / 4) // len() = UTF-8 字节数
-        .sum()
+    miniagent_core::budget::estimate_history_tokens(history)
 }
 
 pub struct Agent {
@@ -210,11 +207,31 @@ impl Agent {
             String::new()
         };
 
+        // ── 上下文占用透明化（MemGPT memory-pressure 思想）──────────
+        // LLM 知道当前 token 占用、窗口预算与预算占比，可以主动调整
+        // 行为（少读全文、及时收尾）。占用接近预算时附加行动指令：
+        // 立即总结收尾，别再发起大结果工具调用。
+        let used = miniagent_core::budget::estimate_history_tokens(history);
+        let budget = self.history_token_limit();
         let system = if memory_context.is_empty() {
             context.system_prompt.clone()
         } else {
             format!("{}\n\n{}", context.system_prompt, memory_context)
         };
+        let pct = (used as f64 / budget.max(1) as f64 * 100.0) as u64;
+        let pressure_note = if pct >= 75 {
+            format!(
+                "\n\n⚠️ CONTEXT PRESSURE: ~{used} tokens used of ~{budget} budget ({pct}%). \
+                 Wrap up NOW: summarize findings and produce your final answer. \
+                 Do NOT start new tool calls that return large outputs."
+            )
+        } else {
+            format!(
+                "\n\n[Context: ~{used}/~{budget} tokens ({pct}%). Tool outputs are capped (~32KB, full text offloaded to file with path in the result). \
+                 Prefer read(offset/limit) over whole-file reads.]"
+            )
+        };
+        let system = format!("{system}{pressure_note}");
 
         let request = CompletionRequest {
             system,
@@ -731,7 +748,39 @@ impl Agent {
             recent = history[history.len() - recent.len()..].to_vec();
         }
 
-        let mut trimmed = Vec::with_capacity(keep_recent + 2);
+        // ── 保留窗口体积预算（trim 压缩下限的修复）──────────────────
+        // last-N 盲留窗口的单条巨消息（数百万字节的历史层漏网之鱼）会
+        // 让 trim 后的请求仍然超 provider 窗口。这里按预算从头收缩窗口，
+        // 再对超预算的单条 tool result 做历史层头部截断（Tool 消息截断
+        // 是安全的：模型只需摘要；截断不破坏 tool_use/tool_result 配对）。
+        const RETENTION_TOKEN_BUDGET: usize = 24_000;
+        let mut window_tokens = miniagent_core::budget::estimate_history_tokens(&recent);
+        while recent.len() > 2 && window_tokens > RETENTION_TOKEN_BUDGET {
+            recent.remove(0);
+            window_tokens = miniagent_core::budget::estimate_history_tokens(&recent);
+        }
+        for msg in recent.iter_mut() {
+            let t = miniagent_core::budget::estimate_history_tokens(std::slice::from_ref(msg));
+            if t > RETENTION_TOKEN_BUDGET / 2 {
+                let text = msg.text_content();
+                let keep_bytes = RETENTION_TOKEN_BUDGET * 2; // ≈1/2 预算的字节量
+                let mut head: String = text.chars().take(keep_bytes.max(1)).collect();
+                let original_tokens = t;
+                head.push_str(&format!(
+                    "\n[...TRUNCATED here: this single result was ~{original_tokens} tokens; \
+                     full content available via re-read with offset/limit...]"
+                ));
+                *msg = Message::tool(
+                    // 保留原 tool_call_id：从文本前缀恢复
+                    text.strip_prefix("[toolu_vrtx_")
+                        .and_then(|s| s.split(']').next())
+                        .unwrap_or("unknown"),
+                    &head,
+                );
+            }
+        }
+
+        let mut trimmed = Vec::with_capacity(recent.len() + 2);
         if let Some(msg) = first {
             trimmed.push(msg);
         }

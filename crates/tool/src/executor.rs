@@ -103,6 +103,7 @@ impl ToolExecutor {
                     let input = c.input.clone();
                     let id = c.id;
                     let token = cancel.child_token();
+                    let wd = ctx.working_dir.clone();
                     async move {
                         let result = self
                             .execute(&name, &input, ctx, token)
@@ -111,7 +112,16 @@ impl ToolExecutor {
                                 content: format!("Error: {e}"),
                                 metadata: None,
                             });
-                        (id, result)
+                        // 最后一道防线：任何工具的输出进历史前统一封顶。
+                        // read/glob 已在工具内提前处理（更智能的分页提示），
+                        // 这里兜住其余工具与未来新增者（Manus/Claude Code
+                        // 共识：封顶必须发生在结果回填模型之前）。
+                        let (capped, offloaded) =
+                            crate::output_cap::cap_tool_output(&name, &result.content, &wd);
+                        if offloaded {
+                            tracing::info!(tool = %name, bytes = result.content.len(), "tool output capped+offloaded");
+                        }
+                        (id, ToolOutput { content: capped, metadata: result.metadata })
                     }
                 })
                 .collect();
@@ -138,7 +148,12 @@ impl ToolExecutor {
                     content: format!("Error: {e}"),
                     metadata: None,
                 });
-            results.push((call.id, result));
+            let (capped, offloaded) =
+                crate::output_cap::cap_tool_output(&call.name, &result.content, &ctx.working_dir);
+            if offloaded {
+                tracing::info!(tool = %call.name, bytes = result.content.len(), "tool output capped+offloaded");
+            }
+            results.push((call.id, ToolOutput { content: capped, metadata: result.metadata }));
         }
 
         results

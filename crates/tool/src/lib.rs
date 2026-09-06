@@ -5,6 +5,7 @@ pub mod registry;
 pub mod glob_util;
 pub mod tools;
 pub mod health;
+pub mod output_cap;
 pub mod security;
 
 pub use traits::*;
