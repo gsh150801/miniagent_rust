@@ -19,6 +19,8 @@ mod opentargets;
 mod enrichr;
 mod uniprot;
 mod citation_check;
+pub mod write_note;
+mod search_history;
 
 pub use read::ReadTool;
 pub use write::WriteTool;
@@ -39,6 +41,8 @@ pub use opentargets::OpenTargetsTool;
 pub use enrichr::EnrichrTool;
 pub use uniprot::UniprotTool;
 pub use citation_check::CitationCheckTool;
+pub use write_note::WriteNoteTool;
+pub use search_history::SearchHistoryTool;
 
 use crate::registry::ToolRegistry;
 use ask_user::AskUserTool;
@@ -66,7 +70,9 @@ pub fn defaults() -> ToolRegistry {
         .register(OpenTargetsTool::new())
         .register(EnrichrTool::new())
         .register(UniprotTool::new())
-        .register(CitationCheckTool::new());
+        .register(CitationCheckTool::new())
+        .register(WriteNoteTool::new())
+        .register(SearchHistoryTool::new());
     registry
 }
 

@@ -58,6 +58,10 @@ pub struct AppConfig {
     pub agent_keep_recent_msgs: usize,
     /// Max consecutive all-error tool rounds before breaking the agent loop.
     pub agent_max_consecutive_errors: usize,
+    /// Codex 式实验性上下文管理（history notes 状态记忆）：开启后
+    /// trim 不再调用 LLM 事后摘要，而是用 write_note 工具落盘的
+    /// notes.json（状态记忆）+ 最近消息重建窗口（new_context 式重启）。
+    pub agent_notes_mode: bool,
 
     // ── Loop pipeline ─────────────────────────────────────────────
     pub loop_max_loops: usize,
@@ -146,6 +150,7 @@ impl AppConfig {
             agent_history_token_limit: Self::parsed("AGENT_HISTORY_TOKEN_LIMIT", 96_000),
             agent_keep_recent_msgs: Self::parsed("AGENT_KEEP_RECENT_MSGS", 5),
             agent_max_consecutive_errors: Self::parsed("AGENT_MAX_CONSECUTIVE_ERRORS", 3),
+            agent_notes_mode: Self::parsed("AGENT_NOTES_MODE", 0) != 0,
 
             // ── Loop pipeline ──
             loop_max_loops: Self::parsed("LOOP_MAX_LOOPS", 10),

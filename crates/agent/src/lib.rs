@@ -223,7 +223,8 @@ impl Agent {
             format!(
                 "\n\n⚠️ CONTEXT PRESSURE: ~{used} tokens used of ~{budget} budget ({pct}%). \
                  Wrap up NOW: summarize findings and produce your final answer. \
-                 Do NOT start new tool calls that return large outputs."
+                 Do NOT start new tool calls that return large outputs. \
+                 If you have not done so recently, record essential state via write_note."
             )
         } else {
             format!(
@@ -231,7 +232,27 @@ impl Agent {
                  Prefer read(offset/limit) over whole-file reads.]"
             )
         };
-        let system = format!("{system}{pressure_note}");
+        // Codex 式状态记忆层：write_note 落盘的 notes 每轮注入——历史
+        // 正文可能被裁剪，notes 是模型唯一可靠的长期记忆。
+        let notes_mode = self.config.as_ref().map(|c| c.agent_notes_mode).unwrap_or(false);
+        let notes_block = if !context.working_dir.is_empty() {
+            miniagent_tool::tools::write_note::render_notes_block(&context.working_dir)
+        } else {
+            String::new()
+        };
+        let system = format!("{system}{pressure_note}{notes_block}");
+        let system = if notes_mode {
+            format!(
+                "{system}\n\n[NOTES MODE: 历史正文会在上下文超限时移出窗口归档（不会销毁）。\
+                 务必在关键节点用 write_note 记录状态：目标细化/决策敲定时写 goal，\
+                 里程碑完成写 done，假设被否决时写 rejected 及原因，产物落盘写 artifacts，\
+                 并注明信息来源（如归档 item_id、文件路径）。\
+                 需要被归档的历史细节时用 search_history（关键词检索）或按 item_id 读取；\
+                 窗口外历史不会自动回来，但永远可以查回。]"
+            )
+        } else {
+            system
+        };
 
         let request = CompletionRequest {
             system,
@@ -667,6 +688,57 @@ impl Agent {
             return;
         }
 
+        // ── notes 驱动重建（Codex `new_context` 式窗口重启）──────────
+        // 关键修正：被裁剪的历史**不丢弃**——先归档到
+        // `<working_dir>/history_archive.jsonl`（每条带 item_id，可经
+        // search_history 工具按需查回，对齐 Codex 的 history/read_item/
+        // search_contents 机制），再用 原始任务 + 最近消息 重建窗口。
+        // notes（状态记忆）每轮由 run() 注入 system prompt。
+        let notes_mode = self.config.as_ref().map(|c| c.agent_notes_mode).unwrap_or(false);
+        if notes_mode && !context.working_dir.is_empty() {
+            let notes_block =
+                miniagent_tool::tools::write_note::render_notes_block(&context.working_dir);
+            if !notes_block.is_empty() {
+                let keep_recent = self.keep_recent_msgs().min(history.len().saturating_sub(1));
+                let first = history.first().cloned();
+                let keep = keep_recent;
+                let cut = history.len().saturating_sub(keep);
+                // 归档被裁剪的历史（原始 prompt 之后、保留窗口之前）
+                let archive_ids = Self::append_history_archive(
+                    &context.working_dir,
+                    &history[1..cut.max(1)],
+                );
+                let recent: Vec<Message> = history
+                    .iter()
+                    .rev()
+                    .take(keep)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut rebuilt = Vec::with_capacity(recent.len() + 2);
+                if let Some(msg) = first {
+                    rebuilt.push(msg);
+                }
+                rebuilt.push(Message::user(format!(
+                    "[上下文已重启：较早的 {} 条历史已归档（item_id {}–{}）。\
+                     任务状态见 system 中的 Task State Notes；\
+                     需要当时的技术细节时用 search_history 按关键词检索、\
+                     read_history_item 按 item_id 读取。\
+                     从中断处继续任务。]",
+                    archive_ids.len(),
+                    archive_ids.first().copied().unwrap_or(0),
+                    archive_ids.last().copied().unwrap_or(0),
+                )));
+                rebuilt.extend(recent);
+                tracing::info!(
+                    archived = archive_ids.len(),
+                    "notes-driven context restart (history archived, no LLM summary call)"
+                );
+                *history = rebuilt;
+                return;
+            }
+            // 无 notes 可用（模型还没写过）→ 落到传统 LLM 摘要路径
+        }
+
         let keep_recent = self.keep_recent_msgs().min(history.len().saturating_sub(1));
         let discard_count = history.len().saturating_sub(keep_recent + 1);
 
@@ -889,6 +961,56 @@ impl Agent {
     }
 
     /// Write the compressed context summary to disk.
+    /// 把被裁剪的历史归档到 `<working_dir>/history_archive.jsonl`。
+    ///
+    /// 对齐 Codex 的 history 层：详情只移出窗口、不销毁。每条记录带
+    /// 全局递增 item_id（跨多次 trim 连续），供 search_history /
+    /// read_history_item 工具按需查回。返回本次写入的 item_id 列表。
+    fn append_history_archive(working_dir: &str, messages: &[Message]) -> Vec<u64> {
+        use std::io::Write as _;
+        let path = std::path::Path::new(working_dir).join("history_archive.jsonl");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 续接既有 item_id（跨 trim 会话连续）
+        let mut next_id = 1u64;
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if let Some(last_line) = existing.lines().rev().find(|l| !l.trim().is_empty()) {
+                if let Ok(prev) = serde_json::from_str::<serde_json::Value>(last_line) {
+                    next_id = prev.get("item_id").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                }
+            }
+        }
+        let mut ids = Vec::with_capacity(messages.len());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            for msg in messages {
+                let role = format!("{:?}", msg.role).to_lowercase();
+                let text = msg.text_content();
+                let tool_input: Vec<String> = msg.content.iter().filter_map(|b| match b {
+                    miniagent_core::event::ContentBlock::ToolUse { name, input, .. } => {
+                        Some(format!("{name} {}", serde_json::to_string(input).unwrap_or_default()))
+                    }
+                    _ => None,
+                }).collect();
+                let body = if text.is_empty() { tool_input.join("\n") } else { text };
+                if body.trim().is_empty() {
+                    continue;
+                }
+                let rec = serde_json::json!({
+                    "item_id": next_id,
+                    "role": role,
+                    "chars": body.len(),
+                    "content": body.chars().take(20_000).collect::<String>(),
+                });
+                if writeln!(f, "{rec}").is_ok() {
+                    ids.push(next_id);
+                }
+                next_id += 1;
+            }
+        }
+        ids
+    }
+
     fn save_context_file(summary: &str) {
         // Anchored under the workspace root (was `./miniagent_context`
         // relative to the process CWD, which scattered dump files whenever
