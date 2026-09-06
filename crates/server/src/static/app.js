@@ -506,7 +506,10 @@ function renderTaskList() {
   const el = document.getElementById('taskList');
   const query = document.getElementById('searchInput').value.trim().toLowerCase();
   const sorted = Object.entries(tasks).sort((a,b) => {
-    const da = new Date(a[1].created_at||0), db = new Date(b[1].created_at||0);
+    // getTime() || 0：Invalid Date（空/缺失 created_at 的旧任务）沉底，
+    // NaN 比较结果会让 sort 顺序随机化（live: 列表排序混乱的根源之一）。
+    const da = new Date(a[1].created_at || 0).getTime() || 0;
+    const db = new Date(b[1].created_at || 0).getTime() || 0;
     return db - da;
   });
 

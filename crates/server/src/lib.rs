@@ -107,12 +107,30 @@ fn restore_tasks_from_disk(state: &AppState) {
         if name.starts_with('.') || name.starts_with('_') {
             continue;
         }
+        // Skip non-directories: result/ 也存放散文件（server_runN.log、
+        // memory.db、kg_store.json 等），此前被当成任务注册进列表，
+        // 挤占排序位（live: "server_run8.log" 出现在任务列表）。
+        if !entry.path().is_dir() {
+            continue;
+        }
 
         // Parse "{id}_{brief}" from directory name
         let (task_id, brief) = match name.find('_') {
             Some(pos) => (&name[..pos], name[pos + 1..].to_string()),
             None => continue,
         };
+
+        // created_at from the filesystem: birth time when available
+        // (APFS/ext4), falling back to mtime. 此前这里填空字符串——前端
+        // new Date("") 得到 NaN，比较器失效，任务列表顺序完全随机
+        //（live: 左侧面板排序混乱）。
+        let created_at = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.created().ok().or_else(|| m.modified().ok()))
+            .map(std::convert::Into::<chrono::DateTime<chrono::Utc>>::into)
+            .map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339())
+            .unwrap_or_default();
 
         // Find the result file: prefer {brief}.md, fall back to output.md (legacy)
         let dir = entry.path();
@@ -151,7 +169,7 @@ fn restore_tasks_from_disk(state: &AppState) {
             brief,
             prompt: String::new(),
             status,
-            created_at: String::new(),
+            created_at,
             result_dir: dir,
             files,
             response: response.clone(),
