@@ -1219,7 +1219,6 @@ async fn handle_run_loop(
         eprintln!("FATAL: {e}");
         std::process::exit(1);
     });
-    let agent_arc = state.agent.clone();
 
     // Task creation goes through the same `create_new_task` helper as the
     // workflow mode: 8-char id + sanitized brief under `state.task_dir`, so
@@ -1274,12 +1273,42 @@ async fn handle_run_loop(
             if agent_tx_for_fwd.send(ProgressMsg::AgentEvent(ev)).await.is_err() { break; }
         }
     });
+    // Per-task pipeline agent：loop pipeline 必须跑在"注册了事件发送器的
+    // 同一个 Agent"上。此前注册在 state.agent，而 pipeline 在 StageContext
+    // 里自建隐藏 Agent 执行工具 → 工具事件零到达，前端操作卡不渲染
+    // （live 验证：event_log 只有 goal_state_updated）。
+    // 每个任务独立建 Agent（而非共用 state.agent）以保持并发任务间
+    // 事件流隔离，与原 StageContext::build_agent 的隔离语义一致。
+    let pipeline_agent = {
+        let active = state.models.read().unwrap().active().clone();
+        match (
+            build_provider(&active, ProviderTier::Flash),
+            build_provider(&active, ProviderTier::Pro),
+        ) {
+            (Ok(f), Ok(p)) => std::sync::Arc::new(
+                miniagent_agent::Agent::new(f, p)
+                    .with_tools(miniagent_tool::executor::ToolExecutor::new(
+                        miniagent_tool::tools::defaults(),
+                        Box::new(miniagent_tool::approval::AutoApprove),
+                    ))
+                    .with_config(state.config.clone()),
+            ),
+            (Err(e), _) | (_, Err(e)) => {
+                let _ = ws_send(socket, serde_json::json!({
+                    "type": "error",
+                    "message": format!("当前模型配置不可用: {e}"),
+                })).await;
+                state.cancels.remove(&task_id);
+                return;
+            }
+        }
+    };
     // Register a *per-task* event sender so concurrent loop pipelines no
     // longer clobber each other's event streams (each task gets its own
     // independent subscription). The RAII guard is stored in AppState and
     // dropped on completion / cancel so the shared Agent's event list
     // stays bounded.
-    let event_guard = agent_arc.register_event_sender(agent_event_tx.clone()).await;
+    let event_guard = pipeline_agent.register_event_sender(agent_event_tx.clone()).await;
     state.event_guards.insert(task_id.to_string(), event_guard);
 
     // Build a ProgressFn closure that ships per-stage events into the
@@ -1395,6 +1424,7 @@ async fn handle_run_loop(
         Some(task_dir.clone()),
         Some(ask_hook),
         Some(steer_hook),
+        Some(pipeline_agent),
     ).await;
 
     state.cancels.remove(&task_id);

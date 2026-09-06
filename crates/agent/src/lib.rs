@@ -79,7 +79,10 @@ impl Agent {
             tool_executor: Arc::new(std::sync::Mutex::new(None)),
             memory: None,
             config: None,
-            event_sender: None,
+            // 空容器而非 None：None 会让 emit_event 静默丢弃所有事件、
+            // register_event_sender 返回空操作 guard（live: workflow 与
+            // loop 模式的工具事件从未到达前端，操作卡不渲染，根因即此）。
+            event_sender: Some(Arc::new(tokio::sync::Mutex::new(Vec::new()))),
             sub_agent_rx: None,
         }
     }

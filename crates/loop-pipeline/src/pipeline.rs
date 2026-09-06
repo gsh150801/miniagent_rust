@@ -181,12 +181,16 @@ impl LoopPipeline {
         on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
-        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None, None).await
+        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None, None, None).await
     }
 
     /// [`Self::run`] with an interactive clarify channel. The server wires
     /// its WS ask/reply protocol here so the Clarify stage can ask the user;
     /// CLI passes `None` and clarification self-skips.
+    ///
+    /// `agent`：外部注入的 Agent。缺省时本函数自建一个（CLI 场景），但
+    /// 服务端必须注入——事件发送器注册在服务端构建的实例上；若 pipeline
+    /// 自建隐藏 Agent，工具事件就永远到不了注册者（live: 操作卡不渲染）。
     pub async fn run_with_clarify(
         task: impl Into<String>,
         config: Arc<AppConfig>,
@@ -196,6 +200,7 @@ impl LoopPipeline {
         result_dir: Option<std::path::PathBuf>,
         clarify_hook: Option<crate::clarify::ClarifyHook>,
         steer_hook: Option<crate::clarify::SteerHook>,
+        agent: Option<std::sync::Arc<miniagent_agent::Agent>>,
     ) -> Result<PipelineState, AgentError> {
         let result_base = result_dir
             .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
@@ -209,9 +214,12 @@ impl LoopPipeline {
             .canonicalize()
             .unwrap_or(result_base);
 
-        let mut ctx = StageContext::new(task, config)
-            .with_max_loops(max_loops)
-            .with_working_dir(result_base.to_string_lossy().to_string());
+        let mut ctx = match agent {
+            Some(a) => StageContext::with_agent(task, config.clone(), a),
+            None => StageContext::new(task, config),
+        }
+        .with_max_loops(max_loops)
+        .with_working_dir(result_base.to_string_lossy().to_string());
         if let Some(hook) = clarify_hook {
             ctx = ctx.with_clarify_hook(hook);
         }
