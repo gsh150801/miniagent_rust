@@ -24,6 +24,8 @@ stderr*.txt
 efetch_multi.txt
 models.json
 kg_store.json
+agents.json
+.miniagent/
 skills/*/examples/*/output/
 
 # 运行产物：analysis 管线以仓库根为 cwd 时会落在 ./analysis/（正式产物在 result/<task>/analysis/）

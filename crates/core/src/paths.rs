@@ -95,6 +95,18 @@ pub fn models_file() -> PathBuf {
     workspace_root().join("models.json")
 }
 
+/// Location of the custom agent-role profile file (workspace root).
+pub fn agents_file() -> PathBuf {
+    workspace_root().join("agents.json")
+}
+
+/// User-managed skill directory (imported/generated skills live here so the
+/// repo's builtin `skills/` tree stays clean). `.miniagent/skills` mirrors the
+/// discovery scan roots in `miniagent_skill::discovery::SkillDiscovery`.
+pub fn user_skill_dir() -> PathBuf {
+    workspace_root().join(".miniagent").join("skills")
+}
+
 /// Human- and filesystem-safe task brief derived from the user prompt.
 /// Shared by server and CLI so both produce identical `{id}_{brief}` dirs
 /// and the server restart scan picks CLI runs up.

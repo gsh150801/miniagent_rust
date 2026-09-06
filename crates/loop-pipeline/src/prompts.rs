@@ -16,6 +16,54 @@ pub fn tools_for_role(role: &str) -> &'static [&'static str] {
     }
 }
 
+/// Catalog-aware tool resolution: 自定义角色（agents.json）→ 档案声明的工具
+/// 白名单（空 = 全部内置工具，与 RunContext::allowed_tools 语义一致）；
+/// 内置角色 → [`tools_for_role`] 静态表。
+pub fn tools_for_role_dyn(role: &str) -> Vec<String> {
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    if let Some(profile) = store.get_by_key(role) {
+        if profile.tools.is_empty() {
+            // 全量默认工具表（tools_for_role 的 _ 分支）
+            return tools_for_role("_").iter().map(|s| s.to_string()).collect();
+        }
+        return profile.tools.clone();
+    }
+    tools_for_role(role).iter().map(|s| s.to_string()).collect()
+}
+
+/// 自定义角色目录块（注入规划提示，让 LLM 在 Plan 阶段看到并可自主把
+/// 子任务分配给这些智能体）。无自定义角色时返回空串。
+pub fn custom_role_catalog_block() -> String {
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    let roles = store.roles();
+    if roles.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = roles
+        .iter()
+        .map(|r| {
+            let tools = if r.tools.is_empty() {
+                "(全部内置工具)".to_string()
+            } else {
+                r.tools.join(", ")
+            };
+            let skills = if r.skills.is_empty() {
+                String::new()
+            } else {
+                format!("；技能: {}", r.skills.join(", "))
+            };
+            format!(
+                "- \"{}\"（{}）: {}。工具: {}{}",
+                r.role_key, r.name, r.description, tools, skills
+            )
+        })
+        .collect();
+    format!(
+        "\n## Custom Agent Roles（自定义智能体——assigned_role 可以填这些键）\n当子任务与下列某个智能体的职责匹配时，优先把 assigned_role 设为对应键：\n{}\n",
+        lines.join("\n")
+    )
+}
+
 /// Build a role-specific system prompt with tool guidance.
 ///
 /// 参考 cc-python-claude 的分层提示词工程，system prompt 由以下段落组成：
@@ -28,6 +76,12 @@ pub fn tools_for_role(role: &str) -> &'static [&'static str] {
 /// 7. 角色特定工具指南
 /// 8. 关键规则（USE tools、不模拟、引用来源）
 pub fn role_system_prompt(role: &str, task_desc: &str, expected_output: &str) -> String {
+    // ── 自定义角色优先：agents.json 命中 → 用档案的 Persona 与工具/技能
+    // 声明替换角色定义段（其余脚手架：执行原则/风险评估/输出效率 不变）。
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    if let Some(profile) = store.get_by_key(role) {
+        return custom_role_system_prompt(profile, task_desc, expected_output);
+    }
     let role_guide = match role {
         "researcher" =>
             "Use **web_search** and **web_fetch** to gather online information. \
@@ -128,6 +182,84 @@ pub fn role_system_prompt(role: &str, task_desc: &str, expected_output: &str) ->
         expected_output = expected_output,
         role_guide = role_guide,
         env_info = env_info,
+    )
+}
+
+/// 为自定义角色构建 system prompt：保留通用执行原则脚手架，替换角色
+/// 定义段为档案 Persona + 工具/技能声明。
+fn custom_role_system_prompt(
+    profile: &miniagent_core::roles::AgentRoleProfile,
+    task_desc: &str,
+    expected_output: &str,
+) -> String {
+    let env_info = format!(
+        "{}{}",
+        miniagent_core::context_info::env_block("."),
+        miniagent_core::context_info::project_md_block(".").unwrap_or_default()
+    );
+
+    let tools = if profile.tools.is_empty() {
+        "全部内置工具（web_search, bash, read, write, edit, glob, grep, pubmed_search 等）".to_string()
+    } else {
+        profile.tools.join(", ")
+    };
+    let skills = if profile.skills.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n你的配套技能（执行相关子任务时优先按其工作流使用）: {}",
+            profile.skills.join(", ")
+        )
+    };
+
+    format!(
+        r#"You are {name} — {description}
+
+## Role Persona（你的角色设定，必须遵循）
+{persona}
+{skills}
+
+## Task Execution Principles
+ - **Read before modifying.** Do not propose changes to code or files you haven't read. Understand existing content before suggesting modifications.
+ - **Don't over-engineer.** Do the minimum needed to complete the task well.
+ - **Be careful with security.** Avoid command injection, XSS, SQL injection.
+ - **If an approach fails, diagnose why before switching.**
+
+## Tool Usage
+你可用的工具: {tools}
+
+## Risk Assessment
+ - Local, reversible actions are fine to do freely.
+ - For hard-to-reverse or destructive actions, verify before executing.
+
+## Output Efficiency
+ - Go straight to the point. Lead with the answer or result.
+
+{env_info}
+
+## Your Task
+{task_desc}
+
+## Expected Output
+{expected_output}
+
+## Critical Rules
+1. **USE tools — do not simulate.** Always call a tool rather than fabricating results.
+2. Report actual findings, not invented information.
+3. If a tool returns an error, describe the error honestly — do not guess.
+4. Complete the task thoroughly before reporting."#,
+        name = profile.name,
+        description = profile.description,
+        persona = if profile.system_prompt.trim().is_empty() {
+            profile.description.clone()
+        } else {
+            profile.system_prompt.clone()
+        },
+        skills = skills,
+        tools = tools,
+        env_info = env_info,
+        task_desc = task_desc,
+        expected_output = expected_output,
     )
 }
 

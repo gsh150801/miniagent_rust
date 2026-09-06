@@ -123,6 +123,26 @@ pub struct PipelineState {
     /// evaluate 决定的下一环节路由；pipeline 主循环在轮首消费。
     #[serde(default)]
     pub next_action: Option<String>,
+    /// 用户在前端指定的执行智能体（自定义角色 role_key）。规划阶段会把
+    /// 全部子任务的 assigned_role 机械覆盖为它——"指定某个智能体完成某
+    /// 个任务"的确定性语义，不依赖 LLM 服从提示。
+    #[serde(default)]
+    pub forced_agent: Option<String>,
+    /// 用户在前端勾选的技能（技能名）。dispatch 阶段把完整技能正文注入
+    /// 每个子任务的 system prompt 并要求强制使用。
+    #[serde(default)]
+    pub forced_skills: Vec<String>,
+}
+
+/// 用户从前端下发的执行指令（指定智能体 / 技能）。
+/// `run_with_clarify` 的可选入参，落到 [`PipelineState::forced_agent`] /
+/// [`PipelineState::forced_skills`]。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForcedDirectives {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// A lightweight record of a stage output for history replay.
@@ -155,6 +175,8 @@ impl PipelineState {
             steerings: Vec::new(),
             repair_retries: std::collections::HashMap::new(),
             next_action: None,
+            forced_agent: None,
+            forced_skills: Vec::new(),
         }
     }
 

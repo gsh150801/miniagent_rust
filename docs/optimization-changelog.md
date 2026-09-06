@@ -2569,3 +2569,58 @@ core/kg/loop-pipeline/provider/telemetry/skill/tool/workflow/planning/memory/hyp
 ### 验证
 - `cargo check --workspace --tests` 0 错误；`cargo test --release --workspace` 383 通过 0 失败；`node --check app.js` 通过。
 - 第二轮 e2e（research 全流程 + loop 多智能体）事件流验证：reviewed 事件、评估裁决卡、merge_ops_applied、dataset_note、analysis 结果卡、重载恢复。
+
+---
+
+## A32. 自定义智能体角色 + 技能管理 + 任务级指派（✅ 已完成）
+
+**日期**：2026-09-07（分支 `feature/agent-roles`）
+
+### 目标
+1. Web UI 方便地查看/新建/编辑/删除智能体角色（角色名、Persona、配套工具、配套技能）
+2. 新建智能体时可按 API 规格（base_url / 鉴权 / api_key / 文档）由 LLM 生成配套工具脚本与技能
+3. 技能的导入 / 查看 / 删除
+4. Loop 执行阶段 LLM 可见自定义角色目录并自主分配子任务
+5. 前端可指定"某智能体 + 某技能"完成某个任务
+
+### 新增
+| 文件 | 用途 |
+|------|------|
+| `crates/core/src/roles.rs` | `AgentRoleProfile` + `AgentRoleStore`（`agents.json` CRUD，内置角色键防冲突，slug 化） |
+| `core::paths::agents_file()` / `user_skill_dir()` | 工作区根锚定：`agents.json`、`.miniagent/skills/` |
+
+### REST API
+| 端点 | 说明 |
+|------|------|
+| `GET/POST /api/agents`、`PUT/DELETE /api/agents/{id}` | 角色 CRUD（内置角色只读列出） |
+| `POST /api/agents/generate` | LLM 生成 Python 工具脚本 + SKILL.md → `.miniagent/skills/<slug>/`；api_key 只写 `.miniagent/secrets/<slug>.key`（0600），脚本经 env var + 密钥文件回退读取，key 绝不进提示词/产物 |
+| `GET /api/skills`（扩展） | 增加 `custom`（用户目录标记）与 `file_path` |
+| `GET/DELETE /api/skills/{name}` | 技能详情（完整正文+文件清单）/ 删除（仅用户目录，内置拒绝） |
+| `POST /api/skills` | 导入 SKILL.md（解析校验 fail-fast）→ `.miniagent/skills/` |
+
+### Loop 管线接入
+- **Plan**：规划提示注入自定义角色目录（`custom_role_catalog_block`），LLM 可把
+  `assigned_role` 设为自定义键；`enumerate_work_items` 角色白名单并入自定义键
+- **Dispatch**：`execute_single_task` 用档案 Persona 构建 system prompt
+  （`custom_role_system_prompt`）、档案工具白名单（`tools_for_role_dyn`）、
+  强制注入配套技能正文；Repair 重试路径同样生效
+- **强制指派**：`PipelineState.forced_agent/forced_skills` + `ForcedDirectives`
+  （`run_with_clarify` 新参，checkpoint 恢复后应用）；指定智能体时
+  `apply_forced_agent` 机械覆盖全部子任务角色（不依赖 LLM 服从提示）
+- **WS**：`{type:'run', agent:'<role_key>', skills:[...]}`——loop 走
+  ForcedDirectives；workflow 默认路径走 `build_agent_directive_block` prompt 注入
+  （修复：前端早已上报 `skills` 但服务端从未消费）
+
+### 前端
+- ⚙️ 设置新增「智能体」tab：内置角色（只读）+ 自定义角色卡片（编辑/删除）+
+  新建/编辑表单（工具勾选网格 + 可搜索技能勾选）+ 生成器表单（生成结果可一键挂到表单）
+- 技能面板：查看（弹窗渲染 SKILL.md）/ 删除（仅导入技能）/ 导入（粘贴或本地文件）
+- 输入栏新增智能体选择器（🤖 自动 = 规划器自选）；已选技能以 chips 展示随任务下发
+
+### 验证
+- `cargo test --workspace` 全绿；`plan` 新增 3 个 forced-agent 单测；`core::roles` 5 个单测
+- 端到端（mock LLM）：agents CRUD / 内置键拒绝 / 技能导入-查看-删除（内置拒删）/
+  生成器（SKILL.md+脚本落盘、密钥 0600、技能即席发现 custom=true）/
+  WS loop 指定 agent 后 plan 与子任务事件角色均为 weather-agent
+- 修复 live bug：`SkillDiscovery` 记录相对路径导致 custom 归属判定恒 false
+  （`is_user_skill` 两侧绝对化 + canonicalize 后比较）

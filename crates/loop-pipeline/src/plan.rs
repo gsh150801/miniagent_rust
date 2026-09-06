@@ -64,6 +64,15 @@ impl PipelineStage for PlanStage {
                     output: None,
                 });
 
+                // 用户指定的执行智能体同样覆盖枚举路径生成的 plan。
+                let mut enumerated = TaskPlan {
+                    overall_goal: task.clone(),
+                    tasks,
+                    max_loops: ctx.state.max_loops,
+                };
+                apply_forced_agent(&mut enumerated, &ctx.state);
+                let tasks = enumerated.tasks;
+
                 tracing::info!(tasks = tasks.len(), "Enumerated multi-agent plan");
                 let goal = format!(
                     "{}（多智能体并行执行：{} 个并行子任务 + 1 个汇编任务）",
@@ -136,7 +145,11 @@ impl PipelineStage for PlanStage {
             .map(|e| e.needs_decomposition)
             .unwrap_or(false);
 
-        let prompt = build_plan_prompt(task, loop_count, &repair_suggestions, &prior_tasks, needs_decomposition);
+        // 自定义角色目录 + 用户强制指令（前端指定智能体/技能）。
+        let role_catalog = crate::prompts::custom_role_catalog_block();
+        let forced_block = build_forced_block(&ctx.state);
+
+        let prompt = build_plan_prompt(task, loop_count, &repair_suggestions, &prior_tasks, needs_decomposition, &role_catalog, &forced_block);
 
         let provider = ctx.agent.flash_provider();
 
@@ -171,10 +184,13 @@ impl PipelineStage for PlanStage {
             // 升级到 pro 模型重试（flash 在复杂分解上更易偷懒合并）
             if let Ok(retry_plan) = try_generate_plan(ctx.agent.pro_provider().as_ref(), &retry_prompt, ctx.config.loop_plan_max_tokens, cancel.clone()).await
                 && retry_plan.tasks.len() > 1 {
-                    tracing::info!(tasks = retry_plan.tasks.len(), "Retry succeeded: decomposed into multiple tasks");
-                    plan = retry_plan;
-                }
+                tracing::info!(tasks = retry_plan.tasks.len(), "Retry succeeded: decomposed into multiple tasks");
+                plan = retry_plan;
+            }
         }
+
+        // 用户指定的执行智能体：确定性覆盖（不依赖 LLM 服从提示）。
+        apply_forced_agent(&mut plan, &ctx.state);
 
         tracing::info!("Plan: {} tasks", plan.tasks.len());
         for (i, t) in plan.tasks.iter().enumerate() {
@@ -225,6 +241,8 @@ fn build_plan_prompt(
     repair_suggestions: &str,
     prior_tasks: &str,
     needs_decomposition: bool,
+    role_catalog: &str,
+    forced_block: &str,
 ) -> String {
     let decomp_hint = if needs_decomposition {
         "IMPORTANT: The explorer determined this task MUST be decomposed into multiple parallel sub-tasks. \
@@ -254,10 +272,11 @@ If the task has multiple topics, create ONE sub-task per topic. NEVER output 1 t
 - "critic": read, web_search, web_fetch (for review)
 - "synthesizer": read (for integrating sources)
 - "analyst": read, grep, glob (for data analysis)
-
+{role_catalog}
 ## Repair Context
 {repair_suggestions}
 
+{forced_block}
 {prior_tasks}
 ## Instructions
 1. Break into 3-8 concrete sub-tasks
@@ -265,6 +284,7 @@ If the task has multiple topics, create ONE sub-task per topic. NEVER output 1 t
 3. Parallel tasks have empty depends_on
 4. Assign "writer" for final compilation with depends_on on research tasks
 5. Assign "researcher" for information gathering
+6. 当某个子任务与 Custom Agent Roles 中某个智能体的职责匹配时，把 assigned_role 设为该角色的键
 
 ## Few-Shot Example 1: Multi-topic research
 Task: "Research A, B, C and write report"
@@ -285,7 +305,7 @@ Task: "Write hello world in Python"
     {{
       "id": "task_1",
       "description": "what to do and which tools to use",
-      "assigned_role": "researcher|executor|writer|critic|synthesizer|analyst",
+      "assigned_role": "researcher|executor|writer|critic|synthesizer|analyst|<自定义角色键>",
       "depends_on": [],
       "expected_output": "what this task produces",
       "difficulty": "simple|medium|hard"
@@ -298,7 +318,66 @@ Task: "Write hello world in Python"
         loop_count = loop_count,
         repair_suggestions = repair_suggestions,
         prior_tasks = prior_tasks,
+        role_catalog = role_catalog,
+        forced_block = forced_block,
     )
+}
+
+/// 用户强制指令块（前端指定智能体/技能）→ 注入规划提示。
+/// 指定智能体时，除了提示 LLM，Plan 阶段还会在生成后机械覆盖 assigned_role
+/// （[`apply_forced_agent`]）——提示只是让分解粒度更贴合该角色职责。
+fn build_forced_block(state: &crate::types::PipelineState) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(agent) = state.forced_agent.as_deref().filter(|s| !s.is_empty()) {
+        let store = miniagent_core::roles::AgentRoleStore::load();
+        let persona = store
+            .get_by_key(agent)
+            .map(|p| format!("（{}：{}）", p.name, p.description))
+            .unwrap_or_default();
+        parts.push(format!(
+            "- 用户指定由智能体 \"{agent}\"{persona} 完成本任务：所有子任务的 assigned_role 都设为 \"{agent}\""
+        ));
+    }
+    if !state.forced_skills.is_empty() {
+        parts.push(format!(
+            "- 用户要求使用技能 {}：在相关子任务的 description 中注明使用该技能",
+            state.forced_skills.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n## User Directives（用户强制要求，优先级最高）\n{}\n", parts.join("\n"))
+    }
+}
+
+/// 用户指定智能体 → 机械覆盖全部子任务的 assigned_role。
+/// 只在角色键合法（内置或 agents.json 自定义）时执行；否则保留 LLM 的
+/// 分配（无效键多半是前端脏数据，不值得让整次运行失败）。
+fn apply_forced_agent(plan: &mut TaskPlan, state: &crate::types::PipelineState) {
+    let Some(agent) = state.forced_agent.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    apply_forced_agent_checked(plan, agent, &store);
+}
+
+/// [`apply_forced_agent`] 的可测试核心：store 由调用方注入。
+fn apply_forced_agent_checked(
+    plan: &mut TaskPlan,
+    agent: &str,
+    store: &miniagent_core::roles::AgentRoleStore,
+) {
+    let valid = miniagent_core::roles::BUILTIN_ROLE_KEYS.contains(&agent)
+        || store.get_by_key(agent).is_some();
+    if !valid {
+        tracing::warn!(agent = agent, "forced_agent is not a known role key — ignoring");
+        return;
+    }
+    for task in &mut plan.tasks {
+        task.assigned_role = agent.to_string();
+    }
+    tracing::info!(agent = agent, tasks = plan.tasks.len(), "forced agent applied to all subtasks");
 }
 
 /// Build a retry prompt with stronger decomposition emphasis.
@@ -436,6 +515,54 @@ mod tests {
     use crate::types::TaskResult;
     use miniagent_core::task_plan::{TaskPlan, TaskUnit};
 
+    /// 强制智能体：内置键 → 覆盖全部子任务；无效键 → 保留原分配。
+    #[test]
+    fn forced_agent_overrides_all_subtasks() {
+        let mut plan = TaskPlan {
+            overall_goal: "g".into(),
+            tasks: vec![task("t1"), task("t2")],
+            max_loops: 1,
+        };
+        let store = miniagent_core::roles::AgentRoleStore::default();
+        apply_forced_agent_checked(&mut plan, "writer", &store);
+        assert!(plan.tasks.iter().all(|t| t.assigned_role == "writer"));
+    }
+
+    #[test]
+    fn forced_agent_custom_key_via_store() {
+        let mut plan = TaskPlan {
+            overall_goal: "g".into(),
+            tasks: vec![task("t1")],
+            max_loops: 1,
+        };
+        let mut store = miniagent_core::roles::AgentRoleStore::default();
+        store.add(miniagent_core::roles::AgentRoleProfile {
+            id: "x".into(),
+            name: "测试".into(),
+            role_key: "weather-agent".into(),
+            description: String::new(),
+            system_prompt: String::new(),
+            tools: vec![],
+            skills: vec![],
+            icon: String::new(),
+            created_at: String::new(),
+        });
+        apply_forced_agent_checked(&mut plan, "weather-agent", &store);
+        assert_eq!(plan.tasks[0].assigned_role, "weather-agent");
+    }
+
+    #[test]
+    fn forced_agent_invalid_key_ignored() {
+        let mut plan = TaskPlan {
+            overall_goal: "g".into(),
+            tasks: vec![task("t1")],
+            max_loops: 1,
+        };
+        let store = miniagent_core::roles::AgentRoleStore::default();
+        apply_forced_agent_checked(&mut plan, "no-such-agent", &store);
+        assert_eq!(plan.tasks[0].assigned_role, "researcher", "invalid key must not touch LLM assignment");
+    }
+
     fn task(id: &str) -> TaskUnit {
         TaskUnit {
             id: id.into(),
@@ -550,6 +677,19 @@ pub async fn enumerate_work_items(
     use miniagent_core::message::Message;
     use miniagent_provider::traits::CompletionRequest;
 
+    // 自定义角色提示：有自定义智能体时，枚举角色白名单追加它们的键。
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    let custom_role_hint = if store.roles().is_empty() {
+        String::new()
+    } else {
+        let keys: Vec<String> = store
+            .roles()
+            .iter()
+            .map(|r| format!("\"{}\"（{}：{}）", r.role_key, r.name, r.description))
+            .collect();
+        format!(" | 自定义角色：{}", keys.join("；"))
+    };
+
     let prompt = format!(
         r#"Break this goal into its independent parallel work items. Each item must be
 independently completable by one agent and produce its own result.
@@ -560,10 +700,12 @@ Goal:
 Rules:
 - 2 to 5 items; one item per independent subject/deliverable
 - Do NOT include a final "summary" item (the pipeline adds one)
-- role ∈ researcher | executor | analyst
+- role ∈ researcher | executor | analyst{custom_role_hint}
 
 Output ONLY valid JSON:
-{{"items":[{{"title":"<work item>","role":"researcher"}}]}}"#
+{{"items":[{{"title":"<work item>","role":"researcher"}}]}}"#,
+        goal = goal,
+        custom_role_hint = custom_role_hint,
     );
     let request = CompletionRequest {
         system: "You decompose goals into independent parallel work items. Output ONLY valid JSON."
@@ -604,13 +746,16 @@ Output ONLY valid JSON:
     }
 
     let parsed: Items = serde_json::from_str(&cleaned).ok()?;
+    // 角色白名单 = 内置角色 + agents.json 自定义角色键（规划器可以把工作项
+    // 分配给用户创建的智能体）。
+    let custom_keys: Vec<&str> = store.roles().iter().map(|r| r.role_key.as_str()).collect();
     let role_ok = ["researcher", "executor", "analyst", "writer"];
     let items: Vec<(String, String)> = parsed
         .items
         .into_iter()
         .filter(|i| !i.title.trim().is_empty())
         .map(|i| {
-            let role = if role_ok.contains(&i.role.as_str()) {
+            let role = if role_ok.contains(&i.role.as_str()) || custom_keys.contains(&i.role.as_str()) {
                 i.role
             } else {
                 "researcher".into()

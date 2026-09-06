@@ -33,6 +33,8 @@
       <div class="ss-body" id="skillPanel">
         <div class="skill-search-wrap">
           <input class="skill-search" id="skillSearch" type="text" placeholder="搜索技能..." oninput="filterSkills()">
+          <button class="skill-mini-btn" onclick="event.stopPropagation(); openSkillImport()" title="导入技能">⬆</button>
+          <button class="skill-mini-btn" onclick="event.stopPropagation(); loadSkills()" title="刷新技能列表">⟳</button>
         </div>
         <div class="skill-list" id="skillList"></div>
       </div>
@@ -101,6 +103,9 @@
           <option value="research">🔬 Research</option>
         </select>
         <input type="file" id="fileInput" multiple hidden accept=".txt,.md,.pdf,.csv,.tsv,.json,.py,.rs,.js,.ts,.html,.css,.ipynb,.png,.jpg,.svg,.xlsx,.xls,.xlsm">
+        <select id="agentSelect" class="mode-select agent-select" title="指定执行智能体（留空 = 自动分配）" onchange="onAgentSelectChange()">
+          <option value="">🤖 自动</option>
+        </select>
         <div class="input-wrap">
           <textarea id="input" rows="1" placeholder="Ask anything..." onkeydown="handleKey(event)"></textarea>
         </div>
@@ -139,6 +144,17 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- ── 技能查看 / 导入 弹窗 ───────────────────────────────────── -->
+<div class="settings-overlay" id="skillModal" onclick="if(event.target===this)closeSkillModal()">
+  <div class="settings-drawer skill-drawer" role="dialog" aria-label="技能">
+    <div class="settings-head">
+      <h3 id="skillModalTitle"><span class="sh-icon">🛠</span><span>技能</span></h3>
+      <button class="preview-close" onclick="closeSkillModal()" title="Close">×</button>
+    </div>
+    <div class="settings-body" id="skillModalBody"></div>
+  </div>
+</div>
+
 <!-- ── Unified settings drawer (Round 36) ─────────────────── -->
 <div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
   <div class="settings-drawer" role="dialog" aria-label="设置">
@@ -149,6 +165,9 @@
     <div class="settings-tabs" id="settingsTabs">
       <button class="settings-tab active" data-tab="models" onclick="switchSettingsTab('models')">
         <span>🤖</span> 模型
+      </button>
+      <button class="settings-tab" data-tab="agents" onclick="switchSettingsTab('agents')">
+        <span>🧑‍💼</span> 智能体
       </button>
       <button class="settings-tab" data-tab="debate" onclick="switchSettingsTab('debate')">
         <span>⚖</span> 辩论角色

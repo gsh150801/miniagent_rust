@@ -18,9 +18,17 @@
   澄清问答、**结构化假说/辩论卡片**（支持/反驳/rebuttal/置信度变化/跨假说矛盾）、
   **多标签预览面板**（Markdown/JSON/CSV/TSV/`.ipynb` 含输出/**Excel 多 sheet**/图片）、
   **Provenance 溯源面板**、Trace 事件审计、任务历史/搜索/删除
+- **自定义智能体 / Custom Agent Roles**（✅）：⚙️ 设置页新建/编辑/删除智能体角色
+  （角色名、Persona、工具白名单、配套技能，存 `agents.json`）；**生成器**按
+  base_url / 鉴权 / API key / 文档一键生成 Python 工具脚本 + SKILL.md（key 只落
+  `.miniagent/secrets/`，0600）；技能面板支持导入/查看/删除（用户目录
+  `.miniagent/skills/`）；Loop 规划阶段可见自定义角色目录并自主分配子任务；
+  输入栏可强制指定"某智能体 + 某技能"执行任务（loop 确定性覆盖 + workflow
+  prompt 注入）
 - **跨供应商容灾 / Cross-Vendor Resilience**（✅）：DeepSeek / StepFun / MiniMax 自动回退，
   401/402/403 账户级错误**进程内熔断**该厂商；搜索后端健康探针 + 熔断
-- **可扩展技能 / Extensible Skills**（✅）：156 个科学技能，drop SKILL.md 自动发现注册
+- **可扩展技能 / Extensible Skills**（✅）：156 个科学技能，drop SKILL.md 自动发现注册；
+  Web UI 导入/查看/删除用户技能
 - **四层记忆 / 4-Layer Memory**（✅）：L0 工作记忆 → L1 情景记忆 (SQLite FTS5) →
   L2 语义记忆 (向量) → L3 技能记忆；loop/workflow 模式注入跨会话经验
 - **自改进 / Self-Improvement**（✅）：在线 Step-Reflection + Q-Router；离线 Experience Graph + Skill 生命周期

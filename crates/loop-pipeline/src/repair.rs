@@ -212,6 +212,7 @@ Output before failure (may be partial/empty):
                     ctx.working_dir.clone(),
                     state.steerings.clone(),
                     upstream_block,
+                    state.forced_skills.clone(),
                 ).await;
 
                 let ok = retry_result.success;

@@ -64,10 +64,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}", get(get_task_handler).delete(delete_task_handler))
         // Keep legacy routes
         .route("/api/health", get(health_handler))
-        .route("/api/skills", get(skills_handler))
+        .route("/api/skills", get(skills_handler).post(import_skill_handler))
+        .route("/api/skills/{name}", get(skill_detail_handler).delete(delete_skill_handler))
         .route("/api/trace/{task_id}", get(trace_handler))
         .route("/api/provenance/{task_id}", get(provenance_handler))
         .route("/api/metrics", get(metrics_handler))
+        // Custom agent roles (view / create / edit / delete + LLM-assisted
+        // tool-script & skill generation from an API endpoint spec).
+        .route("/api/agents", get(agents_handler).post(add_agent_handler))
+        .route("/api/agents/{id}", axum::routing::put(update_agent_handler).delete(delete_agent_handler))
+        .route("/api/agents/generate", post(generate_agent_assets_handler))
         // Runtime LLM model registry (add / select / delete models)
         .route("/api/models", get(models_handler).post(add_model_handler))
         .route("/api/models/{id}", axum::routing::put(update_model_handler).delete(delete_model_handler))
@@ -139,11 +145,12 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
-/// 返回已发现的 skill 列表（供前端浏览/搜索）。
+/// 返回已发现的 skill 列表（供前端浏览/搜索/勾选）。
 ///
 /// 扫描 `skills/` 和 `.miniagent/skills/` 目录下的 SKILL.md 文件，
-/// 返回 `[{name, description, triggers, tags, tools_needed, priority, actionable}]`。
-/// 前端 `loadSkills()` fetch 此端点渲染 skill 面板。
+/// 返回 `[{name, description, triggers, tags, tools_needed, priority, actionable, custom, file_path}]`。
+/// `custom=true` 表示该技能在用户目录（`.miniagent/skills/`，可删除/覆盖）；
+/// 仓库内置技能不可删。前端 `loadSkills()` fetch 此端点渲染 skill 面板。
 async fn skills_handler() -> Json<Vec<serde_json::Value>> {
     use miniagent_skill::SkillDiscovery;
 
@@ -151,6 +158,7 @@ async fn skills_handler() -> Json<Vec<serde_json::Value>> {
     let bundles = discovery.discover();
 
     let skills: Vec<serde_json::Value> = bundles.iter().map(|b| {
+        let custom = is_user_skill(&b.file_path);
         serde_json::json!({
             "name": b.metadata.name,
             "description": b.metadata.description,
@@ -160,6 +168,8 @@ async fn skills_handler() -> Json<Vec<serde_json::Value>> {
             "priority": b.metadata.priority,
             "actionable": b.metadata.actionable,
             "version": b.metadata.version,
+            "custom": custom,
+            "file_path": b.file_path,
         })
     }).collect();
 
@@ -1202,6 +1212,13 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     let sink2 = Arc::clone(&sink);
                     let mode = req.mode.clone();
                     let files2 = req.files.clone();
+                    // 用户指定的执行智能体（自定义角色 role_key）与技能。
+                    // loop 模式 → ForcedDirectives（确定性覆盖 assigned_role +
+                    // 强制注入技能正文）；workflow 模式 → 指令块拼入 prompt。
+                    let forced = miniagent_loop_pipeline::types::ForcedDirectives {
+                        agent: req.agent.clone().filter(|s| !s.is_empty()),
+                        skills: req.skills.clone(),
+                    };
                     let handle = tokio::spawn(async move {
                         match mode.as_str() {
                             "debate" => {
@@ -1210,7 +1227,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                             }
                             "loop" | "loop_pipeline" | "loop-pipeline" => {
                                 // Loop pipeline: 迭代 Explore→Plan→Dispatch→Evaluate→Repair
-                                let _ = handle_run_loop(&sink2, &state2, req.prompt, task_id).await;
+                                let _ = handle_run_loop(&sink2, &state2, req.prompt, task_id, forced).await;
                             }
                             "research" => {
                                 // Research pipeline: 文献→KG→致病机理假说→辩论→验证计划→数据分析 notebook
@@ -1218,7 +1235,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                             }
                             _ => {
                                 // 默认：单智能体 ReAct + 计划 + 反馈（workflow 路径）
-                                let _ = handle_run(&sink2, &state2, req.prompt, files2, task_id).await;
+                                let _ = handle_run(&sink2, &state2, req.prompt, files2, task_id, forced).await;
                             }
                         }
                     });
@@ -1358,6 +1375,9 @@ struct WsRequest {
     mode: String,
     #[serde(default)]
     skills: Vec<String>,
+    /// 用户指定的执行智能体（自定义角色 role_key，来自 /api/agents）。
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 /// Loop pipeline: iterative Explore->Plan->Dispatch->Evaluate->Repair cycles.
@@ -1370,6 +1390,7 @@ async fn handle_run_loop(
     state: &AppState,
     prompt: String,
     existing_task_id: Option<String>,
+    forced: miniagent_loop_pipeline::types::ForcedDirectives,
 ) {
     let _api_key = state.config.require_active_key().unwrap_or_else(|e| {
         eprintln!("FATAL: {e}");
@@ -1581,6 +1602,7 @@ async fn handle_run_loop(
         Some(ask_hook),
         Some(steer_hook),
         Some(pipeline_agent),
+        Some(forced),
     ).await;
 
     state.cancels.remove(&task_id);
@@ -2409,6 +2431,7 @@ async fn handle_run(
     prompt: String,
     file_ids: Vec<String>,
     existing_task_id: Option<String>,
+    forced: miniagent_loop_pipeline::types::ForcedDirectives,
 ) {
     eprintln!("🔍 handle_run enter | follow_up={existing_task_id:?} | prompt={}", prompt.chars().take(40).collect::<String>());
     // Resolve the active model profile once per task; every stage provider
@@ -2457,6 +2480,16 @@ async fn handle_run(
 
     // Read and parse uploaded files
     let enriched_prompt = enrich_prompt_with_files(&prompt, &file_ids, &state.task_dir);
+
+    // 用户指定的智能体/技能（workflow 单智能体路径）：指令块（含技能完整
+    // 正文）前置拼入 prompt——该路径无 Plan/Dispatch 阶段可挂指令，prompt
+    // 注入是唯一可靠的生效点。
+    let directive_block = build_agent_directive_block(forced.agent.as_deref(), &forced.skills);
+    let enriched_prompt = if directive_block.is_empty() {
+        enriched_prompt
+    } else {
+        format!("{directive_block}\n{enriched_prompt}")
+    };
 
     // P1 多轮交互：follow-up 时把上一轮交流与产物清单注入本轮上下文，
     // 修复"逐轮失忆"断层（此前 task.messages 仅用于展示，agent 从零开始）。
@@ -4338,4 +4371,551 @@ async fn settings_active_handler(State(state): State<AppState>) -> impl IntoResp
         },
         "kinds": kinds,
     }))
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Custom agent roles（自定义智能体角色）+ skill 管理 API
+// ════════════════════════════════════════════════════════════════
+
+/// 内置角色视图（只读；工具表与 `loop_pipeline::prompts::tools_for_role`
+/// 的静态表对齐——单一事实来源在那边，这里仅为前端展示复制一份）。
+fn builtin_role_views() -> Vec<serde_json::Value> {
+    let table: [(&str, &str, &str, &str); 7] = [
+        ("researcher", "🧭 Researcher", "信息检索与文献调研（web/pubmed/patent/clinical trials）",
+            "web_search, web_fetch, pubmed_search, patent_search, clinical_trials_search, citation_check, read"),
+        ("explorer", "🔭 Explorer", "任务需求探索，为规划收集信息",
+            "web_search, web_fetch, pubmed_search, patent_search, clinical_trials_search"),
+        ("executor", "⚙️ Executor", "代码执行与工程操作（bash/git/conda）",
+            "bash, read, write, edit, glob, grep, git, conda"),
+        ("writer", "✍️ Writer", "产出与润色最终交付物",
+            "read, write, edit"),
+        ("critic", "🔍 Critic", "审查输出质量、核查论断",
+            "read, web_search, web_fetch, citation_check"),
+        ("synthesizer", "🧩 Synthesizer", "整合多来源结果",
+            "read"),
+        ("analyst", "📊 Analyst", "数据分析（本地文件）",
+            "read, grep, glob"),
+    ];
+    table
+        .iter()
+        .map(|(key, name, desc, tools)| {
+            serde_json::json!({
+                "id": format!("builtin-{key}"),
+                "role_key": key,
+                "name": name,
+                "description": desc,
+                "tools": tools.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>(),
+                "skills": [],
+                "builtin": true,
+            })
+        })
+        .collect()
+}
+
+/// GET /api/agents — 内置 + 自定义智能体列表。
+async fn agents_handler() -> Json<serde_json::Value> {
+    let store = miniagent_core::roles::AgentRoleStore::load();
+    Json(serde_json::json!({
+        "builtins": builtin_role_views(),
+        "custom": store.roles(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRoleRequest {
+    name: String,
+    #[serde(default)]
+    role_key: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    system_prompt: String,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    icon: Option<String>,
+}
+
+impl AgentRoleRequest {
+    fn into_profile(self, id: String, created_at: String) -> miniagent_core::roles::AgentRoleProfile {
+        miniagent_core::roles::AgentRoleProfile {
+            id,
+            name: self.name,
+            role_key: self.role_key,
+            description: self.description,
+            system_prompt: self.system_prompt,
+            tools: self.tools,
+            skills: self.skills,
+            icon: self.icon.unwrap_or_else(|| "🤖".into()),
+            created_at,
+        }
+    }
+}
+
+/// POST /api/agents — 新建自定义智能体角色。
+async fn add_agent_handler(Json(req): Json<AgentRoleRequest>) -> Response {
+    let role_key = if req.role_key.trim().is_empty() {
+        miniagent_core::roles::slugify_role_key(&req.name)
+    } else {
+        miniagent_core::roles::slugify_role_key(&req.role_key)
+    };
+    let profile = req.into_profile(String::new(), String::new());
+    let profile = miniagent_core::roles::AgentRoleProfile {
+        role_key,
+        ..profile
+    };
+    if let Err(e) = profile.validate() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    let mut store = miniagent_core::roles::AgentRoleStore::load();
+    let added = store.add(profile);
+    tracing::info!(role_key = %added.role_key, "custom agent role created");
+    (StatusCode::CREATED, Json(serde_json::json!({"id": added.id, "agent": added}))).into_response()
+}
+
+/// PUT /api/agents/{id} — 编辑自定义智能体角色（全量替换）。
+async fn update_agent_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AgentRoleRequest>,
+) -> Response {
+    let _ = state;
+    let existing = miniagent_core::roles::AgentRoleStore::load();
+    let Some(old) = existing.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("角色 {id} 不存在")}))).into_response();
+    };
+    let role_key = if req.role_key.trim().is_empty() {
+        old.role_key.clone()
+    } else {
+        miniagent_core::roles::slugify_role_key(&req.role_key)
+    };
+    let profile = req.into_profile(old.id.clone(), old.created_at.clone());
+    let profile = miniagent_core::roles::AgentRoleProfile { role_key, ..profile };
+    if let Err(e) = profile.validate() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    let mut store = existing;
+    match store.update(&id, profile) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// DELETE /api/agents/{id} — 删除自定义智能体角色。
+async fn delete_agent_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let _ = state;
+    let mut store = miniagent_core::roles::AgentRoleStore::load();
+    match store.remove(&id) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+// ── LLM 辅助生成：API 规格 → 工具脚本 + SKILL.md ────────────────
+
+#[derive(Debug, Deserialize)]
+struct GenerateAgentAssetsRequest {
+    /// 智能体/技能名（也是生成文件的目录名 slug）。
+    name: String,
+    /// 该智能体的职责描述（告诉 LLM 要生成什么能力的工具）。
+    #[serde(default)]
+    purpose: String,
+    /// API 端点规格。None 时仍可生成（基于 purpose 的本地脚本/技能）。
+    #[serde(default)]
+    base_url: Option<String>,
+    /// 鉴权方式：query（api_key 作查询参数）| bearer | header（X-API-Key）。
+    #[serde(default)]
+    auth: Option<String>,
+    /// API 文档片段/示例（可选）。
+    #[serde(default)]
+    docs: Option<String>,
+    /// API key。绝不写进脚本/技能正文——只落 `.miniagent/secrets/<slug>.key`
+    /// （chmod 600），脚本经环境变量 + 该文件回退读取。
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// POST /api/agents/generate — 由当前激活模型按 API 规格（url/key/docs）
+/// 生成配套的工具脚本与技能 SKILL.md，落盘到 `.miniagent/skills/<slug>/`。
+/// 返回生成的技能名与文件路径，前端可把它自动挂到新建的智能体上。
+async fn generate_agent_assets_handler(
+    State(state): State<AppState>,
+    Json(req): Json<GenerateAgentAssetsRequest>,
+) -> Response {
+    if req.name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "名称不能为空"}))).into_response();
+    }
+    let slug = miniagent_core::roles::slugify_role_key(&req.name);
+    let purpose = if req.purpose.trim().is_empty() {
+        req.name.trim().to_string()
+    } else {
+        req.purpose.trim().to_string()
+    };
+
+    // 密钥落盘：.miniagent/secrets/<slug>.key（0600）。脚本通过 env var
+    // <SLUG_API_KEY> 读取，回退到该文件。密钥本体绝不进入任何提示词/产物。
+    let secrets_dir = miniagent_core::paths::workspace_root().join(".miniagent").join("secrets");
+    let secret_path = secrets_dir.join(format!("{slug}.key"));
+    if let Some(key) = req.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(&secrets_dir) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("创建密钥目录失败: {e}")}))).into_response();
+        }
+        if let Err(e) = std::fs::write(&secret_path, key.trim()) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("写入密钥失败: {e}")}))).into_response();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let secret_path_str = secret_path.display().to_string();
+    let env_var = format!("{}_API_KEY", slug.to_uppercase().replace('-', "_"));
+
+    let auth = req.auth.unwrap_or_else(|| "bearer".into());
+    let base_url = req.base_url.clone().unwrap_or_default();
+    let docs = req.docs.clone().unwrap_or_default();
+
+    let prompt = format!(
+        r#"You are a tooling engineer for an AI agent framework. Generate a local tool script + skill doc.
+
+## Target
+- Agent/tool name: {slug}
+- Purpose: {purpose}
+- API base URL: {base_url}
+- Auth style: {auth} ("query" = api key as `api_key` query parameter; "bearer" = Authorization: Bearer; "header" = X-API-Key header)
+- API docs / examples (may be empty):
+{docs}
+
+## Key handling (CRITICAL)
+The API key is NEVER embedded in any generated file. The script reads it via `os.environ.get("{env_var}")` and falls back to reading the file `{secret_path_str}` (first line, strip whitespace).
+
+## Requirements for `script` (Python 3, stdlib + requests only)
+- argparse CLI with sensible positional/optional arguments covering the tool's main operations.
+- Reads the key exactly as described above; exits with a clear error message when missing.
+- Prints human/agent-readable output (JSON or markdown) to stdout; errors to stderr with non-zero exit.
+- Timeout on every HTTP call; surface HTTP error bodies.
+
+## Requirements for `skill_md` (SKILL.md with YAML-like frontmatter)
+- Frontmatter fields: name (exactly "{slug}"), description (one line), triggers (3-6 short phrases, include Chinese variants), tools_needed: [bash, read], version, priority: 9.
+- Body: a step-by-step workflow the agent follows: when to use this skill, the exact bash command lines to run the script (absolute path shown as <skill_dir>/scripts/<filename>), how to interpret output, and failure handling.
+- Write body instructions in Chinese.
+
+## Output JSON ONLY:
+{{
+  "skill_md": "<full SKILL.md content>",
+  "script": "<full python script content>",
+  "script_filename": "<slug>.py"
+}}"#,
+        slug = slug,
+        purpose = purpose,
+        base_url = if base_url.is_empty() { "(none — write a local-processing tool, no API calls)".into() } else { base_url },
+        auth = auth,
+        docs = if docs.is_empty() { "(none provided)".into() } else { docs },
+        env_var = env_var,
+        secret_path_str = secret_path_str,
+    );
+
+    // 用当前激活模型（Pro 档——代码生成质量优先）单次调用。
+    let profile = state.models.read().unwrap().active().clone();
+    let provider = match build_provider(&profile, ProviderTier::Pro) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("当前模型配置不可用: {e}")}))).into_response();
+        }
+    };
+    let request = CompletionRequest {
+        system: "You generate agent tooling artifacts. Output ONLY valid JSON — no markdown fences, no commentary.".into(),
+        messages: vec![AgentMessage::user(&prompt)],
+        tools: vec![],
+        config: InferenceConfig {
+            temperature: Some(0.2),
+            max_tokens: Some(8000),
+            ..Default::default()
+        },
+    };
+    let resp = match provider.complete(&request, tokio_util::sync::CancellationToken::new()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("生成调用失败: {e}")}))).into_response();
+        }
+    };
+    let text: String = resp.content.iter()
+        .filter_map(|b| match b {
+            miniagent_core::event::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let cleaned = miniagent_core::json_util::extract_and_repair(&text);
+    let parsed: serde_json::Value = match serde_json::from_str(&cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            let snippet: String = cleaned.chars().take(200).collect();
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("模型输出无法解析为 JSON: {e}. 开头: {snippet}")
+            }))).into_response();
+        }
+    };
+
+    let skill_md = parsed["skill_md"].as_str().unwrap_or("").trim().to_string();
+    let script = parsed["script"].as_str().unwrap_or("").trim().to_string();
+    let script_filename = parsed["script_filename"].as_str().unwrap_or("").trim().to_string();
+    if skill_md.is_empty() || script.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "模型输出缺少 skill_md 或 script 字段"}))).into_response();
+    }
+    // 文件名安全：必须是纯文件名（无路径分隔符），且为 .py/.sh。
+    let script_filename = if script_filename.contains('/') || script_filename.contains('\\')
+        || !(script_filename.ends_with(".py") || script_filename.ends_with(".sh"))
+    {
+        format!("{slug}.py")
+    } else {
+        script_filename
+    };
+
+    // 验证 SKILL.md 能被技能发现器解析（frontmatter 必须有 name）。
+    if let Err(e) = miniagent_skill::bundle::parse_skill_file("(generated)", &skill_md) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("生成的 SKILL.md 无效: {e}")
+        }))).into_response();
+    }
+
+    // 落盘：.miniagent/skills/<slug>/SKILL.md + scripts/<filename>
+    let skill_dir = miniagent_core::paths::user_skill_dir().join(&slug);
+    let scripts_dir = skill_dir.join("scripts");
+    if let Err(e) = std::fs::create_dir_all(&scripts_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("创建技能目录失败: {e}")}))).into_response();
+    }
+    let skill_path = skill_dir.join("SKILL.md");
+    let script_path = scripts_dir.join(&script_filename);
+    if let Err(e) = std::fs::write(&skill_path, &skill_md) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("写入 SKILL.md 失败: {e}")}))).into_response();
+    }
+    if let Err(e) = std::fs::write(&script_path, &script) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("写入脚本失败: {e}")}))).into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    tracing::info!(slug = %slug, script = %script_path.display(), "generated agent tool script + skill");
+    (StatusCode::CREATED, Json(serde_json::json!({
+        "skill_name": slug,
+        "skill_path": skill_path.display().to_string(),
+        "script_path": script_path.display().to_string(),
+        "secret_stored": req.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false),
+    }))).into_response()
+}
+
+// ── Skill 导入 / 详情 / 删除 ─────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ImportSkillRequest {
+    /// 技能名（目录 slug）。为空时从 frontmatter 的 name 推导。
+    #[serde(default)]
+    name: String,
+    /// 完整 SKILL.md 内容（frontmatter + 正文）。
+    content: String,
+    /// 附加文件（如脚本）：{filename, content}。filename 必须是纯文件名。
+    #[serde(default)]
+    files: Vec<ImportSkillFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportSkillFile {
+    filename: String,
+    content: String,
+}
+
+/// POST /api/skills — 导入技能：写入 `.miniagent/skills/<slug>/SKILL.md`。
+async fn import_skill_handler(Json(req): Json<ImportSkillRequest>) -> Response {
+    if req.content.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "SKILL.md 内容不能为空"}))).into_response();
+    }
+    // 先验证内容可解析（fail-fast，不落盘半成品）。
+    if let Err(e) = miniagent_skill::bundle::parse_skill_file("(import)", &req.content) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("SKILL.md 无效: {e}")}))).into_response();
+    }
+    let name = if req.name.trim().is_empty() {
+        match miniagent_skill::bundle::parse_skill_file("(import)", &req.content) {
+            Ok(b) => b.metadata.name,
+            Err(_) => String::new(),
+        }
+    } else {
+        req.name.trim().to_string()
+    };
+    let slug = miniagent_core::roles::slugify_role_key(&name);
+    if miniagent_core::roles::BUILTIN_ROLE_KEYS.contains(&slug.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "技能名与内置角色键冲突"}))).into_response();
+    }
+    let skill_dir = miniagent_core::paths::user_skill_dir().join(&slug);
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("创建技能目录失败: {e}")}))).into_response();
+    }
+    if let Err(e) = std::fs::write(skill_dir.join("SKILL.md"), &req.content) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("写入失败: {e}")}))).into_response();
+    }
+    let mut saved_files = vec![skill_dir.join("SKILL.md").display().to_string()];
+    for f in &req.files {
+        if f.filename.contains('/') || f.filename.contains('\\') || f.filename.trim().is_empty() {
+            continue; // 附加文件名不合法 → 跳过（SKILL.md 已入库）
+        }
+        let path = skill_dir.join("scripts").join(f.filename.trim());
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        if std::fs::write(&path, &f.content).is_ok() {
+            saved_files.push(path.display().to_string());
+        }
+    }
+    tracing::info!(slug = %slug, files = saved_files.len(), "skill imported");
+    (StatusCode::CREATED, Json(serde_json::json!({
+        "name": slug,
+        "files": saved_files,
+    }))).into_response()
+}
+
+/// GET /api/skills/{name} — 技能详情：完整 SKILL.md 正文 + 技能目录文件清单。
+async fn skill_detail_handler(Path(name): Path<String>) -> Response {
+    use miniagent_skill::SkillDiscovery;
+    let bundles = SkillDiscovery::new().discover();
+    let Some(bundle) = bundles.iter().find(|b| b.metadata.name == name) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("技能 {name} 不存在")}))).into_response();
+    };
+    let skill_dir = absolute_skill_dir(&bundle.file_path);
+    let mut files: Vec<String> = Vec::new();
+    fn walk(dir: &StdPath, base: &StdPath, out: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, base, out);
+                } else if let Ok(rel) = p.strip_prefix(base) {
+                    out.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+    walk(&skill_dir, &skill_dir, &mut files);
+    Json(serde_json::json!({
+        "name": bundle.metadata.name,
+        "description": bundle.metadata.description,
+        "triggers": bundle.metadata.triggers,
+        "tools_needed": bundle.metadata.tools_needed,
+        "priority": bundle.metadata.priority,
+        "version": bundle.metadata.version,
+        "body": bundle.body,
+        "custom": is_user_skill(&bundle.file_path),
+        "dir": skill_dir.display().to_string(),
+        "files": files,
+    })).into_response()
+}
+
+/// DELETE /api/skills/{name} — 删除技能（仅用户目录 `.miniagent/skills/`
+/// 下的可删；仓库内置技能返回 400）。
+async fn delete_skill_handler(Path(name): Path<String>) -> Response {
+    use miniagent_skill::SkillDiscovery;
+    let bundles = SkillDiscovery::new().discover();
+    let Some(bundle) = bundles.iter().find(|b| b.metadata.name == name) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("技能 {name} 不存在")}))).into_response();
+    };
+    if !is_user_skill(&bundle.file_path) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "内置技能不可删除（位于仓库 skills/ 目录）"
+        }))).into_response();
+    }
+    let skill_dir = absolute_skill_dir(&bundle.file_path);
+    if let Err(e) = std::fs::remove_dir_all(&skill_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("删除失败: {e}")}))).into_response();
+    }
+    tracing::info!(skill = %name, dir = %skill_dir.display(), "skill deleted");
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+/// 技能目录归属判定：`file_path` 是否位于用户技能目录
+/// `.miniagent/skills/`（工作区根锚定的绝对路径）之下。
+///
+/// SkillDiscovery 记录的 file_path 是相对 CWD 的路径，而
+/// [`miniagent_core::paths::user_skill_dir`] 是绝对路径——直接
+/// `starts_with` 比较恒为 false（live：导入的技能 custom 标记丢失）。
+/// 两侧都先绝对化 + canonicalize 再比较。
+fn is_user_skill(file_path: &str) -> bool {
+    absolute_skill_dir(file_path)
+        .canonicalize()
+        .map(|abs| {
+            let user = miniagent_core::paths::user_skill_dir();
+            let user = user.canonicalize().unwrap_or(user);
+            abs.starts_with(user)
+        })
+        .unwrap_or(false)
+}
+
+/// 把 SkillDiscovery 的（可能相对的）SKILL.md 路径解析为绝对路径并取其
+/// 目录。相对路径按进程 CWD 解析（与 discovery 的扫描根一致）。
+fn absolute_skill_dir(file_path: &str) -> PathBuf {
+    let p = StdPath::new(file_path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    abs.parent().map(|d| d.to_path_buf()).unwrap_or(abs)
+}
+
+// ── 指定智能体/技能 → workflow 模式指令块 ────────────────────────
+
+/// 构建"指定智能体 + 指定技能"指令块（workflow 单智能体路径用：拼入
+/// prompt）。loop 模式不走这里（ForcedDirectives 确定性生效）。
+fn build_agent_directive_block(agent: Option<&str>, skills: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(agent) = agent.filter(|s| !s.is_empty()) {
+        let store = miniagent_core::roles::AgentRoleStore::load();
+        match store.get_by_key(agent) {
+            Some(p) => {
+                let persona = if p.system_prompt.trim().is_empty() {
+                    p.description.clone()
+                } else {
+                    p.system_prompt.clone()
+                };
+                parts.push(format!(
+                    "## 指定智能体（你必须以该角色身份执行本任务）\n你是 {}（{}）：{}\n{}",
+                    p.name, p.role_key, p.description, persona
+                ));
+            }
+            None => {
+                parts.push(format!(
+                    "## 指定智能体\n用户指定了智能体 \"{agent}\"，但该角色不存在——按字面角色名尽力执行并在开头注明角色未找到。"
+                ));
+            }
+        }
+    }
+    if !skills.is_empty() {
+        use miniagent_skill::SkillDiscovery;
+        let bundles = SkillDiscovery::new().discover();
+        let mut blocks: Vec<String> = Vec::new();
+        for name in skills {
+            match bundles.iter().find(|b| b.metadata.name == *name) {
+                Some(b) => {
+                    let body: String = b.body.lines().take(60).collect::<Vec<_>>().join("\n");
+                    blocks.push(format!("### 技能: {name}（必须按其工作流使用）\n{body}"));
+                }
+                None => {
+                    blocks.push(format!(
+                        "### 技能: {name}（本地技能库未找到——不要伪造执行结果，如实报告）"
+                    ));
+                }
+            }
+        }
+        parts.push(format!(
+            "## 指定技能（用户要求必须使用）\n{}",
+            blocks.join("\n\n")
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", parts.join("\n\n"))
+    }
 }

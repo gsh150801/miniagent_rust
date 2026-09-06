@@ -254,6 +254,8 @@ fn mock_state(loop_count: usize, max_loops: usize, completed: bool) -> PipelineS
         steerings: Vec::new(),
         repair_retries: Default::default(),
         next_action: None,
+        forced_agent: None,
+        forced_skills: Vec::new(),
     }
 }
 

@@ -331,6 +331,38 @@ def route(prompt: str) -> str:
         return validation_plan(p)
     if "bioinformatics engineer" in p:
         return analysis_script(p)
+    if "tooling engineer" in p:
+        # /api/agents/generate: canned SKILL.md + python script. The slug is
+        # echoed back from the prompt so frontmatter `name` matches.
+        m = re.search(r"Agent/tool name: ([A-Za-z0-9_-]+)", p)
+        slug = m.group(1) if m else "mock-tool"
+        skill_md = (
+            "---\n"
+            f"name: {slug}\n"
+            "description: Mock generated skill for e2e tests\n"
+            "triggers:\n"
+            "  - mock tool\n"
+            "tools_needed:\n"
+            "  - bash\n"
+            "version: \"0.1.0\"\n"
+            "priority: 9\n"
+            "---\n"
+            "# Mock Skill\n\nRun the script via bash.\n"
+        )
+        script = (
+            "#!/usr/bin/env python3\n"
+            "import argparse, os\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('city')\n"
+            "a = p.parse_args()\n"
+            "key = os.environ.get('MOCK_KEY', 'none')\n"
+            "print(f'mock tool for {{a.city}} key={{key}}')\n"
+        )
+        return json.dumps({
+            "skill_md": skill_md,
+            "script": script,
+            "script_filename": f"{slug}.py",
+        })
     return "OK"
 
 

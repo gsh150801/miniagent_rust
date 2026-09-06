@@ -496,12 +496,19 @@ function renderSkillList() {
     const selected = selectedSkills.has(s.name);
     const desc = (s.description || '').slice(0, 80);
     const icon = selected ? '&#9989;' : '&#11036;';
+    // 查看/删除操作按钮：点击不冒泡到 toggleSkill。仅用户目录技能
+    //（custom=true，.miniagent/skills/）可删除；内置技能无删除钮。
+    const actions = `
+      <span class="skill-act" title="查看详情" onclick="event.stopPropagation(); viewSkill('${escHtml(s.name)}')">👁</span>
+      ${s.custom ? `<span class="skill-act danger" title="删除" onclick="event.stopPropagation(); deleteSkill('${escHtml(s.name)}')">🗑</span>` : ''}
+      ${s.custom ? '<span class="skill-tag" title="用户导入">导入</span>' : ''}`;
     return `<div class="skill-item ${selected ? 'selected' : ''}" data-name="${escHtml(s.name)}" onclick="toggleSkill('${escHtml(s.name)}')">
       <span class="skill-check">${icon}</span>
       <div class="skill-body">
         <div class="skill-name">${escHtml(s.name)}</div>
         ${desc ? `<div class="skill-desc">${escHtml(desc)}</div>` : ''}
       </div>
+      <div class="skill-actions">${actions}</div>
     </div>`;
   }).join('');
 }
@@ -1547,6 +1554,10 @@ function sendMessage() {
   payload.mode = currentMode;
   if (currentTaskId) payload.task_id = currentTaskId;
   if (selectedSkills.size > 0) payload.skills = [...selectedSkills];
+  // 用户指定的执行智能体（自定义角色 role_key；空 = 自动分配）。
+  const agentSel = document.getElementById('agentSelect');
+  const agentKey = agentSel?.value || '';
+  if (agentKey) payload.agent = agentKey;
   ws.send(JSON.stringify(payload));
   input.value = '';
   autoResize(input);
@@ -2867,6 +2878,7 @@ initPanelGrips();
 renderProgressView();
 renderFilesView();
 connect();
+loadAgents();
 
 // ── Model registry（运行时 LLM 管理：统一设置中心） ───────────
 //
@@ -2942,7 +2954,7 @@ async function activateModel(id) {
 function openSettings(tab) {
   const overlay = document.getElementById('settingsOverlay');
   if (!overlay) return;
-  if (tab && ['models','debate','about'].includes(tab)) settingsStore.settingsTab = tab;
+  if (tab && ['models','agents','debate','about'].includes(tab)) settingsStore.settingsTab = tab;
   overlay.classList.add('active');
   for (const t of document.querySelectorAll('.settings-tab')) {
     t.classList.toggle('active', t.dataset.tab === settingsStore.settingsTab);
@@ -2950,6 +2962,7 @@ function openSettings(tab) {
   renderSettingsTab();
   // Hydrate fresh data so changes from other surfaces appear.
   loadSettings();
+  loadAgents();
 }
 function closeSettings() {
   document.getElementById('settingsOverlay')?.classList.remove('active');
@@ -2966,6 +2979,7 @@ function renderSettingsTab() {
   const body = document.getElementById('settingsBody');
   if (!body) return;
   if (settingsStore.settingsTab === 'models') renderSettingsModels(body);
+  else if (settingsStore.settingsTab === 'agents') renderSettingsAgents(body);
   else if (settingsStore.settingsTab === 'debate') renderSettingsDebate(body);
   else renderSettingsAbout(body);
 }
@@ -3251,4 +3265,481 @@ function renderSettingsAbout(body) {
       </div>
     </div>
   `;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  智能体角色管理（/api/agents）+ 技能查看/导入/删除（/api/skills）
+// ════════════════════════════════════════════════════════════════
+
+// 内置工具全集（与 Rust 端 tools::defaults() 注册表对齐）。
+const ALL_TOOLS = [
+  'read', 'write', 'edit', 'glob', 'grep', 'bash',
+  'web_fetch', 'web_search', 'pubmed_search', 'git', 'conda',
+  'patent_search', 'clinical_trials_search', 'ask_user', 'notebook_edit',
+  'geo_search', 'opentargets', 'enrichr', 'uniprot', 'citation_check',
+  'write_note', 'search_history',
+];
+
+let agentsStore = {
+  builtins: [],   // [{role_key, name, description, tools, skills}]
+  custom: [],     // AgentRoleProfile[]
+};
+
+// 表单状态：null = 新建模式；否则为正在编辑的 AgentRoleProfile.id。
+let editingAgentId = null;
+
+async function loadAgents() {
+  try {
+    const res = await fetch('/api/agents');
+    if (!res.ok) return;
+    const data = await res.json();
+    agentsStore.builtins = data.builtins || [];
+    agentsStore.custom = data.custom || [];
+    renderAgentSelect();
+    if (document.getElementById('settingsOverlay')?.classList.contains('active')
+        && settingsStore.settingsTab === 'agents') {
+      renderSettingsTab();
+    }
+  } catch (e) { /* offline */ }
+}
+
+/// 输入区的智能体下拉：留空 = 自动分配（规划器自选角色）。
+function renderAgentSelect() {
+  const sel = document.getElementById('agentSelect');
+  if (!sel) return;
+  const prev = sel.value;
+  const options = ['<option value="">🤖 自动</option>']
+    .concat(agentsStore.custom.map(a =>
+      `<option value="${esc(a.role_key)}">${esc(a.icon || '🤖')} ${esc(a.name)}</option>`));
+  sel.innerHTML = options.join('');
+  if (prev && agentsStore.custom.some(a => a.role_key === prev)) sel.value = prev;
+}
+
+function onAgentSelectChange() {
+  // 选择即生效（sendMessage 读取当前值）；这里仅做轻提示。
+  const sel = document.getElementById('agentSelect');
+  if (sel?.value) showToast(`任务将指定由 ${sel.selectedOptions[0]?.textContent || sel.value} 执行`, false);
+}
+
+// ── Settings · Agents tab ───────────────────────────────────
+
+function renderSettingsAgents(body) {
+  const builtinCards = agentsStore.builtins.map(b => `
+    <div class="card" style="padding:10px 12px">
+      <div class="card-head">
+        <div class="card-icon" style="font-size:18px">${esc(b.name.split(' ')[0])}</div>
+        <div class="grow">
+          <div class="card-title">${esc(b.name)} <span class="status-tag muted">内置</span></div>
+          <div class="card-sub">${esc(b.description)}</div>
+        </div>
+      </div>
+      <div class="card-meta"><div class="cm-row"><span class="cm-key">工具</span><span>${esc((b.tools||[]).join(', '))}</span></div></div>
+    </div>`).join('');
+
+  const customCards = agentsStore.custom.map(a => `
+    <div class="card" style="padding:10px 12px">
+      <div class="card-head">
+        <div class="card-icon" style="font-size:18px">${esc(a.icon || '🤖')}</div>
+        <div class="grow">
+          <div class="card-title">${esc(a.name)} <code class="role-key-code">${esc(a.role_key)}</code></div>
+          <div class="card-sub">${esc(a.description || '（无描述）')}</div>
+        </div>
+        <div class="card-actions">
+          <button class="btn-action" onclick="editAgent('${esc(a.id)}')">编辑</button>
+          <button class="btn-action danger" onclick="deleteAgent('${esc(a.id)}','${esc(a.name)}')">删除</button>
+        </div>
+      </div>
+      <div class="card-meta">
+        <div class="cm-row"><span class="cm-key">工具</span><span>${a.tools?.length ? esc(a.tools.join(', ')) : '（全部）'}</span></div>
+        ${a.skills?.length ? `<div class="cm-row"><span class="cm-key">技能</span><span>${esc(a.skills.join(', '))}</span></div>` : ''}
+      </div>
+    </div>`).join('');
+
+  body.innerHTML = `
+    <div class="settings-section">
+      <h4>自定义智能体 <span class="hsp-hint">${agentsStore.custom.length} · Loop 模式下规划器可自主把子任务分配给它们；输入栏可强制指定</span></h4>
+      ${customCards || '<div class="empty-state"><div class="es-icon">🧑‍💼</div>还没有自定义智能体。<br>在下方表单创建，或用生成器从 API 规格一键生成配套工具与技能。</div>'}
+    </div>
+
+    <div class="settings-section">
+      <h4>内置角色 <span class="hsp-hint">${agentsStore.builtins.length} · 只读</span></h4>
+      ${builtinCards}
+    </div>
+
+    <hr class="divider">
+
+    <div class="settings-section">
+      <h4 id="agentFormTitle">新建智能体</h4>
+      <div class="form-grid">
+        <div class="form-row">
+          <label>名称 *</label>
+          <input id="afName" type="text" placeholder="例如：气象数据专员">
+        </div>
+        <div class="form-row">
+          <label>角色键 <small>（role_key，留空自动生成）</small></label>
+          <input id="afKey" type="text" placeholder="例如：weather-agent">
+        </div>
+        <div class="form-row span2">
+          <label>职责描述 * <small>（规划器据此决定何时指派该角色）</small></label>
+          <input id="afDesc" type="text" placeholder="例如：查询城市天气并生成预报摘要">
+        </div>
+        <div class="form-row span2">
+          <label>角色 Prompt（Persona）</label>
+          <textarea id="afPrompt" rows="4" placeholder="该角色执行任务时的系统提示词——性格、方法论、输出风格等。留空则只用职责描述。"></textarea>
+        </div>
+      </div>
+
+      <p class="form-hint" style="margin:10px 0 4px">配套工具（不勾 = 全部内置工具）</p>
+      <div class="tool-check-grid" id="afTools">
+        ${ALL_TOOLS.map(t => `
+          <label class="tool-check"><input type="checkbox" value="${t}"><span>${t}</span></label>`).join('')}
+      </div>
+
+      <p class="form-hint" style="margin:10px 0 4px">配套技能（可搜索勾选；执行该角色任务时强制注入）</p>
+      <input id="afSkillSearch" type="text" class="skill-search" placeholder="过滤技能..." oninput="renderAgentSkillPicker()" style="width:100%;margin-bottom:6px">
+      <div class="skill-check-list" id="afSkills"></div>
+
+      <div class="btn-row" style="margin-top:12px">
+        <button class="btn-action" onclick="resetAgentForm()">重置</button>
+        <button class="btn-action primary" id="afSaveBtn" onclick="saveAgent()">创建智能体</button>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <div class="settings-section">
+      <h4>生成器：API 规格 → 工具脚本 + 技能</h4>
+      <p class="form-hint" style="margin-bottom:10px">填入外部 API 的 base_url / 鉴权 / 文档与 key，由当前激活模型生成可执行的 Python 工具脚本和 SKILL.md，自动注册为本地技能。API key 只写入服务端 <code>.miniagent/secrets/</code>（gitignore，权限 0600），绝不进入提示词或技能正文。</p>
+      <div class="form-grid">
+        <div class="form-row">
+          <label>名称 * <small>（也是技能 slug）</small></label>
+          <input id="genName" type="text" placeholder="例如：weather-api">
+        </div>
+        <div class="form-row">
+          <label>用途描述 *</label>
+          <input id="genPurpose" type="text" placeholder="例如：查询指定城市当前天气与 3 日预报">
+        </div>
+        <div class="form-row">
+          <label>Base URL</label>
+          <input id="genUrl" type="text" placeholder="https://api.example.com/v1">
+        </div>
+        <div class="form-row">
+          <label>鉴权方式</label>
+          <select id="genAuth">
+            <option value="bearer">Bearer Token</option>
+            <option value="query">api_key 查询参数</option>
+            <option value="header">X-API-Key 请求头</option>
+          </select>
+        </div>
+        <div class="form-row span2">
+          <label>API 文档 / 示例 <small>（可选，粘贴 endpoint 说明或 curl 示例）</small></label>
+          <textarea id="genDocs" rows="3" placeholder="GET /weather?q={city} → {temp, ...}"></textarea>
+        </div>
+        <div class="form-row span2">
+          <label>API Key <small>（存服务端密钥文件，不回显）</small></label>
+          <input id="genKey" type="password" placeholder="sk-...">
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn-action primary" id="genBtn" onclick="generateAgentAssets()">⚡ 生成工具 + 技能</button>
+      </div>
+      <div id="genResult" style="margin-top:10px"></div>
+    </div>
+  `;
+  renderAgentSkillPicker();
+}
+
+/// 技能勾选列表（表单内，带过滤）。勾选状态存 dataset，避免重渲染丢失。
+function renderAgentSkillPicker() {
+  const wrap = document.getElementById('afSkills');
+  if (!wrap) return;
+  const picked = new Set(getPickedAgentSkills());
+  const q = (document.getElementById('afSkillSearch')?.value || '').trim().toLowerCase();
+  const filtered = skills.filter(s => !q || s.name.toLowerCase().includes(q) || (s.description||'').toLowerCase().includes(q));
+  wrap.innerHTML = filtered.slice(0, 200).map(s => `
+    <label class="tool-check"><input type="checkbox" value="${escHtml(s.name)}" ${picked.has(s.name) ? 'checked' : ''}><span>${escHtml(s.name)}</span></label>
+  `).join('') || '<div class="mini-empty">无匹配技能</div>';
+}
+
+function getPickedAgentSkills() {
+  return [...document.querySelectorAll('#afSkills input:checked')].map(i => i.value);
+}
+
+function resetAgentForm() {
+  editingAgentId = null;
+  const title = document.getElementById('agentFormTitle');
+  const btn = document.getElementById('afSaveBtn');
+  if (title) title.textContent = '新建智能体';
+  if (btn) btn.textContent = '创建智能体';
+  for (const id of ['afName','afKey','afDesc','afPrompt']) {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  }
+  document.querySelectorAll('#afTools input').forEach(i => { i.checked = false; });
+  renderAgentSkillPicker();
+}
+
+function editAgent(id) {
+  const a = agentsStore.custom.find(x => x.id === id);
+  if (!a) return;
+  editingAgentId = id;
+  document.getElementById('settingsOverlay')?.scrollTo({ top: 0, behavior: 'smooth' });
+  const title = document.getElementById('agentFormTitle');
+  const btn = document.getElementById('afSaveBtn');
+  if (title) title.textContent = `编辑智能体：${a.name}`;
+  if (btn) btn.textContent = '保存修改';
+  document.getElementById('afName').value = a.name || '';
+  document.getElementById('afKey').value = a.role_key || '';
+  document.getElementById('afDesc').value = a.description || '';
+  document.getElementById('afPrompt').value = a.system_prompt || '';
+  document.querySelectorAll('#afTools input').forEach(i => {
+    i.checked = (a.tools || []).includes(i.value);
+  });
+  // 先渲染空勾选集再勾选（renderAgentSkillPicker 会从 DOM 读回状态）。
+  renderAgentSkillPicker();
+  for (const name of (a.skills || [])) {
+    const input = document.querySelector(`#afSkills input[value="${CSS.escape(name)}"]`);
+    if (input) input.checked = true;
+  }
+}
+
+async function saveAgent() {
+  const name = document.getElementById('afName')?.value.trim();
+  const desc = document.getElementById('afDesc')?.value.trim();
+  if (!name) { showToast('请输入智能体名称', true); return; }
+  if (!desc) { showToast('请输入职责描述（规划器据此分配任务）', true); return; }
+  const body = {
+    name,
+    role_key: document.getElementById('afKey')?.value.trim() || '',
+    description: desc,
+    system_prompt: document.getElementById('afPrompt')?.value.trim() || '',
+    tools: [...document.querySelectorAll('#afTools input:checked')].map(i => i.value),
+    skills: getPickedAgentSkills(),
+  };
+  const isEdit = !!editingAgentId;
+  try {
+    const res = await fetch(isEdit ? `/api/agents/${encodeURIComponent(editingAgentId)}` : '/api/agents', {
+      method: isEdit ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '保存失败', true); return; }
+    showToast(isEdit ? `已更新 ${name}` : `已创建 ${name}`, false, 'success');
+    resetAgentForm();
+    await loadAgents();
+    renderSettingsTab();
+  } catch (e) { showToast('保存失败: ' + e.message, true); }
+}
+
+async function deleteAgent(id, name) {
+  if (!confirm(`删除智能体 "${name}"？`)) return;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '删除失败', true); return; }
+    showToast(`已删除 ${name}`, false, 'success');
+    if (editingAgentId === id) resetAgentForm();
+    await loadAgents();
+    renderSettingsTab();
+  } catch (e) { showToast('删除失败: ' + e.message, true); }
+}
+
+async function generateAgentAssets() {
+  const name = document.getElementById('genName')?.value.trim();
+  const purpose = document.getElementById('genPurpose')?.value.trim();
+  if (!name || !purpose) { showToast('请填写名称与用途描述', true); return; }
+  const btn = document.getElementById('genBtn');
+  const result = document.getElementById('genResult');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 生成中（约 10-60 秒）…'; }
+  try {
+    const res = await fetch('/api/agents/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        purpose,
+        base_url: document.getElementById('genUrl')?.value.trim() || null,
+        auth: document.getElementById('genAuth')?.value || 'bearer',
+        docs: document.getElementById('genDocs')?.value.trim() || null,
+        api_key: document.getElementById('genKey')?.value.trim() || null,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (result) result.innerHTML = `<div class="empty-state"><div class="es-icon">⚠️</div>${escHtml(data.error || '生成失败')}</div>`;
+      showToast(data.error || '生成失败', true);
+      return;
+    }
+    await loadSkills();
+    if (result) result.innerHTML = `
+      <div class="card" style="padding:10px 12px">
+        <div class="card-head">
+          <div class="card-icon" style="font-size:18px">⚡</div>
+          <div class="grow">
+            <div class="card-title">已生成技能 <code class="role-key-code">${escHtml(data.skill_name)}</code></div>
+            <div class="card-sub">${escHtml(data.skill_path)}<br>${escHtml(data.script_path)}${data.secret_stored ? '<br>🔑 API key 已存入服务端密钥文件' : ''}</div>
+          </div>
+          <div class="card-actions">
+            <button class="btn-action primary" onclick="useGeneratedSkill('${escHtml(data.skill_name)}')">挂到表单</button>
+          </div>
+        </div>
+      </div>`;
+    showToast(`已生成技能 ${data.skill_name}`, false, 'success');
+  } catch (e) {
+    showToast('生成失败: ' + e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ 生成工具 + 技能'; }
+  }
+}
+
+/// 生成的技能自动勾进当前表单的"配套技能"，并预填名称。
+function useGeneratedSkill(skillName) {
+  const nameEl = document.getElementById('afName');
+  if (nameEl && !nameEl.value.trim()) nameEl.value = skillName;
+  const descEl = document.getElementById('afDesc');
+  if (descEl && !descEl.value.trim()) descEl.value = `使用生成的 ${skillName} 技能完成任务`;
+  renderAgentSkillPicker();
+  const input = document.querySelector(`#afSkills input[value="${CSS.escape(skillName)}"]`);
+  if (input) input.checked = true;
+  document.getElementById('afName')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  showToast(`技能 ${skillName} 已挂到表单，确认后点"创建智能体"`, false);
+}
+
+// ── 技能查看 / 导入 / 删除 弹窗 ───────────────────────────────
+
+function openSkillModal(title, html) {
+  const overlay = document.getElementById('skillModal');
+  if (!overlay) return;
+  document.getElementById('skillModalTitle').innerHTML = `<span class="sh-icon">🛠</span><span>${title}</span>`;
+  document.getElementById('skillModalBody').innerHTML = html;
+  overlay.classList.add('active');
+}
+
+function closeSkillModal() {
+  document.getElementById('skillModal')?.classList.remove('active');
+}
+
+async function viewSkill(name) {
+  openSkillModal(escHtml(name), '<div class="skeleton" style="height:120px"></div>');
+  try {
+    const res = await fetch(`/api/skills/${encodeURIComponent(name)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      openSkillModal(escHtml(name), `<div class="empty-state">${escHtml(data.error || '加载失败')}</div>`);
+      return;
+    }
+    const html = `
+      <div class="settings-section">
+        <div class="card" style="padding:10px 12px">
+          <div class="card-head">
+            <div class="grow">
+              <div class="card-title">${escHtml(data.name)}
+                ${data.custom ? '<span class="status-tag muted">导入</span>' : '<span class="status-tag muted">内置</span>'}
+              </div>
+              <div class="card-sub">${escHtml(data.description || '')}</div>
+            </div>
+            <div class="card-actions">
+              <button class="btn-action" onclick="toggleSkill('${escHtml(data.name)}'); closeSkillModal(); renderSkillList(); renderSkillChips();">${selectedSkills.has(data.name) ? '取消选用' : '选用'}</button>
+              ${data.custom ? `<button class="btn-action danger" onclick="deleteSkill('${escHtml(data.name)}')">删除</button>` : ''}
+            </div>
+          </div>
+          <div class="card-meta">
+            <div class="cm-row"><span class="cm-key">触发词</span><span>${escHtml((data.triggers||[]).join(' · '))}</span></div>
+            <div class="cm-row"><span class="cm-key">工具</span><span>${escHtml((data.tools_needed||[]).join(', ') || '—')}</span></div>
+            ${data.version ? `<div class="cm-row"><span class="cm-key">版本</span><span>${escHtml(data.version)}</span></div>` : ''}
+            ${data.files?.length ? `<div class="cm-row"><span class="cm-key">文件</span><span>${escHtml(data.files.join(' · '))}</span></div>` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="settings-section">
+        <h4>SKILL.md 正文</h4>
+        <div class="skill-md-body">${md(data.body || '')}</div>
+      </div>`;
+    openSkillModal(escHtml(name), html);
+    enhanceRichBody(document.getElementById('skillModalBody'));
+  } catch (e) {
+    openSkillModal(escHtml(name), `<div class="empty-state">${escHtml(e.message)}</div>`);
+  }
+}
+
+async function deleteSkill(name) {
+  if (!confirm(`删除技能 "${name}"？该操作会移除其全部文件（仅用户导入的技能可删）。`)) return;
+  try {
+    const res = await fetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '删除失败', true); return; }
+    showToast(`已删除技能 ${name}`, false, 'success');
+    selectedSkills.delete(name);
+    closeSkillModal();
+    await loadSkills();
+    renderSkillList();
+    renderSkillChips();
+  } catch (e) { showToast('删除失败: ' + e.message, true); }
+}
+
+/// 导入弹窗：粘贴 SKILL.md 全文（或从本地文件读取）。
+function openSkillImport() {
+  const html = `
+    <div class="settings-section">
+      <h4>导入技能</h4>
+      <p class="form-hint" style="margin-bottom:10px">粘贴完整 SKILL.md 内容（含 <code>---</code> frontmatter，<code>name</code> 必填），或选择本地文件。导入后立即出现在技能面板，可被勾选使用、可删除。</p>
+      <div class="form-row span2" style="margin-bottom:8px">
+        <label>技能名 <small>（目录名，留空则从 frontmatter 推导）</small></label>
+        <input id="siName" type="text" placeholder="例如：my-custom-skill">
+      </div>
+      <div class="form-row span2" style="margin-bottom:8px">
+        <label>SKILL.md 内容</label>
+        <textarea id="siContent" rows="14" placeholder="---
+name: my-custom-skill
+description: ...
+triggers:
+  - ...
+---
+# 工作流正文..."></textarea>
+      </div>
+      <div class="form-row span2" style="margin-bottom:8px">
+        <label>本地文件 <small>（可选，读取 .md 填入上方文本框）</small></label>
+        <input id="siFile" type="file" accept=".md,.markdown,.txt">
+      </div>
+      <div class="btn-row">
+        <button class="btn-action" onclick="closeSkillModal()">取消</button>
+        <button class="btn-action primary" onclick="submitSkillImport()">导入</button>
+      </div>
+    </div>`;
+  openSkillModal('导入技能', html);
+  const fileInput = document.getElementById('siFile');
+  if (fileInput) {
+    fileInput.addEventListener('change', async () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      const text = await f.text();
+      document.getElementById('siContent').value = text;
+      const base = f.name.replace(/\.(md|markdown|txt)$/i, '');
+      const nameEl = document.getElementById('siName');
+      if (nameEl && !nameEl.value.trim()) nameEl.value = base;
+    });
+  }
+}
+
+async function submitSkillImport() {
+  const content = document.getElementById('siContent')?.value;
+  const name = document.getElementById('siName')?.value.trim() || '';
+  if (!content || !content.trim()) { showToast('请粘贴 SKILL.md 内容', true); return; }
+  try {
+    const res = await fetch('/api/skills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || '导入失败', true); return; }
+    showToast(`已导入技能 ${data.name}`, false, 'success');
+    closeSkillModal();
+    await loadSkills();
+    renderSkillList();
+    // 展开技能面板让用户看到新技能。
+    const panel = document.getElementById('skillPanel');
+    if (panel && panel.style.display === 'none') toggleSkillPanel();
+  } catch (e) { showToast('导入失败: ' + e.message, true); }
 }

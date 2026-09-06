@@ -181,7 +181,7 @@ impl LoopPipeline {
         on_progress: Option<ProgressFn>,
         result_dir: Option<std::path::PathBuf>,
     ) -> Result<PipelineState, AgentError> {
-        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None, None, None).await
+        Self::run_with_clarify(task, config, max_loops, cancel, on_progress, result_dir, None, None, None, None).await
     }
 
     /// [`Self::run`] with an interactive clarify channel. The server wires
@@ -191,6 +191,11 @@ impl LoopPipeline {
     /// `agent`：外部注入的 Agent。缺省时本函数自建一个（CLI 场景），但
     /// 服务端必须注入——事件发送器注册在服务端构建的实例上；若 pipeline
     /// 自建隐藏 Agent，工具事件就永远到不了注册者（live: 操作卡不渲染）。
+    ///
+    /// `forced`：用户从前端下发的执行指令（指定智能体 / 勾选技能）。
+    /// 落到 PipelineState.forced_agent / forced_skills，由 Plan / Dispatch
+    /// 阶段消费。在 checkpoint 恢复之后应用——恢复的旧状态即使没有这些
+    /// 字段，本次请求的指令也必须生效。
     pub async fn run_with_clarify(
         task: impl Into<String>,
         config: Arc<AppConfig>,
@@ -201,6 +206,7 @@ impl LoopPipeline {
         clarify_hook: Option<crate::clarify::ClarifyHook>,
         steer_hook: Option<crate::clarify::SteerHook>,
         agent: Option<std::sync::Arc<miniagent_agent::Agent>>,
+        forced: Option<crate::types::ForcedDirectives>,
     ) -> Result<PipelineState, AgentError> {
         let result_base = result_dir
             .unwrap_or_else(|| miniagent_core::paths::result_root().join("loop-pipeline"));
@@ -251,6 +257,16 @@ impl LoopPipeline {
                 let resumed_loops = resumed.loop_count;
                 ctx.state = resumed;
                 tracing::info!("Resuming from loop {} (checkpoint loaded)", resumed_loops);
+            }
+        }
+
+        // 用户执行指令在 checkpoint 恢复之后应用（本次请求优先于旧状态）。
+        if let Some(f) = forced {
+            if let Some(agent) = f.agent.filter(|s| !s.is_empty()) {
+                ctx.state.forced_agent = Some(agent);
+            }
+            if !f.skills.is_empty() {
+                ctx.state.forced_skills = f.skills;
             }
         }
 

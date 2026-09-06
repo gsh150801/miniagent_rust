@@ -14,7 +14,7 @@ use miniagent_provider::traits::CompletionRequest;
 
 use crate::stage::{PipelineStage, StageContext, StageOutput};
 use crate::types::{TaskPlan, TaskUnit, TaskResult, StageMessage, CritiqueEntry};
-use crate::prompts::{role_system_prompt as new_role_system_prompt, tool_instruction_block, tools_for_role};
+use crate::prompts::{role_system_prompt as new_role_system_prompt, tool_instruction_block};
 
 /// Emit one per-subtask progress event through the shared callback slot.
 /// The server forwards these to the WebSocket as
@@ -598,6 +598,8 @@ impl PipelineStage for DispatchStage {
                 let working_dir = ctx.working_dir.clone();
                 let semaphore = semaphore.clone();
                 let steerings = steerings.clone();
+                // 用户从前端勾选的技能（强制注入每个子任务）。
+                let forced_skills = ctx.state.forced_skills.clone();
                 // 上游任务的输出摘要直接注入依赖任务的提示：此前依赖任务
                 // 只能靠"读共享目录文件"这一隐性契约拿到上游结果，纯文本
                 // 类任务（无文件产物）会因此空转。
@@ -613,6 +615,7 @@ impl PipelineStage for DispatchStage {
                     execute_single_task(
                         task, agent, cancel, wave_ctx.clone(), max_tool_iters,
                         working_dir.clone(), steerings.clone(), upstream_block,
+                        forced_skills.clone(),
                     ).await
                 }));
             }
@@ -936,12 +939,48 @@ pub(crate) async fn execute_single_task(
     working_dir: String,
     steerings: Vec<String>,
     upstream_block: String,
+    forced_skills: Vec<String>,
 ) -> TaskResult {
     let mut system = new_role_system_prompt(
         &task.assigned_role,
         &task.description,
         &task.expected_output,
     );
+
+    // ── 强制技能注入（用户前端勾选 / 自定义角色配套技能）──────────
+    // 这些技能不经过相关性匹配，直接以完整正文注入并要求强制使用。
+    {
+        use miniagent_skill::discovery::SkillDiscovery;
+        let discovery = SkillDiscovery::new();
+        let bundles = discovery.discover();
+        // 汇总强制来源：用户勾选 + 自定义角色档案声明的配套技能。
+        let mut mandatory: Vec<String> = forced_skills.clone();
+        if let Some(profile) = miniagent_core::roles::AgentRoleStore::load()
+            .get_by_key(&task.assigned_role)
+            .map(|p| p.clone())
+        {
+            for s in &profile.skills {
+                if !mandatory.contains(s) {
+                    mandatory.push(s.clone());
+                }
+            }
+        }
+        for name in &mandatory {
+            match bundles.iter().find(|b| &b.metadata.name == name) {
+                Some(bundle) => {
+                    let body: String = bundle.body.lines().take(60).collect::<Vec<_>>().join("\n");
+                    system.push_str(&format!(
+                        "\n## 指定技能: {name}（必须使用——按其工作流执行本任务）\n{body}\n"
+                    ));
+                }
+                None => {
+                    system.push_str(&format!(
+                        "\n## 指定技能: {name}（本地技能库未找到——如无法完成请如实报告，不要伪造技能执行结果）\n"
+                    ));
+                }
+            }
+        }
+    }
 
     // ── 本地技能注入（workflow AgentStage 同款能力）────────────────
     // 修复 live 问题：loop worker 不知道本地技能库，被要求
@@ -1058,8 +1097,9 @@ if !bundles.is_empty() {
     );
 
     let mut history = vec![Message::user(&prompt)];
-    let allowed: Vec<String> = tools_for_role(&task.assigned_role)
-        .iter().map(|s| s.to_string()).collect();
+    // 角色工具解析走 catalog-aware 路径：自定义角色（agents.json）用档案
+    // 声明的工具白名单；内置角色回落到静态表。
+    let allowed: Vec<String> = crate::prompts::tools_for_role_dyn(&task.assigned_role);
     let mut context = RunContext::new(&system)
         .with_complexity(TaskComplexity::Moderate)
         .with_provider(ProviderChoice::Auto)
