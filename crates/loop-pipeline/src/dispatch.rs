@@ -20,7 +20,7 @@ use crate::prompts::{role_system_prompt as new_role_system_prompt, tool_instruct
 /// The server forwards these to the WebSocket as
 /// `{type:"progress", stage:"task", status, data}` so the frontend can render
 /// a live todo list and per-subtask execution summaries.
-fn emit_task(ctx: &StageContext, status: &str, data: &serde_json::Value) {
+pub(crate) fn emit_task(ctx: &StageContext, status: &str, data: &serde_json::Value) {
     ctx.emit_progress("task", status, Some(data));
 }
 
@@ -32,7 +32,7 @@ pub fn preview_chars(s: &str, max: usize) -> String {
 /// Build the upstream-context block for a task: the outputs of its direct
 /// `depends_on` predecessors (successful only, truncated). Empty when the
 /// task has no completed dependencies — the prompt then contains nothing.
-fn upstream_context(task: &TaskUnit, result_map: &std::collections::HashMap<String, TaskResult>) -> String {
+pub(crate) fn upstream_context(task: &TaskUnit, result_map: &std::collections::HashMap<String, TaskResult>) -> String {
     if task.depends_on.is_empty() {
         return String::new();
     }
@@ -270,6 +270,60 @@ async fn run_critic(
     }
 }
 
+/// 调用 LLM 并解析 JSON 响应；空响应/解析失败自动重试一次。
+///
+/// live：MiniMax 偶发返回空 content（空响应退化），judge 连续收到空
+/// 文本 → parse error → 高质量产物被误判 FAIL → 整轮空转。空响应
+/// 几乎必然在重试后恢复，因此在这里消化而不是把失败传导给任务结果。
+async fn complete_json_with_retry(
+    provider: &dyn miniagent_provider::traits::LlmProvider,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    cancel: CancellationToken,
+) -> Result<serde_json::Value, String> {
+    let mut last_err = String::new();
+    for attempt in 0..2u32 {
+        let request = CompletionRequest {
+            system: system.into(),
+            messages: vec![Message::user(prompt)],
+            tools: vec![],
+            config: InferenceConfig {
+                temperature: Some(0.2),
+                max_tokens: Some(max_tokens),
+                ..Default::default()
+            },
+        };
+        match provider.complete(&request, cancel.clone()).await {
+            Ok(resp) => {
+                let text: String = resp.content.iter()
+                    .filter_map(|b| match b { ContentBlock::Text { text } => Some(text.clone()), _ => None })
+                    .collect::<Vec<_>>().join("");
+                let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned) {
+                    return Ok(v);
+                }
+                // 直接解析失败 → 提取嵌入 JSON 并修复后重试解析
+                let repaired = miniagent_core::json_util::extract_and_repair(&text);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    return Ok(v);
+                }
+                last_err = if text.trim().is_empty() {
+                    "empty response (provider degradation)".into()
+                } else {
+                    format!("unparseable: {}", text.chars().take(120).collect::<String>())
+                };
+                tracing::warn!(attempt, error = %last_err, "JSON call unparseable — retrying once");
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Run the judge: decides if output quality passes.
 async fn run_judge(
     _task_id: &str,
@@ -326,31 +380,22 @@ async fn run_judge(
         },
     };
 
-    match provider.complete(&request, cancel).await {
-        Ok(resp) => {
-            let text: String = resp.content.iter()
-                .filter_map(|b| match b { ContentBlock::Text { text } => Some(text.clone()), _ => None })
-                .collect::<Vec<_>>().join("");
-            let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
-            serde_json::from_str::<serde_json::Value>(&cleaned)
-                .map(|v| JudgeResult {
-                    passed: v["passed"].as_bool().unwrap_or(true),
-                    verdict: v["verdict"].as_str().unwrap_or("Judge evaluation unavailable").to_string(),
-                    improvements: v["improvements"].as_array()
-                        .map(|a| a.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
-                        .unwrap_or_default(),
-                })
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "judge LLM response parse failed — marking task as not passed");
-                    JudgeResult {
-                        passed: false,
-                        verdict: "Judge evaluation failed (parse error) — task requires re-execution".into(),
-                        improvements: vec![],
-                    }
-                })
-        }
+    match complete_json_with_retry(
+        provider,
+        "You are a strict but fair judge. Output ONLY valid JSON.",
+        &prompt,
+        max_tokens,
+        cancel,
+    ).await {
+        Ok(v) => JudgeResult {
+            passed: v["passed"].as_bool().unwrap_or(true),
+            verdict: v["verdict"].as_str().unwrap_or("Judge evaluation unavailable").to_string(),
+            improvements: v["improvements"].as_array()
+                .map(|a| a.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        },
         Err(e) => {
-            tracing::error!(error = %e, "judge LLM call failed — marking task as not passed (do not silently approve)");
+            tracing::error!(error = %e, "judge LLM unavailable after retry — marking task as not passed (do not silently approve)");
             JudgeResult {
                 passed: false,
                 verdict: format!("Judge unavailable: {e} — task requires re-execution"),
@@ -865,7 +910,7 @@ fn extract_final_deliverable(history: &[Message]) -> String {
 }
 
 /// Execute a single task (tactic layer).
-async fn execute_single_task(
+pub(crate) async fn execute_single_task(
     task: TaskUnit,
     agent: std::sync::Arc<Agent>,
     cancel: CancellationToken,

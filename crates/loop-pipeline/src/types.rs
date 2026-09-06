@@ -49,6 +49,11 @@ pub struct EvaluationResult {
     /// when this evaluation decided the pipeline would stop.
     #[serde(default)]
     pub adjudication: Option<serde_json::Value>,
+    /// 评估得出的下一环节路由："explore" / "plan" / "dispatch" / "repair"。
+    /// pipeline 主循环据此跳过不必要的阶段（如仅重试失败任务时不再
+    /// 重新探索/规划）。None = 按默认完整循环执行。
+    #[serde(default)]
+    pub next_action: Option<String>,
 }
 
 /// Repair analysis for a failed task
@@ -60,6 +65,12 @@ pub struct RepairAnalysis {
     pub requires_re_explore: bool,
     pub requires_re_plan: bool,
     pub suggested_new_approach: Option<String>,
+    /// 修正后的重试提示词（repair stage 用它增强任务描述后立即重试）
+    #[serde(default)]
+    pub revised_prompt: Option<String>,
+    /// 本次分析对应的是第几次重试（0 = 首次失败后的分析）
+    #[serde(default)]
+    pub retry_attempt: usize,
 }
 
 /// A critique entry from the 3-party review (worker → critic → judge).
@@ -106,6 +117,12 @@ pub struct PipelineState {
     /// P3 执行中转向：用户在运行期间插入的指令（审计记录）。
     #[serde(default)]
     pub steerings: Vec<String>,
+    /// 每个失败任务已被 repair 重试的次数（task_id → 次数），防止无限重试。
+    #[serde(default)]
+    pub repair_retries: std::collections::HashMap<String, usize>,
+    /// evaluate 决定的下一环节路由；pipeline 主循环在轮首消费。
+    #[serde(default)]
+    pub next_action: Option<String>,
 }
 
 /// A lightweight record of a stage output for history replay.
@@ -136,6 +153,8 @@ impl PipelineState {
             clarifications: Vec::new(),
             clarified: false,
             steerings: Vec::new(),
+            repair_retries: std::collections::HashMap::new(),
+            next_action: None,
         }
     }
 

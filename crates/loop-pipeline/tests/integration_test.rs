@@ -252,6 +252,8 @@ fn mock_state(loop_count: usize, max_loops: usize, completed: bool) -> PipelineS
         clarifications: Vec::new(),
         clarified: false,
         steerings: Vec::new(),
+        repair_retries: Default::default(),
+        next_action: None,
     }
 }
 
@@ -279,6 +281,7 @@ fn make_eval(completed: usize, failed: usize, pending: usize, progress: f64, sho
         should_continue,
         summary: format!("{completed}/{total} done"),
         adjudication: None,
+        next_action: None,
     }
 }
 
@@ -290,6 +293,8 @@ fn make_repair(task_id: &str, re_explore: bool, re_plan: bool) -> RepairAnalysis
         requires_re_explore: re_explore,
         requires_re_plan: re_plan,
         suggested_new_approach: Some(format!("New approach for {task_id}")),
+        revised_prompt: None,
+        retry_attempt: 0,
     }
 }
 
@@ -814,8 +819,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
         unmet_goals: vec!["CRISPR clinical trials research incomplete".into(), "Synthesis report blocked pending all research".into()],
         should_continue: should_continue_1,
         summary: "2/4 tasks done. CRISPR research failed due to API timeout. Synthesis blocked. Continuing to loop 2.".into(),
-        adjudication: None,
-    };
+        adjudication: None,    next_action: None,
+};
     ctx.state.evaluations.push(eval_1);
 
     // ⚡ Self-evaluation check: pipeline assesses progress is insufficient → continue
@@ -829,8 +834,9 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
         suggested_fix: "Retry CRISPR research with narrower search parameters (limit to 2024 trials, use specific gene targets instead of broad search).".into(),
         requires_re_explore: true,   // needs better exploration strategy
         requires_re_plan: false,      // overall plan structure is fine
-        suggested_new_approach: Some("Search for 'FDA-approved CRISPR therapies 2024' and 'CRISPR clinical trials sickle cell' separately instead of one broad query.".into()),
-    });
+        suggested_new_approach: Some("Search for 'FDA-approved CRISPR therapies 2024' and 'CRISPR clinical trials sickle cell' separately instead of one broad query.".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
 
     assert_eq!(ctx.state.repair_analyses.len(), 1);
     eprintln!("   🔧 Repair analysis: API timeout → retry with narrower search parameters");
@@ -952,8 +958,8 @@ fn test_e2e_multi_loop_self_evaluate_and_optimize() {
         unmet_goals: vec![],
         should_continue: !should_stop,
         summary: "All 4 research topics completed. Final synthesis produced.".into(),
-        adjudication: None,
-    };
+        adjudication: None,    next_action: None,
+};
     let should_continue_2 = eval_2.should_continue;
     ctx.state.evaluations.push(eval_2);
     ctx.state.loop_count += 1;
@@ -1063,8 +1069,8 @@ fn test_e2e_no_progress_safety_stops_infinite_loop() {
         overall_progress_pct: 66.0, failed_task_ids: vec!["analyze_data".into()],
         unmet_goals: vec!["Analysis incomplete".into()], should_continue: true,
         adjudication: None,
-        summary: format!("2/3 done after loop {loop_num}. Analysis still failing."),
-    };
+        summary: format!("2/3 done after loop {loop_num}. Analysis still failing."),    next_action: None,
+};
 
     // 4 evaluations all at 66% (loop 0 improved from 0→66, loops 1-3 stagnant)
     for i in 0..4 {
@@ -1075,8 +1081,9 @@ fn test_e2e_no_progress_safety_stops_infinite_loop() {
             root_cause: format!("Failure attempt {i}"),
             suggested_fix: "Retry".into(),
             requires_re_explore: i % 2 == 0, requires_re_plan: false,
-            suggested_new_approach: None,
-        });
+            suggested_new_approach: None,    revised_prompt: None,
+    retry_attempt: 0,
+});
     }
     state.loop_count = 4;
 
@@ -1170,8 +1177,8 @@ fn test_e2e_max_loops_boundary_forced_stop() {
             unmet_goals: vec!["Incomplete".into()],
             should_continue: true,
             adjudication: None,
-            summary: format!("Loop {} eval", loop_i + 1),
-        });
+            summary: format!("Loop {} eval", loop_i + 1),    next_action: None,
+});
 
         state.loop_count = (loop_i + 1) as usize;
     }
@@ -1459,8 +1466,8 @@ fn test_multi_loop_dynamic_plan_evolution() {
         failed_task_ids: vec!["finance".into()],
         unmet_goals: vec!["Finance AI research incomplete".into(), "Synthesis blocked pending all research".into()],
         should_continue, summary: "3/4 tasks. Finance failed (API 503). Need to retry with fallback source.".into(),
-        adjudication: None,
-    });
+        adjudication: None,    next_action: None,
+});
     assert!(should_continue, "Loop 1: should continue with failures");
 
     // Repair: recommends re_plan because finance data source was too brittle
@@ -1470,8 +1477,9 @@ fn test_multi_loop_dynamic_plan_evolution() {
         suggested_fix: "Split finance research into two parallel sub-tasks: (a) market data from alternative source, (b) fintech trends from web_search".into(),
         requires_re_explore: true,
         requires_re_plan: true,   // ← key: plan must restructure
-        suggested_new_approach: Some("Use web_search for fintech news and a different economic indicator API for market data".into()),
-    });
+        suggested_new_approach: Some("Use web_search for fintech news and a different economic indicator API for market data".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
 
     ctx.state.loop_count += 1;
     let has_re_plan = ctx.state.repair_analyses.iter().any(|r| r.requires_re_plan);
@@ -1542,8 +1550,8 @@ fn test_multi_loop_dynamic_plan_evolution() {
         unmet_goals: vec!["Fintech trends incomplete".into()],
         should_continue: true,
         adjudication: None,
-        summary: "finance_market done. finance_trends needs retry with pagination.".into(),
-    });
+        summary: "finance_market done. finance_trends needs retry with pagination.".into(),    next_action: None,
+});
 
     ctx.state.repair_analyses.push(RepairAnalysis {
         failed_task_id: "finance_trends".into(),
@@ -1551,8 +1559,9 @@ fn test_multi_loop_dynamic_plan_evolution() {
         suggested_fix: "Retry with paginated queries (year-by-year search)".into(),
         requires_re_explore: false,
         requires_re_plan: false,
-        suggested_new_approach: Some("Search 'AI fintech 2024' and 'AI fintech 2025' separately".into()),
-    });
+        suggested_new_approach: Some("Search 'AI fintech 2024' and 'AI fintech 2025' separately".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
     ctx.state.loop_count += 1;
     eprintln!("   🔧 Repair: finance_trends search truncated → paginated retry\n");
 
@@ -1573,8 +1582,8 @@ fn test_multi_loop_dynamic_plan_evolution() {
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
         adjudication: None,
-        summary: "All research complete. Final synthesis produced.".into(),
-    });
+        summary: "All research complete. Final synthesis produced.".into(),    next_action: None,
+});
     ctx.state.completed = true;
     ctx.state.final_output = Some("# AI Impact Report\n\nFinal synthesis covering all three industries...".into());
 
@@ -1691,8 +1700,8 @@ fn test_multi_loop_quality_self_assessment() {
                           "No discussion of hybrid cryptographic schemes".into()],
         should_continue: true,  // ← key: continue even though all passed
         summary: "Both tasks technically completed but quality is insufficient. Analysis is superficial — only mentions Shor's algorithm without covering NIST PQC standards, lattice-based cryptography, or real-world timelines.".into(),
-        adjudication: None,
-    };
+        adjudication: None,    next_action: None,
+};
     ctx.state.evaluations.push(eval_1);
     assert!(ctx.state.evaluations[0].should_continue,
         "Loop 1: should continue even with 0 failures — output quality insufficient");
@@ -1704,8 +1713,9 @@ fn test_multi_loop_quality_self_assessment() {
         suggested_fix: "Add sections on: (1) NIST PQC standardization process and selected algorithms, (2) Lattice-based cryptography (Kyber, Dilithium), (3) Hash-based signatures (SPHINCS+), (4) Real-world migration timelines".into(),
         requires_re_explore: true,
         requires_re_plan: false,
-        suggested_new_approach: Some("Search for 'NIST PQC standards 2024', 'post-quantum cryptography migration', 'lattice-based cryptography Kyber Dilithium'".into()),
-    });
+        suggested_new_approach: Some("Search for 'NIST PQC standards 2024', 'post-quantum cryptography migration', 'lattice-based cryptography Kyber Dilithium'".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
     ctx.state.loop_count += 1;
 
     eprintln!("   ⚠ Quality assessment: all tasks pass but quality poor (60%)");
@@ -1753,8 +1763,8 @@ fn test_multi_loop_quality_self_assessment() {
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
         adjudication: None,
-        summary: "Comprehensive analysis complete. All quality criteria satisfied.".into(),
-    });
+        summary: "Comprehensive analysis complete. All quality criteria satisfied.".into(),    next_action: None,
+});
     ctx.state.completed = true;
     ctx.state.loop_count += 1;
 
@@ -1873,8 +1883,8 @@ fn test_multi_loop_multiple_failure_modes() {
         unmet_goals: vec!["All tasks failed due to fetch_data failure (chain reaction)".into()],
         should_continue: true,
         adjudication: None,
-        summary: "0/4 tasks. Root cause: fetch_data failed due to network timeout. Chain reaction to all downstream tasks.".into(),
-    });
+        summary: "0/4 tasks. Root cause: fetch_data failed due to network timeout. Chain reaction to all downstream tasks.".into(),    next_action: None,
+});
 
     // Repair: two different failure mode analyses
     // Failure 1: fetch_data — tool error, retry with timeout increase
@@ -1884,8 +1894,9 @@ fn test_multi_loop_multiple_failure_modes() {
         suggested_fix: "Increase timeout to 60s and add retry logic with exponential backoff".into(),
         requires_re_explore: false,
         requires_re_plan: false,
-        suggested_new_approach: Some("Use `yfinance.download(tickers, timeout=60)` with retry wrapper".into()),
-    });
+        suggested_new_approach: Some("Use `yfinance.download(tickers, timeout=60)` with retry wrapper".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
 
     // Failure 2: compute_ma — logical error, needs corrected column reference in script
     ctx.state.repair_analyses.push(RepairAnalysis {
@@ -1894,8 +1905,9 @@ fn test_multi_loop_multiple_failure_modes() {
         suggested_fix: "1. Fix fetch_data first. 2. Add column name detection: use 'Adj Close' or 'Close' based on available columns.".into(),
         requires_re_explore: false,
         requires_re_plan: true,  // ← key: needs plan adjustment for column fallback logic
-        suggested_new_approach: Some("Add a preliminary 'inspect_data' step that probes the CSV columns before running MA computation".into()),
-    });
+        suggested_new_approach: Some("Add a preliminary 'inspect_data' step that probes the CSV columns before running MA computation".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
 
     ctx.state.loop_count += 1;
 
@@ -1963,8 +1975,8 @@ fn test_multi_loop_multiple_failure_modes() {
         overall_progress_pct: 100.0, failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
         adjudication: None,
-        summary: "All 4 tasks completed successfully after retry with fixed timeout and column inspection step.".into(),
-    });
+        summary: "All 4 tasks completed successfully after retry with fixed timeout and column inspection step.".into(),    next_action: None,
+});
     ctx.state.completed = true;
     ctx.state.loop_count += 1;
     ctx.state.final_output = Some("# Stock Analysis Report\n\n...".into());
@@ -2124,8 +2136,8 @@ fn test_long_running_complex_research_pipeline() {
         unmet_goals: vec!["AI safety research incomplete — missing technical safety frameworks and regulatory comparisons".into()],
         should_continue: true,
         adjudication: None,
-        summary: "4/5 research tasks completed. AI safety failed due to data retrieval issues. Need better search strategy.".into(),
-    });
+        summary: "4/5 research tasks completed. AI safety failed due to data retrieval issues. Need better search strategy.".into(),    next_action: None,
+});
     assert!(ctx.state.evaluations[0].should_continue);
 
     // Repair: AI safety failure — needs re-explore with better strategy
@@ -2135,8 +2147,9 @@ fn test_long_running_complex_research_pipeline() {
         suggested_fix: "Decompose AI safety into (1) technical alignment research, (2) regulatory frameworks by jurisdiction, (3) industry best practices and incidents. Search each separately.".into(),
         requires_re_explore: true,
         requires_re_plan: true,
-        suggested_new_approach: Some("Use 3 parallel sub-queries: 'AI alignment technical research 2024', 'EU AI Act implementation 2024-2025', 'AI safety incidents industry 2024'".into()),
-    };
+        suggested_new_approach: Some("Use 3 parallel sub-queries: 'AI alignment technical research 2024', 'EU AI Act implementation 2024-2025', 'AI safety incidents industry 2024'".into()),    revised_prompt: None,
+    retry_attempt: 0,
+};
     ctx.state.repair_analyses.push(repair_1);
     ctx.state.loop_count += 1;
 
@@ -2239,8 +2252,8 @@ fn test_long_running_complex_research_pipeline() {
         unmet_goals: vec!["Report could benefit from more quantitative benchmark comparisons across all 5 areas".into()],
         should_continue: true, // quality-based continue
         summary: "All research complete. Report is comprehensive. Could add cross-area benchmark comparison table.".into(),
-        adjudication: None,
-    });
+        adjudication: None,    next_action: None,
+});
     assert!(ctx.state.evaluations[1].should_continue,
         "Evaluator decides to continue for quality improvement despite no failures");
     ctx.state.loop_count += 1;
@@ -2272,8 +2285,8 @@ fn test_long_running_complex_research_pipeline() {
         failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
         adjudication: None,
-        summary: "Benchmark comparison added. Report is comprehensive with quantitative comparisons across all 5 areas.".into(),
-    });
+        summary: "Benchmark comparison added. Report is comprehensive with quantitative comparisons across all 5 areas.".into(),    next_action: None,
+});
     ctx.state.completed = true;
     ctx.state.loop_count += 1;
     ctx.state.final_output = Some("# Comparative Analysis: 5 Trending AI Research Areas (2024-2025)\n\n## Complete Report with Benchmark Comparisons\n\n...".into());
@@ -2417,15 +2430,16 @@ fn test_ultra_long_running_cumulative_repairs() {
         unmet_goals: vec!["Dataset B collection failed".into(), "Cleaning blocked".into()],
         should_continue: true,
         adjudication: None,
-        summary: "1/6 tasks. Dataset B API rate limited. Need retry with backoff.".into(),
-    });
+        summary: "1/6 tasks. Dataset B API rate limited. Need retry with backoff.".into(),    next_action: None,
+});
     ctx.state.repair_analyses.push(RepairAnalysis {
         failed_task_id: "task_2".into(),
         root_cause: "tool_error: API rate limit (429)".into(),
         suggested_fix: "Retry with exponential backoff (start 5s delay, double each retry, max 3 retries)".into(),
         requires_re_explore: false, requires_re_plan: false,
-        suggested_new_approach: Some("Use `time.sleep(5)` before API call, max 3 retries".into()),
-    });
+        suggested_new_approach: Some("Use `time.sleep(5)` before API call, max 3 retries".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
     ctx.state.loop_count += 1;
     eprintln!("   Loop 1: task_1 ✅, task_2 ❌ (rate limit), task_3 ⏭️ (blocked)\n");
 
@@ -2458,15 +2472,16 @@ fn test_ultra_long_running_cumulative_repairs() {
         unmet_goals: vec!["Predictive model failed convergence".into()],
         should_continue: true,
         adjudication: None,
-        summary: "3/4 loop 2 tasks done. ARIMA model failed. Need alternative approach.".into(),
-    });
+        summary: "3/4 loop 2 tasks done. ARIMA model failed. Need alternative approach.".into(),    next_action: None,
+});
     ctx.state.repair_analyses.push(RepairAnalysis {
         failed_task_id: "task_5".into(),
         root_cause: "model_error: ARIMA model not suitable for climate data with non-stationary variance and seasonal cycles".into(),
         suggested_fix: "Replace ARIMA with Prophet (handles seasonality + trend changes) or use XGBoost with engineered features (lag values, rolling statistics)".into(),
         requires_re_explore: false, requires_re_plan: true,
-        suggested_new_approach: Some("Use Facebook Prophet for trend forecasting + XGBoost for anomaly detection as ensemble".into()),
-    });
+        suggested_new_approach: Some("Use Facebook Prophet for trend forecasting + XGBoost for anomaly detection as ensemble".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
     ctx.state.loop_count += 1;
     eprintln!("   Loop 2: tasks 2-4 ✅, task_5 ❌ (model convergence)\n");
 
@@ -2497,15 +2512,16 @@ fn test_ultra_long_running_cumulative_repairs() {
         unmet_goals: vec!["Trend validation failed — bias in normalization".into()],
         should_continue: true,
         adjudication: None,
-        summary: "Model works but validation revealed normalization bias. Need to re-examine preprocessing.".into(),
-    });
+        summary: "Model works but validation revealed normalization bias. Need to re-examine preprocessing.".into(),    next_action: None,
+});
     ctx.state.repair_analyses.push(RepairAnalysis {
         failed_task_id: "task_4_validate".into(),
         root_cause: "ambiguity_error: Dataset B normalization introduced systematic bias (+0.11°C offset vs IPCC). Normalization parameters need adjustment.".into(),
         suggested_fix: "Re-normalize dataset B using IPCC reference period (1850-1900) instead of z-score normalization. Recompute trends after correction.".into(),
         requires_re_explore: true, requires_re_plan: true,
-        suggested_new_approach: Some("Research IPCC reference period normalization methodology. Apply anomaly-based normalization (subtract baseline mean).".into()),
-    });
+        suggested_new_approach: Some("Research IPCC reference period normalization methodology. Apply anomaly-based normalization (subtract baseline mean).".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
     ctx.state.loop_count += 1;
     eprintln!("   Loop 3: model ✅, validation ❌ (bias), report ⏭️ (blocked)\n");
 
@@ -2566,8 +2582,8 @@ fn test_ultra_long_running_cumulative_repairs() {
         overall_progress_pct: 100.0, failed_task_ids: vec![], unmet_goals: vec![],
         should_continue: false,
         adjudication: None,
-        summary: "Pipeline complete. Normalization fixed, validation passed, comprehensive report generated.".into(),
-    });
+        summary: "Pipeline complete. Normalization fixed, validation passed, comprehensive report generated.".into(),    next_action: None,
+});
     ctx.state.completed = true;
     ctx.state.loop_count += 1;
     ctx.state.final_output = Some(report.clone());
@@ -2695,16 +2711,17 @@ fn test_5_loop_no_progress_safety_stop() {
             unmet_goals: vec!["Problem 1 unsolved: ∫e^(-x²)dx has no elementary closed form".into()],
             should_continue: true,
             adjudication: None,
-            summary: format!("{}/3 done. Problem 1 persistent: Gaussian integral needs special function or numerical method.", 2),
-        });
+            summary: format!("{}/3 done. Problem 1 persistent: Gaussian integral needs special function or numerical method.", 2),    next_action: None,
+});
 
         ctx.state.repair_analyses.push(RepairAnalysis {
             failed_task_id: "problem_1".into(),
             root_cause: "Gaussian integral ∫e^(-x²)dx has no closed-form elementary antiderivative. Sympy returns erf(x).".into(),
             suggested_fix: "Accept the error function solution as valid, or switch to numerical integration with scipy.integrate.quad".into(),
             requires_re_explore: false, requires_re_plan: false,
-            suggested_new_approach: Some("Use numerical integration: scipy.integrate.quad(lambda x: exp(-x**2), -inf, inf) returns sqrt(π)".into()),
-        });
+            suggested_new_approach: Some("Use numerical integration: scipy.integrate.quad(lambda x: exp(-x**2), -inf, inf) returns sqrt(π)".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
         ctx.state.loop_count += 1;
     }
 
@@ -2727,16 +2744,17 @@ fn test_5_loop_no_progress_safety_stop() {
             unmet_goals: vec!["Problem 1 still unsolved".into()],
             should_continue: true,
             adjudication: None,
-            summary: "Still 2/3 done. Problem 1 persistent.".into(),
-        });
+            summary: "Still 2/3 done. Problem 1 persistent.".into(),    next_action: None,
+});
 
         ctx.state.repair_analyses.push(RepairAnalysis {
             failed_task_id: "problem_1".into(),
             root_cause: "Same Gaussian integral — no elementary solution.".into(),
             suggested_fix: "Accept erf(x) solution.".into(),
             requires_re_explore: false, requires_re_plan: false,
-            suggested_new_approach: None,
-        });
+            suggested_new_approach: None,    revised_prompt: None,
+    retry_attempt: 0,
+});
         ctx.state.loop_count += 1;
     }
 
@@ -2853,8 +2871,8 @@ fn test_12_loop_software_refactoring_pipeline() {
             overall_progress_pct: progress.min(100.0), failed_task_ids: vec![],
             unmet_goals: vec!["Core extraction in progress".into()],
             should_continue: true, summary: format!("Phase 1 loop {loop_i}: {completed}/3 tasks this round"),
-            adjudication: None,
-        });
+            adjudication: None,    next_action: None,
+});
 
         if r1 { completed_set.insert("auth".into()); }
         if r2 { completed_set.insert("data_pipeline".into()); }
@@ -2868,8 +2886,9 @@ fn test_12_loop_software_refactoring_pipeline() {
                 root_cause: "dependency_error: tight coupling with auth module's user model".into(),
                 suggested_fix: "Extract shared user model interface first; use dependency injection to break circular dep".into(),
                 requires_re_explore: false, requires_re_plan: true,
-                suggested_new_approach: Some("Create shared/models.py with abstract interfaces; both auth and data import from shared".into()),
-            });
+                suggested_new_approach: Some("Create shared/models.py with abstract interfaces; both auth and data import from shared".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
         }
         if !r3 {
             ctx.state.repair_analyses.push(RepairAnalysis {
@@ -2877,8 +2896,9 @@ fn test_12_loop_software_refactoring_pipeline() {
                 root_cause: "dependency_error: gateway routes depend on auth→data interface that changed".into(),
                 suggested_fix: "Update API route definitions after auth+data interfaces stabilize; add integration tests".into(),
                 requires_re_explore: false, requires_re_plan: true,
-                suggested_new_approach: Some("Implement adapter pattern: gateway → adapter → auth/data; interface changes only affect adapters".into()),
-            });
+                suggested_new_approach: Some("Implement adapter pattern: gateway → adapter → auth/data; interface changes only affect adapters".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
         }
         eprintln!("   Phase 1 loop {loop_i}: completed={completed}, failed={failed}, cumulative={}/9\n", completed_set.len());
     }
@@ -2926,8 +2946,8 @@ fn test_12_loop_software_refactoring_pipeline() {
             overall_progress_pct: progress, failed_task_ids: vec![],
             unmet_goals: vec!["Phase 2 in progress".into()],
             should_continue: true, summary: format!("Phase 2 loop {}: {}/9 cumulative", loop_i, completed_set.len()),
-            adjudication: None,
-        });
+            adjudication: None,    next_action: None,
+});
         ctx.state.loop_count += 1;
 
         if !r2 {
@@ -2936,8 +2956,9 @@ fn test_12_loop_software_refactoring_pipeline() {
                 root_cause: "resource_error: legacy data has 1,247 orphaned FK references".into(),
                 suggested_fix: "Run pre-migration data audit script to identify and fix orphaned records; add ON DELETE SET NULL for edge cases".into(),
                 requires_re_explore: false, requires_re_plan: false,
-                suggested_new_approach: Some("Write SQL: find orphaned rows first, assign to 'legacy_user' before migration".into()),
-            });
+                suggested_new_approach: Some("Write SQL: find orphaned rows first, assign to 'legacy_user' before migration".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
         }
         eprintln!("   Phase 2 loop {loop_i}: cumulative={}/9\n", completed_set.len());
     }
@@ -2993,8 +3014,8 @@ fn test_12_loop_software_refactoring_pipeline() {
             tasks_pending: 0, overall_progress_pct: progress, failed_task_ids: vec![],
             unmet_goals: vec![], should_continue: !r4,
             summary: format!("Phase 3 loop {loop_i}: {}/9 cumulative", completed_set.len()),
-            adjudication: None,
-        });
+            adjudication: None,    next_action: None,
+});
 
         if !r3 {
             ctx.state.repair_analyses.push(RepairAnalysis {
@@ -3002,8 +3023,9 @@ fn test_12_loop_software_refactoring_pipeline() {
                 root_cause: "resource_error: K8s sidecar injection configuration mismatch across namespaces".into(),
                 suggested_fix: "Standardize service mesh annotations; use Helm templating with consistent namespace vars".into(),
                 requires_re_explore: false, requires_re_plan: false,
-                suggested_new_approach: None,
-            });
+                suggested_new_approach: None,    revised_prompt: None,
+    retry_attempt: 0,
+});
         }
         if !r4 {
             ctx.state.repair_analyses.push(RepairAnalysis {
@@ -3011,8 +3033,9 @@ fn test_12_loop_software_refactoring_pipeline() {
                 root_cause: "resource_error: DB connection pool default size (10) too small for 12 concurrent services".into(),
                 suggested_fix: "Increase connection pool to 50; add connection pooling metrics to monitor contention".into(),
                 requires_re_explore: false, requires_re_plan: false,
-                suggested_new_approach: Some("Use PgBouncer for connection pooling instead of increasing app pool size".into()),
-            });
+                suggested_new_approach: Some("Use PgBouncer for connection pooling instead of increasing app pool size".into()),    revised_prompt: None,
+    retry_attempt: 0,
+});
         }
         ctx.state.loop_count += 1;
         eprintln!("   Phase 3 loop {loop_i}: cumulative={}/9\n", completed_set.len());

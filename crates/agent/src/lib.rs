@@ -321,9 +321,12 @@ impl Agent {
         let run_id = RunId::new();
         let mut last_delta = None;
         let mut consecutive_errors: usize = 0;
+        let mut pairing_retries: u32 = 0;
 
-        // transcript 修复：在循环开始前修补孤立 tool_use（防 API 校验错误）
-        let fixed = miniagent_core::message::validate_transcript(history);
+        // transcript 修复：循环开始前做双向配对修复（孤立 tool_use 补合成
+        // 结果且紧邻插入；孤立/重复 tool result 丢弃——后者是 MiniMax 400
+        // "tool call result does not follow tool call (2013)" 的直接诱因）
+        let fixed = miniagent_core::message::repair_tool_pairing(history);
         if fixed > 0 {
             tracing::info!(fixed, "transcript repaired at run_with_loop start");
         }
@@ -364,6 +367,23 @@ impl Agent {
                                     "transient LLM error, retrying with backoff"
                                 );
                                 tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            // tool 配对违例（MiniMax 2013 / OpenAI 严格校验）：
+                            // 机械修复 history 后立即重试，而非让整个子任务
+                            // 失败。live: b3337de9 任务 6 个子任务因此全灭。
+                            let is_pairing = err_str.contains("does not follow tool call")
+                                || err_str.contains("(2013)")
+                                || (err_str.contains("400") && err_str.contains("tool"));
+                            if is_pairing && pairing_retries < 2 {
+                                pairing_retries += 1;
+                                let repaired = miniagent_core::message::repair_tool_pairing(history);
+                                tracing::warn!(
+                                    attempt = pairing_retries,
+                                    repaired = repaired,
+                                    error = %err_str,
+                                    "tool-pairing provider error — repaired transcript, retrying"
+                                );
                                 continue;
                             }
                             // 非瞬时错误或重试耗尽 → 返回错误
@@ -521,10 +541,10 @@ impl Agent {
                             cancel.child_token(),
                         )
                         .await;
-                        // P-修复：trim 后立即修补孤立 tool_use/tool_result
-                        // ——压缩窗口可能切在工具序列中间（live: MiniMax
-                        // 400 "tool call result does not follow tool call"）
-                        miniagent_core::message::validate_transcript(history);
+                        // P-修复：trim 后做双向配对修复——压缩窗口可能切在
+                        // 工具序列中间（live: MiniMax 400 "tool call result
+                        // does not follow tool call"）
+                        miniagent_core::message::repair_tool_pairing(history);
 
                         // Break on too many consecutive all-error rounds
                         if consecutive_errors >= self.max_consecutive_errors() {
@@ -567,6 +587,31 @@ impl Agent {
 
             // 收集已完成的子 agent 结果（AgentTool 后台异步模式）
             self.collect_sub_agent_results(history);
+        }
+
+        // 迭代预算耗尽且最后没有可交付文本 → 强制一次"只写最终答案"调用。
+        // live（b3337de9 loop4/5）：worker 在迭代上限内完成了调研但没来得及
+        // 写最终交付物，dispatch 的 extract_final_deliverable 只拿到过程
+        // 叙述 → "Insufficient output (tool calls only)" 整任务失败。
+        let has_final_text = history.iter().rev().take(3).any(|m| {
+            matches!(m.role, miniagent_core::message::MessageRole::Assistant) && !m.text_content().trim().is_empty()
+        });
+        if !has_final_text {
+            tracing::warn!("tool-iteration budget exhausted without a final answer — forcing one text-only completion call");
+            history.push(Message::user(
+                "You have reached the tool-iteration limit. Based on all work completed so far, \
+                 write your final deliverable NOW as plain text. Do NOT call any more tools.",
+            ));
+            match self.run(history, context, cancel.child_token()).await {
+                Ok(delta) => {
+                    total_usage.input_tokens += delta.usage.input_tokens;
+                    total_usage.output_tokens += delta.usage.output_tokens;
+                    last_delta = Some(delta);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "forced final-answer call failed — returning what we have");
+                }
+            }
         }
 
         // Episode-end consolidation

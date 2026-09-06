@@ -482,6 +482,32 @@ impl MiniMaxClient {
 
     // ── Parse responses ──────────────────────────────────────
 
+    /// MiniMax M3 偶发把推理标签（`<mm:think>…</mm:think>`）内联进
+    /// content 文本（而非 reasoning 字段）。这些标签进入 transcript 后会
+    /// 污染下游 JSON 解析（live: b3337de9 任务裁决 judge 收到
+    /// "</mm:think>{…}" 开头的输出 → parse error → 子任务被判失败）。
+    fn strip_inline_think_tags(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            match rest.find("<mm:think>") {
+                Some(start) => {
+                    out.push_str(&rest[..start]);
+                    match rest[start..].find("</mm:think>") {
+                        Some(len) => {
+                            rest = &rest[start + len + "</mm:think>".len()..];
+                        }
+                        // 未闭合：其余内容整体丢弃（推理泄漏，非交付内容）
+                        None => { rest = ""; break; }
+                    }
+                }
+                None => { out.push_str(rest); break; }
+            }
+        }
+        // 残留的孤立标签（跨 chunk 边界或模型漏写配对）
+        out.replace("</mm:think>", "").replace("<mm:think>", "")
+    }
+
     fn parse_oai_response(&self, response: OaiResponse) -> CompletionResponse {
         let choice = response.choices.into_iter().next();
         let mut content = Vec::new();
@@ -493,8 +519,9 @@ impl MiniMaxClient {
                 }
             }
             if let Some(ref text) = choice.message.content {
-                if !text.is_empty() {
-                    content.push(ContentBlock::Text { text: text.clone() });
+                let stripped = Self::strip_inline_think_tags(text);
+                if !stripped.is_empty() {
+                    content.push(ContentBlock::Text { text: stripped });
                 }
             }
             for tc in &choice.message.tool_calls {
@@ -526,7 +553,10 @@ impl MiniMaxClient {
             match block.block_type.as_str() {
                 "text" => {
                     if let Some(text) = block.text.filter(|t| !t.is_empty()) {
-                        content.push(ContentBlock::Text { text });
+                        let stripped = Self::strip_inline_think_tags(&text);
+                        if !stripped.is_empty() {
+                            content.push(ContentBlock::Text { text: stripped });
+                        }
                     }
                 }
                 "tool_use" => {
@@ -817,7 +847,10 @@ impl LlmProvider for MiniMaxClient {
                                 })).await;
                             }
                             if let Some(ref text) = delta.content.filter(|t| !t.is_empty()) {
-                                let _ = tx.send(Ok(StreamChunk::TextDelta { text: text.clone() })).await;
+                                let stripped = MiniMaxClient::strip_inline_think_tags(text);
+                                if !stripped.is_empty() {
+                                    let _ = tx.send(Ok(StreamChunk::TextDelta { text: stripped })).await;
+                                }
                             }
                             for tc in &delta.tool_calls {
                                 let idx = tc.index;

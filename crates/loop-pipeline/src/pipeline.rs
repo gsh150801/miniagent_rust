@@ -284,6 +284,19 @@ impl LoopPipeline {
             let loop_num = ctx.state.loop_count + 1;
             tracing::info!("Loop {}/{}", loop_num, ctx.state.max_loops);
 
+            // ── 3️⃣ 消费 evaluate 的下一环节路由 ────────────────────
+            // evaluate 决定下一步走哪个阶段；主循环据此跳过不必要的阶段
+            //（如仅重试失败任务时不再重新探索/规划——已成功的任务直接
+            // 保留结果，避免每轮全量重跑烧 token、放大失败暴露面）。
+            let next_action = ctx.state.next_action.take();
+            let action = next_action.as_deref().unwrap_or("");
+            let run_explore = !matches!(action, "plan" | "dispatch" | "repair");
+            let run_plan = !matches!(action, "dispatch" | "repair");
+            let run_dispatch = action != "repair";
+            if !action.is_empty() {
+                tracing::info!(routed = action, "evaluate routed pipeline to a specific stage");
+            }
+
             // ── P3 执行中转向：阶段边界拉取用户插入的指令 ──
             if let Some(hook) = ctx.steer_hook.as_ref() {
                 let steers = hook();
@@ -305,6 +318,9 @@ impl LoopPipeline {
             }
 
             // Phase 1: Explore (isolated — fallback to default exploration)
+            // 被 evaluate 路由跳过（next_action ∈ plan/dispatch/repair）时
+            // 保留上一轮的探索结论与任务列表，直接进入目标阶段。
+            if run_explore {
             tracing::info!("Explore phase");
             emit("explore", "running", None);
             let output = Self::execute_isolated(&explore, &ctx, cancel.child_token()).await;
@@ -317,11 +333,12 @@ impl LoopPipeline {
             ctx.collect_messages(output.new_messages);
             emit("explore", "completed", Some(&explore_summary));
             tracing::info!("Explore done: {}", output.summary);
+            }
 
             // Phase 1b: Clarify (once per run; optional — asks the user when
             // the task has material ambiguity and an interactive channel is
             // wired; skipped silently otherwise).
-            if !ctx.state.clarified {
+            if !ctx.state.clarified && run_explore {
                 tracing::info!("Clarify phase");
                 emit("clarify", "running", None);
                 let output = Self::execute_isolated(&clarify, &ctx, cancel.child_token()).await;
@@ -336,6 +353,7 @@ impl LoopPipeline {
             }
 
             // Phase 2: PLAN (isolated — fallback to single-task plan downstream)
+            if run_plan {
             tracing::info!("Plan phase");
             emit("plan", "running", None);
             let output = Self::execute_isolated(&plan, &ctx, cancel.child_token()).await;
@@ -363,8 +381,11 @@ impl LoopPipeline {
             ctx.collect_messages(output.new_messages);
             emit("plan", "completed", Some(&plan_summary));
             tracing::info!("Plan done: {}", output.summary);
+            }
 
             // Phase 3: Dispatch (critical — load-bearing, retry then abort)
+            // 路由为 repair 时跳过（repair 阶段自己执行修正后的重试）。
+            if run_dispatch {
             tracing::info!("Dispatch phase");
             emit("dispatch", "running", None);
             let output = match Self::execute_critical(&dispatch, &ctx, cancel.child_token()).await {
@@ -383,6 +404,7 @@ impl LoopPipeline {
             ctx.collect_messages(output.new_messages);
             emit("dispatch", "completed", Some(&dispatch_summary));
             tracing::info!("Dispatch done: {}", output.summary);
+            }
 
             // Phase 4: Repair (isolated — advisory, pipeline continues without it)
             let failed_count = ctx.state.task_results.iter().filter(|r| !r.success).count();

@@ -111,7 +111,12 @@ impl PipelineStage for EvaluateStage {
    - Continue if: the loop count is low and progress is meaningful
    - Stop if: ALL tasks completed successfully AND quality is acceptable
    - Stop if: no progress over multiple loops (stuck)
-5. If continuing, specify what the next loop should focus on concretely
+5. Choose `next_action` — the single stage the pipeline should run next:
+   - "complete": goal fully met and outputs verified — finish the pipeline
+   - "repair": specific subtasks failed — analyze each failure, adjust its prompt, and retry it directly (no re-planning; succeeded tasks are kept)
+   - "dispatch": the task list is fine but some tasks need plain re-execution (e.g. outputs rejected on quality, transient provider errors)
+   - "plan": tasks keep failing for structural reasons or the goal evolved — re-decompose the work
+   - "explore": the understanding of the goal itself is wrong or incomplete — re-explore first
 
 ## Output Format (valid JSON only)
 {{
@@ -122,6 +127,7 @@ impl PipelineStage for EvaluateStage {
   "failed_task_ids": [{failed_ids_json}],
   "unmet_goals": ["Unmet goal 1", "Unmet goal 2"],
   "should_continue": true|false,
+  "next_action": "explore"|"plan"|"dispatch"|"repair"|"complete",
   "summary": "Overall assessment of what was accomplished and what remains"
 }}"#,
             goal = plan.overall_goal,
@@ -158,7 +164,12 @@ impl PipelineStage for EvaluateStage {
 
         let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
 
-        let mut evaluation: EvaluationResult = match serde_json::from_str(&cleaned) {
+        let parsed: Result<EvaluationResult, serde_json::Error> = serde_json::from_str(&cleaned)
+            .or_else(|_| serde_json::from_str::<EvaluationResult>(
+                &miniagent_core::json_util::extract_and_repair(&text),
+            ));
+
+        let mut evaluation: EvaluationResult = match parsed {
             Ok(e) => e,
             Err(e) => {
                 let preview: String = cleaned.chars().take(200).collect();
@@ -178,6 +189,7 @@ impl PipelineStage for EvaluateStage {
                     should_continue: failed > 0 || loop_count == 0,
                     summary: format!("{}/{} tasks completed. {} failed.", completed, total, failed),
                     adjudication: None,
+                    next_action: None,
                 }
             }
         };
@@ -297,9 +309,44 @@ impl PipelineStage for EvaluateStage {
         }
         // ──────────────────────────────────────────────────────────
 
+        // ── 3️⃣ 下一环节路由 ─────────────────────────────────────
+        // evaluate 评估完任务进度后，除"提交结果（全部完成且经核验）"外，
+        // 还要决定下一步走哪个阶段：repair（修正提示词后直接重试失败
+        // 任务）/ dispatch（原任务列表直接重执行）/ plan（重新分解）/
+        // explore（重新探索）。pipeline 主循环据此跳过不必要的阶段。
+        let next_action = if !evaluation.should_continue {
+            "__complete__".to_string()
+        } else {
+            let chosen = evaluation.next_action.clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    // LLM 未给出路由时的兜底：有失败 → repair；否则 plan
+                    if evaluation.failed_task_ids.is_empty() { "plan".into() } else { "repair".into() }
+                });
+            const VALID: [&str; 4] = ["explore", "plan", "dispatch", "repair"];
+            if VALID.contains(&chosen.as_str()) {
+                // 机械纠偏：有失败任务时至少走 repair（重试闭环比全量
+                // 重跑便宜），除非 LLM 明确认为需要换思路（plan/explore）
+                if !evaluation.failed_task_ids.is_empty() && chosen == "dispatch" && evaluation.tasks_completed == 0 {
+                    "repair".into()
+                } else {
+                    chosen
+                }
+            } else if evaluation.failed_task_ids.is_empty() {
+                "plan".into()
+            } else {
+                "repair".into()
+            }
+        };
+
         let mut state = ctx.state.clone();
         state.evaluations.push(evaluation.clone());
         state.completed = !evaluation.should_continue;
+        state.next_action = if evaluation.should_continue {
+            Some(next_action.clone())
+        } else {
+            None
+        };
 
         if !evaluation.should_continue {
             state.final_output = Some(evaluation.summary.clone());
@@ -313,55 +360,16 @@ impl PipelineStage for EvaluateStage {
             }
         }
 
-        let mut msg = StageMessage {
-            from_stage: "evaluate".into(),
-            to_stage: if evaluation.should_continue { "explore".into() } else { "__complete__".into() },
-            content: serde_json::to_string(&evaluation).unwrap_or_default(),
-            task_id: None,
-        };
-
-        // If there are failed tasks and we're continuing, route to repair first
-        if evaluation.should_continue && !evaluation.failed_task_ids.is_empty() {
-            msg.to_stage = "repair".into();
-
-            // Also send a message to explore for re-exploration if needed
-            let explore_msg = StageMessage {
-                from_stage: "evaluate".into(),
-                to_stage: "explore".into(),
-                content: format!(
-                    "Unmet goals: {}. Failed tasks: {}. Repair analysis will follow.",
-                    evaluation.unmet_goals.join("; "),
-                    evaluation.failed_task_ids.join(", "),
-                ),
-                task_id: None,
-            };
-            state.loop_count += 1;
-            let mut new_msgs = vec![msg, explore_msg];
-
-            // Send to plan stage too if there are unmet goals
-            if !evaluation.unmet_goals.is_empty() {
-                new_msgs.push(StageMessage {
-                    from_stage: "evaluate".into(),
-                    to_stage: "plan".into(),
-                    content: format!("Re-plan needed for: {}", evaluation.unmet_goals.join("; ")),
-                    task_id: None,
-                });
-            }
-
-            let next_loop = state.loop_count;
-            return Ok(StageOutput {
-                updated_state: state,
-                new_messages: new_msgs,
-                summary: format!(
-                    "Evaluation: {}/{} done. {} failed. Continuing loop {}.",
-                    completed, total, failed, next_loop,
-                ),
-            });
-        }
-
         if evaluation.should_continue {
             state.loop_count += 1;
         }
+
+        let msg = StageMessage {
+            from_stage: "evaluate".into(),
+            to_stage: next_action.clone(),
+            content: serde_json::to_string(&evaluation).unwrap_or_default(),
+            task_id: None,
+        };
 
         let loop_count = state.loop_count;
         let max_loops = state.max_loops;
@@ -372,7 +380,7 @@ impl PipelineStage for EvaluateStage {
                 "Evaluation: {:.0}% complete. {} failed. {}",
                 evaluation.overall_progress_pct, evaluation.tasks_failed,
                 if evaluation.should_continue {
-                    format!("Continuing loop {}/{}", loop_count, max_loops)
+                    format!("Next: {} (loop {}/{})", next_action, loop_count, max_loops)
                 } else {
                     "Pipeline complete!".into()
                 },

@@ -86,6 +86,94 @@ impl Message {
     }
 }
 
+/// 从 Tool 消息文本中提取 tool_call_id（"[toolu_vrtx_{id}] ..." 格式）。
+fn extract_tool_id(msg: &Message) -> Option<String> {
+    msg.text_content()
+        .strip_prefix("[toolu_vrtx_")
+        .and_then(|s| s.split(']').next())
+        .map(|s| s.to_string())
+}
+
+/// 修复 tool 配对违例——MiniMax 2013 "tool call result does not follow
+/// tool call" 的机械修复，双向都管：
+///
+/// 1. **孤立/重复 Tool 消息 → 丢弃**。Tool 消息的 id 未被此前 assistant
+///    请求过、或已被回答过（重复结果），会被 provider 拒绝。这是
+///    validate_transcript 没有覆盖的反方向（live：b3337de9 任务 6 个
+///    子任务死于此错误）。
+/// 2. **未回答的 tool_use → 在其 assistant 消息后紧邻插入合成结果**。
+///    validate_transcript 把合成结果追加到 history 末尾——若孤立
+///    tool_use 在中间，合成结果落在后续消息之后，反而制造新的配对
+///    违例。必须紧邻插入。
+///
+/// 返回修复的消息数。幂等：已配对的序列原样通过。
+pub fn repair_tool_pairing(history: &mut Vec<Message>) -> usize {
+    let mut fixed = 0usize;
+
+    // Pass 1: 丢弃孤立/重复 Tool 消息（按顺序扫描，维护未答 id 集合）
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cleaned: Vec<Message> = Vec::with_capacity(history.len());
+    for msg in history.drain(..) {
+        match msg.role {
+            MessageRole::Tool => {
+                match extract_tool_id(&msg) {
+                    Some(id) if pending.remove(&id) => cleaned.push(msg),
+                    // 孤立（无对应请求）、重复（已回答）、无法识别 id → 丢弃
+                    _ => { fixed += 1; }
+                }
+            }
+            MessageRole::Assistant => {
+                for b in &msg.content {
+                    if let ContentBlock::ToolUse { id, .. } = b {
+                        pending.insert(format!("{}", id.0));
+                    }
+                }
+                cleaned.push(msg);
+            }
+            _ => cleaned.push(msg),
+        }
+    }
+
+    // Pass 2: 为未回答的 tool_use 紧邻插入合成结果（每缺失 id 一条）
+    let mut out: Vec<Message> = Vec::with_capacity(cleaned.len());
+    let mut i = 0usize;
+    while i < cleaned.len() {
+        let msg = cleaned[i].clone();
+        let is_assistant = matches!(msg.role, MessageRole::Assistant);
+        out.push(msg);
+        if is_assistant {
+            let requested: Vec<String> = cleaned[i].content.iter().filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(format!("{}", id.0)),
+                _ => None,
+            }).collect();
+            if !requested.is_empty() {
+                // 收集紧随其后的连续 Tool 消息已回答的 id
+                let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut j = i + 1;
+                while j < cleaned.len() && matches!(cleaned[j].role, MessageRole::Tool) {
+                    if let Some(id) = extract_tool_id(&cleaned[j]) {
+                        answered.insert(id);
+                    }
+                    j += 1;
+                }
+                for id in &requested {
+                    if !answered.contains(id) {
+                        out.push(Message::tool(
+                            id,
+                            "[ERROR: tool execution was interrupted — this result is synthetic]",
+                        ));
+                        fixed += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    *history = out;
+    fixed
+}
+
 /// 修复 history 中的孤立 tool_use（参考 cc-python-claude session/recovery.py validate_transcript）。
 ///
 /// 当 Agent 在 tool_use 后、tool 执行前崩溃/中断时，history 末尾的 assistant 消息
