@@ -696,8 +696,23 @@ impl Agent {
         // notes（状态记忆）每轮由 run() 注入 system prompt。
         let notes_mode = self.config.as_ref().map(|c| c.agent_notes_mode).unwrap_or(false);
         if notes_mode && !context.working_dir.is_empty() {
-            let notes_block =
+            let mut notes_block =
                 miniagent_tool::tools::write_note::render_notes_block(&context.working_dir);
+            // ── 机械 checkpoint 兜底（Codex auto_compact_fallback 思路）──
+            // 模型没写过任何 note 时，从被裁剪的历史里机械提取状态
+            //（原始任务→goal、最后 assistant 陈述→progress、写过的
+            // 文件→artifacts），保证 notes 层必然非空——否则重启后的
+            // 新窗口除最近几条外对任务一无所知。
+            if notes_block.is_empty() && history.len() > 2 {
+                let checkpoint = Self::mechanical_checkpoint(history);
+                if checkpoint.as_object().is_some_and(|m| !m.is_empty()) {
+                    Self::seed_notes_from_checkpoint(&context.working_dir, &checkpoint);
+                    notes_block = miniagent_tool::tools::write_note::render_notes_block(
+                        &context.working_dir,
+                    );
+                    tracing::info!("mechanical checkpoint seeded into notes (model wrote none)");
+                }
+            }
             if !notes_block.is_empty() {
                 let keep_recent = self.keep_recent_msgs().min(history.len().saturating_sub(1));
                 let first = history.first().cloned();
@@ -966,6 +981,77 @@ impl Agent {
     /// 对齐 Codex 的 history 层：详情只移出窗口、不销毁。每条记录带
     /// 全局递增 item_id（跨多次 trim 连续），供 search_history /
     /// read_history_item 工具按需查回。返回本次写入的 item_id 列表。
+    /// 从将被裁剪的历史中机械提取任务状态 checkpoint（无 LLM 参与）。
+    /// 提取规则全部是结构性信号，不含任何主题硬编码：
+    /// - goal：首条 user 消息（原始任务陈述）前 500 字
+    /// - progress：最后一条有实质文本的 assistant 消息前 400 字
+    /// - artifacts：历史中所有 write/edit 工具调用的 path 参数（去重，≤10）
+    fn mechanical_checkpoint(messages: &[Message]) -> serde_json::Value {
+        let mut goal = String::new();
+        let mut progress = String::new();
+        let mut artifacts: Vec<String> = Vec::new();
+
+        for msg in messages {
+            if goal.is_empty()
+                && matches!(msg.role, miniagent_core::message::MessageRole::User)
+            {
+                let t: String = msg.text_content().chars().take(500).collect();
+                if !t.trim().is_empty() {
+                    goal = t;
+                }
+            }
+            if matches!(msg.role, miniagent_core::message::MessageRole::Assistant) {
+                let t = msg.text_content();
+                if !t.trim().is_empty() {
+                    progress = t.chars().take(400).collect();
+                }
+            }
+            for b in &msg.content {
+                if let miniagent_core::event::ContentBlock::ToolUse { name, input, .. } = b {
+                    if matches!(name.as_str(), "write" | "edit") {
+                        if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                            if !artifacts.iter().any(|a| a == p) && artifacts.len() < 10 {
+                                artifacts.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut sections = serde_json::Map::new();
+        if !goal.trim().is_empty() {
+            sections.insert("goal".into(), serde_json::json!(goal));
+        }
+        if !progress.trim().is_empty() {
+            sections.insert("done".into(), serde_json::json!(vec![format!(
+                "[机械提取自被裁剪历史] 最近进展: {progress}"
+            )]));
+        }
+        if !artifacts.is_empty() {
+            sections.insert("artifacts".into(), serde_json::json!(artifacts));
+        }
+        serde_json::Value::Object(sections)
+    }
+
+    /// 把机械 checkpoint 种入 notes.json（保留已有节，仅补充缺失节）。
+    fn seed_notes_from_checkpoint(working_dir: &str, checkpoint: &serde_json::Value) {
+        let Some(new_sections) = checkpoint.as_object() else { return };
+        let mut notes = miniagent_tool::tools::write_note::load_notes(working_dir);
+        let existing = notes
+            .get("sections")
+            .and_then(|s| s.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut merged = existing;
+        for (k, v) in new_sections {
+            // 已有节不覆盖（模型/前次提取的内容优先）
+            merged.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        notes["sections"] = serde_json::json!(merged);
+        let _ = miniagent_tool::tools::write_note::save_notes(working_dir, &notes);
+    }
+
     fn append_history_archive(working_dir: &str, messages: &[Message]) -> Vec<u64> {
         use std::io::Write as _;
         let path = std::path::Path::new(working_dir).join("history_archive.jsonl");
@@ -1083,6 +1169,45 @@ impl Drop for EventSenderGuard {
 
 // ── P-记忆机制 Layer A 测试：结构化压缩 ─────────────────────────
 #[cfg(test)]
+mod mechanical_checkpoint_tests {
+    use super::*;
+
+    /// 机械 checkpoint 提取：goal/progress/artifacts 三节全部来自
+    /// 结构性信号，无主题硬编码。
+    #[test]
+    fn mechanical_checkpoint_extracts_goal_progress_artifacts() {
+        use miniagent_core::event::ContentBlock;
+        use miniagent_core::types::ToolCallId;
+        use miniagent_core::message::MessageRole;
+
+        let mut history = Vec::new();
+        history.push(Message::user("调研 mRNA 疫苗进展并写报告 report.md"));
+        history.push(Message::assistant_text(""));
+        let mut write_msg = Message::new(
+            MessageRole::Assistant,
+            vec![
+                ContentBlock::Text { text: "已把调研结果写入报告文件。".into() },
+                ContentBlock::ToolUse {
+                    id: ToolCallId(uuid::Uuid::new_v4()),
+                    name: "write".into(),
+                    input: serde_json::json!({"path": "/task/report.md", "content": "..."}),
+                },
+            ],
+        );
+        let _ = &mut write_msg;
+        history.push(write_msg);
+
+        let cp = Agent::mechanical_checkpoint(&history);
+        let obj = cp.as_object().unwrap();
+        assert!(obj.contains_key("goal"), "应有 goal");
+        assert!(obj["goal"].as_str().unwrap().contains("mRNA"), "goal 来自原始任务");
+        assert!(obj.contains_key("done"), "应有 done（最近 assistant 陈述）");
+        assert!(obj["done"].as_array().unwrap()[0].as_str().unwrap().contains("报告文件"));
+        assert!(obj.contains_key("artifacts"), "应有 artifacts");
+        assert_eq!(obj["artifacts"].as_array().unwrap()[0], "/task/report.md");
+    }
+}
+
 mod compaction_tests {
     use super::*;
     use miniagent_core::config::InferenceConfig;

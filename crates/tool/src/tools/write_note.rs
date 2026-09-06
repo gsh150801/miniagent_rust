@@ -166,5 +166,78 @@ pub fn render_notes_block(working_dir: &str) -> String {
             }
         }
     }
+    // 模型自发写的 notes.md 全文（同步进 notes_md 节）——按字符预算截断
+    if let Some(md) = sections.get("notes_md").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        out.push_str("\n### 笔记文件（notes.md）内容\n");
+        out.push_str(&md.chars().take(NOTES_MD_INJECT_CHARS).collect::<String>());
+        let total = md.chars().count();
+        if total > NOTES_MD_INJECT_CHARS {
+            out.push_str(&format!("\n[…notes.md 共 {total} 字符，已截断；完整内容可用 read 工具读取]\n"));
+        }
+    }
     out
+}
+
+/// notes.md 同步与机械 checkpoint 注入时的字符预算（约 8K token）。
+const NOTES_MD_INJECT_CHARS: usize = 16_000;
+
+/// 把模型自发写入的 notes.md 同步进 notes.json 的 `notes_md` 节。
+///
+/// live 发现：模型在深度研究任务中 0 次调用 write_note 工具，但用
+/// write 写了完整分节的 notes.md（## goal / ## key_facts / 每源一节）
+/// ——意图接受度高，载体不重要。此函数把该自发行为接入状态记忆层：
+/// Agent::run 每轮注入与 trim 重建都会读到。
+pub fn sync_notes_markdown(working_dir: &str, markdown_content: &str) {
+    if working_dir.is_empty() || markdown_content.trim().is_empty() {
+        return;
+    }
+    let mut notes = load_notes(working_dir);
+    let sections = notes.get("sections").cloned().unwrap_or_else(|| json!({}));
+    let mut sections = sections.as_object().cloned().unwrap_or_default();
+    let truncated: String = markdown_content.chars().take(NOTES_MD_INJECT_CHARS).collect();
+    sections.insert("notes_md".into(), json!(truncated));
+    notes["sections"] = json!(sections);
+    let _ = save_notes(working_dir, &notes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ToolContext;
+
+    #[tokio::test]
+    async fn write_notes_md_syncs_into_notes_json() {
+        let dir = std::env::temp_dir().join("miniagent_notes_sync_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext::new(dir.to_string_lossy().to_string(), "t");
+        let tool = super::super::write::WriteTool::new();
+
+        let md = "# Research Notes\n\n## goal\n- 主题: mRNA 疫苗调研\n## key_facts\n- KEYNOTE-942 RFS HR=0.61\n";
+        let notes_file = dir.join("notes.md");
+        let input = json!({
+            "path": notes_file.to_string_lossy(),
+            "content": md,
+        });
+        tool.execute(input, &ctx, CancellationToken::new()).await.unwrap();
+
+        let notes = load_notes(&ctx.working_dir);
+        let synced = notes["sections"]["notes_md"].as_str().unwrap();
+        assert!(synced.contains("KEYNOTE-942"), "notes.md 内容应同步进 notes.json");
+        // render_notes_block 应包含同步的 markdown
+        let block = render_notes_block(&ctx.working_dir);
+        assert!(block.contains("KEYNOTE-942"), "注入块应包含 notes_md 内容");
+        assert!(block.contains("笔记文件"));
+    }
+
+    #[test]
+    fn empty_markdown_is_ignored() {
+        let dir = std::env::temp_dir().join("miniagent_notes_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = notes_path(&dir.to_string_lossy());
+        let _ = std::fs::remove_file(&existing);
+
+        sync_notes_markdown(&dir.to_string_lossy(), "   \n");
+        assert!(!existing.exists(), "空白内容不应产生 notes.json");
+    }
+
 }

@@ -58,6 +58,15 @@ impl Tool for WriteTool {
         std::fs::write(&path, content)
             .map_err(|e| AgentError::tool("write", format!("write '{}': {e}", path.display())))?;
 
+        // Codex 式状态记忆接入：模型经常自发用 write 写 notes.md（而非
+        // 调用 write_note 工具，live: mRNA 深度研究任务 0 次工具调用但
+        // 产出完整分节 notes.md）。检测到该文件名时把内容同步进
+        // notes.json，让自发行为接入状态记忆层（trim 重建与每轮注入
+        // 都从 notes.json 读取）。
+        if path.file_name().and_then(|n| n.to_str()) == Some("notes.md") {
+            crate::tools::write_note::sync_notes_markdown(&ctx.working_dir, content);
+        }
+
         Ok(ToolOutput {
             content: format!("Wrote {} bytes to {}", content.len(), path.display()),
             metadata: None,
