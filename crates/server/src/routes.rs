@@ -87,6 +87,7 @@ pub fn create_router(state: AppState) -> Router {
         // from a single response.
         .route("/api/kinds", get(kinds_handler))
         .route("/api/settings/active", get(settings_active_handler))
+        .route("/api/memory-mode", get(memory_mode_handler).post(memory_mode_set_handler))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -4342,6 +4343,66 @@ async fn kinds_handler() -> impl IntoResponse {
 
 /// Single round-trip snapshot: the active profile (as ModelProfileView),
 /// the resolved per-role debate selection, and the kind enum list.
+/// 记忆压缩模式（可插拔 compaction）的查询与热切换。
+///
+/// GET  返回当前生效模式（运行时覆盖优先于配置）与配置默认值；
+/// POST {"mode":"llm_summary"|"notes_history"} 设置运行时覆盖并
+/// 持久化到 .env（AGENT_MEMORY_MODE），重启后仍生效。
+async fn memory_mode_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use miniagent_agent::compaction::{effective_mode, runtime_override, MemoryMode};
+    let config = state.config.clone();
+    let effective = effective_mode(Some(&config));
+    let runtime = runtime_override().map(|m| m.as_str().to_string());
+    Ok(Json(serde_json::json!({
+        "effective": effective.as_str(),
+        "runtime_override": runtime,
+        "config_default": if config.agent_notes_mode { MemoryMode::NotesHistory.as_str() } else { MemoryMode::LlmSummary.as_str() },
+        "options": ["llm_summary", "notes_history"],
+    })))
+}
+
+async fn memory_mode_set_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use miniagent_agent::compaction::{set_runtime_override, MemoryMode};
+    let Some(mode_str) = body.get("mode").and_then(|v| v.as_str()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "missing 'mode' (llm_summary | notes_history)"
+        }))).into_response();
+    };
+    let Some(mode) = MemoryMode::parse(mode_str) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("unknown mode '{mode_str}'")
+        }))).into_response();
+    };
+    set_runtime_override(Some(mode));
+
+    // 持久化到 .env（AGENT_MEMORY_MODE 行），重启后仍生效。
+    // .env 持久化已保证重启后生效；进程内的运行时覆盖（原子量）已
+    // 立即生效，无需写进程环境变量（Rust 2024 中 set_var 为 unsafe）。
+    let env_path = std::path::Path::new(".env");
+    let mut lines: Vec<String> = std::fs::read_to_string(env_path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    let new_line = format!("AGENT_MEMORY_MODE={}", mode.as_str());
+    match lines.iter_mut().find(|l| l.starts_with("AGENT_MEMORY_MODE=")) {
+        Some(l) => *l = new_line,
+        None => lines.push(new_line),
+    }
+    let content = lines.into_iter().map(|l| format!("{l}\n")).collect::<String>();
+    let _ = std::fs::write(env_path, content);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "mode": mode.as_str(),
+        "note": "runtime override active; persisted to .env",
+    }))).into_response()
+}
+
 async fn settings_active_handler(State(state): State<AppState>) -> impl IntoResponse {
     use miniagent_core::models::ModelKind;
     let reg = state.models.read().unwrap();

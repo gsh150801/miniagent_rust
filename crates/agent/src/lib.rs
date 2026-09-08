@@ -1,5 +1,6 @@
 pub mod context;
 pub mod agent_tool;
+pub mod compaction;
 
 use std::sync::Arc;
 
@@ -675,6 +676,8 @@ impl Agent {
 
     /// Trim history with LLM summarization: keep prompt + summary + last 5 messages.
     /// Saves the compressed context to memory DB and a disk file.
+    /// 历史压缩入口（薄分发）：估算超预算时按生效模式路由到可插拔
+    /// compactor（见 compaction 模块：llm_summary / notes_history）。
     async fn trim_and_summarize_history(
         &self,
         history: &mut Vec<Message>,
@@ -687,196 +690,7 @@ impl Agent {
         if estimate_history_tokens(history) <= self.history_token_limit() {
             return;
         }
-
-        // ── notes 驱动重建（Codex `new_context` 式窗口重启）──────────
-        // 关键修正：被裁剪的历史**不丢弃**——先归档到
-        // `<working_dir>/history_archive.jsonl`（每条带 item_id，可经
-        // search_history 工具按需查回，对齐 Codex 的 history/read_item/
-        // search_contents 机制），再用 原始任务 + 最近消息 重建窗口。
-        // notes（状态记忆）每轮由 run() 注入 system prompt。
-        let notes_mode = self.config.as_ref().map(|c| c.agent_notes_mode).unwrap_or(false);
-        if notes_mode && !context.working_dir.is_empty() {
-            let mut notes_block =
-                miniagent_tool::tools::write_note::render_notes_block(&context.working_dir);
-            // ── 机械 checkpoint 兜底（Codex auto_compact_fallback 思路）──
-            // 模型没写过任何 note 时，从被裁剪的历史里机械提取状态
-            //（原始任务→goal、最后 assistant 陈述→progress、写过的
-            // 文件→artifacts），保证 notes 层必然非空——否则重启后的
-            // 新窗口除最近几条外对任务一无所知。
-            if notes_block.is_empty() && history.len() > 2 {
-                let checkpoint = Self::mechanical_checkpoint(history);
-                if checkpoint.as_object().is_some_and(|m| !m.is_empty()) {
-                    Self::seed_notes_from_checkpoint(&context.working_dir, &checkpoint);
-                    notes_block = miniagent_tool::tools::write_note::render_notes_block(
-                        &context.working_dir,
-                    );
-                    tracing::info!("mechanical checkpoint seeded into notes (model wrote none)");
-                }
-            }
-            if !notes_block.is_empty() {
-                let keep_recent = self.keep_recent_msgs().min(history.len().saturating_sub(1));
-                let first = history.first().cloned();
-                let keep = keep_recent;
-                let cut = history.len().saturating_sub(keep);
-                // 归档被裁剪的历史（原始 prompt 之后、保留窗口之前）
-                let archive_ids = Self::append_history_archive(
-                    &context.working_dir,
-                    &history[1..cut.max(1)],
-                );
-                let recent: Vec<Message> = history
-                    .iter()
-                    .rev()
-                    .take(keep)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut rebuilt = Vec::with_capacity(recent.len() + 2);
-                if let Some(msg) = first {
-                    rebuilt.push(msg);
-                }
-                rebuilt.push(Message::user(format!(
-                    "[上下文已重启：较早的 {} 条历史已归档（item_id {}–{}）。\
-                     任务状态见 system 中的 Task State Notes；\
-                     需要当时的技术细节时用 search_history 按关键词检索、\
-                     read_history_item 按 item_id 读取。\
-                     从中断处继续任务。]",
-                    archive_ids.len(),
-                    archive_ids.first().copied().unwrap_or(0),
-                    archive_ids.last().copied().unwrap_or(0),
-                )));
-                rebuilt.extend(recent);
-                tracing::info!(
-                    archived = archive_ids.len(),
-                    "notes-driven context restart (history archived, no LLM summary call)"
-                );
-                *history = rebuilt;
-                return;
-            }
-            // 无 notes 可用（模型还没写过）→ 落到传统 LLM 摘要路径
-        }
-
-        let keep_recent = self.keep_recent_msgs().min(history.len().saturating_sub(1));
-        let discard_count = history.len().saturating_sub(keep_recent + 1);
-
-        // Collect text from messages being discarded (owned, no borrow conflict)
-        let discarded_text: String = history
-            .iter()
-            .skip(1)
-            .take(discard_count)
-            .map(|m| {
-                let role = format!("{:?}", m.role);
-                format!("[{role}] {}", m.text_content())
-            })
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-
-        // Generate summary via LLM
-        let summary = self
-            .summarize_discarded(&discarded_text, context, &cancel)
-            .await;
-
-        // Persist to memory database
-        if let Some(ref mem) = self.memory {
-            let rec = miniagent_memory::types::StructuredSummary {
-                raw_summary: summary.clone(),
-                ..Default::default()
-            };
-            let _ = mem.store_paper_summary(
-                "Context History Summary",
-                &rec,
-                &["context_summary".to_string()],
-                None,
-            );
-        }
-
-        // Persist to disk file
-        Self::save_context_file(&summary);
-
-        // P-记忆机制 Layer A：压缩记录持久化到任务工作目录（append 列表，
-        // 可审计/可回放）。working_dir 缺失（如部分测试）时静默跳过。
-        if !context.working_dir.is_empty() {
-            Self::append_compaction_record(
-                &context.working_dir,
-                discard_count,
-                &summary,
-            );
-        }
-
-
-
-        // Rebuild: prompt + summary + last N messages.
-        // Tool-pair safety: the kept window must never START with a Tool
-        // message — its matching assistant tool_use call may have been cut,
-        // and providers (MiniMax/OpenAI strict) reject orphaned tool results
-        // ("tool call result does not follow tool call", live 400). Expand
-        // the window left until the first kept message is not a Tool role.
-        let first = history.first().cloned();
-        let mut recent: Vec<Message> = history
-            .iter()
-            .rev()
-            .take(keep_recent)
-            .cloned()
-            .collect::<Vec<_>>();
-        while recent
-            .first()
-            .is_some_and(|m| m.role == miniagent_core::message::MessageRole::Tool)
-        {
-            // Grow leftwards to swallow the whole orphaned tool sequence.
-            let start = history.len() - recent.len();
-            if start == 0 {
-                break;
-            }
-            recent.insert(0, history[start - 1].clone());
-        }
-        recent.reverse();
-        // The window must also be a contiguous slice of the original history;
-        // insert() above keeps contiguity (we prepend the immediately
-        // preceding message). Re-derive from history to be safe:
-        if history.len() >= recent.len() {
-            recent = history[history.len() - recent.len()..].to_vec();
-        }
-
-        // ── 保留窗口体积预算（trim 压缩下限的修复）──────────────────
-        // last-N 盲留窗口的单条巨消息（数百万字节的历史层漏网之鱼）会
-        // 让 trim 后的请求仍然超 provider 窗口。这里按预算从头收缩窗口，
-        // 再对超预算的单条 tool result 做历史层头部截断（Tool 消息截断
-        // 是安全的：模型只需摘要；截断不破坏 tool_use/tool_result 配对）。
-        const RETENTION_TOKEN_BUDGET: usize = 24_000;
-        let mut window_tokens = miniagent_core::budget::estimate_history_tokens(&recent);
-        while recent.len() > 2 && window_tokens > RETENTION_TOKEN_BUDGET {
-            recent.remove(0);
-            window_tokens = miniagent_core::budget::estimate_history_tokens(&recent);
-        }
-        for msg in recent.iter_mut() {
-            let t = miniagent_core::budget::estimate_history_tokens(std::slice::from_ref(msg));
-            if t > RETENTION_TOKEN_BUDGET / 2 {
-                let text = msg.text_content();
-                let keep_bytes = RETENTION_TOKEN_BUDGET * 2; // ≈1/2 预算的字节量
-                let mut head: String = text.chars().take(keep_bytes.max(1)).collect();
-                let original_tokens = t;
-                head.push_str(&format!(
-                    "\n[...TRUNCATED here: this single result was ~{original_tokens} tokens; \
-                     full content available via re-read with offset/limit...]"
-                ));
-                *msg = Message::tool(
-                    // 保留原 tool_call_id：从文本前缀恢复
-                    text.strip_prefix("[toolu_vrtx_")
-                        .and_then(|s| s.split(']').next())
-                        .unwrap_or("unknown"),
-                    &head,
-                );
-            }
-        }
-
-        let mut trimmed = Vec::with_capacity(recent.len() + 2);
-        if let Some(msg) = first {
-            trimmed.push(msg);
-        }
-        trimmed.push(Message::assistant_text(format!(
-            "[Context trimmed. Summary of earlier work:\n{summary}\n\n\
-             Continue the task with the latest results below.]"
-        )));
-        trimmed.extend(recent);
-        *history = trimmed;
+        crate::compaction::run_compaction(self, history, context, cancel).await;
     }
 
     /// Ask the LLM to summarise discarded conversation turns.
@@ -1208,22 +1022,25 @@ mod mechanical_checkpoint_tests {
     }
 }
 
-mod compaction_tests {
+/// 共享测试支持：捕获 prompt 的 stub provider（返回固定的四段式
+/// 结构化压缩结果）。供 lib.rs 与 compaction 子模块的测试使用。
+#[cfg(test)]
+pub mod test_support {
     use super::*;
     use miniagent_core::config::InferenceConfig;
     use miniagent_core::error::AgentError;
     use miniagent_core::event::{ContentBlock, StopReason};
-    use miniagent_provider::traits::{CompletionResponse, LlmProvider, StreamResponse};
+    use miniagent_provider::traits::{CompletionRequest, CompletionResponse, LlmProvider, StreamResponse};
+    use tokio_util::sync::CancellationToken;
 
-    /// 捕获 prompt 的 stub provider：返回固定的四段式结构化压缩结果。
     #[derive(Clone)]
-    struct CapturingProvider(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    pub struct CapturingProvider(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     impl CapturingProvider {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
         }
-        fn prompts(&self) -> Vec<String> {
+        pub fn prompts(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
     }

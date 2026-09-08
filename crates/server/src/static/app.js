@@ -2954,7 +2954,7 @@ async function activateModel(id) {
 function openSettings(tab) {
   const overlay = document.getElementById('settingsOverlay');
   if (!overlay) return;
-  if (tab && ['models','agents','debate','about'].includes(tab)) settingsStore.settingsTab = tab;
+  if (tab && ['models','agents','debate','memory','about'].includes(tab)) settingsStore.settingsTab = tab;
   overlay.classList.add('active');
   for (const t of document.querySelectorAll('.settings-tab')) {
     t.classList.toggle('active', t.dataset.tab === settingsStore.settingsTab);
@@ -2981,6 +2981,7 @@ function renderSettingsTab() {
   if (settingsStore.settingsTab === 'models') renderSettingsModels(body);
   else if (settingsStore.settingsTab === 'agents') renderSettingsAgents(body);
   else if (settingsStore.settingsTab === 'debate') renderSettingsDebate(body);
+  else if (settingsStore.settingsTab === 'memory') renderSettingsMemory(body);
   else renderSettingsAbout(body);
 }
 
@@ -3216,6 +3217,72 @@ async function resetDebateRoles() {
 }
 
 // ── Settings · About tab ────────────────────────────────────
+
+// ── Settings · Memory tab（可插拔记忆压缩模式）──────────────
+const MEMORY_MODE_LABELS = {
+  llm_summary: 'LLM 摘要压缩',
+  notes_history: 'Notes + 历史归档',
+};
+const MEMORY_MODE_DESC = {
+  llm_summary: '传统模式：上下文超限时把被裁剪历史交给 LLM 生成结构化摘要（约束/决策/产物/待办），重建窗口。兼容性最好，但摘要调用消耗额外 token，且细节可能丢失。',
+  notes_history: 'Codex 式：模型用 write_note / notes.md 主动维护状态记忆（每轮注入）；被裁剪历史完整归档（history_archive.jsonl），可经 search_history 按需查回；重建窗口零 LLM 调用。notes 缺失时自动机械提取兜底。',
+};
+async function renderSettingsMemory(body) {
+  body.innerHTML = '<div class="skeleton" style="height:100px"></div>';
+  let data;
+  try {
+    const resp = await fetch('/api/memory-mode');
+    data = await resp.json();
+  } catch (err) {
+    body.innerHTML = '<div class="settings-section"><div class="card">加载失败: ' + esc(String(err)) + '</div></div>';
+    return;
+  }
+  const rows = (data.options || []).map(m => {
+    const active = data.effective === m;
+    const desc = MEMORY_MODE_DESC[m] || '';
+    const label = MEMORY_MODE_LABELS[m] || m;
+    return `
+    <div class="card" style="margin-bottom:10px;${active ? 'border-color:var(--accent,#4a9eff)' : ''}">
+      <div class="card-head">
+        <div class="grow">
+          <div class="card-title">${esc(label)} ${active ? '<span class="status-tag ok">当前</span>' : ''}</div>
+          <div class="card-sub">${esc(desc)}</div>
+        </div>
+        <div class="card-actions">
+          ${active
+            ? `<button class="btn-sm" disabled>使用中</button>`
+            : `<button class="btn-sm" onclick="setMemoryMode('${esc(m)}')">切换</button>`}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  body.innerHTML = `
+    <div class="settings-section">
+      <h4>记忆压缩模式</h4>
+      <div class="card-meta" style="margin-bottom:10px">
+        <div class="cm-row"><span class="cm-key">当前生效</span><span>${esc(MEMORY_MODE_LABELS[data.effective] || data.effective)}</span></div>
+        <div class="cm-row"><span class="cm-key">配置默认</span><span>${esc(MEMORY_MODE_LABELS[data.config_default] || data.config_default)}</span></div>
+        ${data.runtime_override ? '' : '<div class="cm-row"><span class="cm-key">运行时覆盖</span><span>无（跟随配置）</span></div>'}
+      </div>
+      ${rows}
+      <div style="opacity:.7;font-size:12px;margin-top:6px">切换立即对后续任务生效并持久化（写入 .env 的 AGENT_MEMORY_MODE）。</div>
+    </div>`;
+}
+async function setMemoryMode(mode) {
+  try {
+    const resp = await fetch('/api/memory-mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    const data = await resp.json();
+    showToast(data.ok ? ('记忆模式已切换: ' + (MEMORY_MODE_LABELS[mode] || mode)) : ('切换失败: ' + (data.error || '')), !data.ok);
+  } catch (err) {
+    showToast('切换失败: ' + String(err), true);
+  }
+  renderSettingsTab();
+}
+
 function renderSettingsAbout(body) {
   const active = settingsStore.active;
   body.innerHTML = `
