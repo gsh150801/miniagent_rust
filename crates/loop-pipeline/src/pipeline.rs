@@ -604,6 +604,12 @@ impl LoopPipeline {
             let _ = std::fs::remove_file(&cp_path);
             tracing::debug!("Checkpoint cleaned up: {:?}", cp_path);
         }
+        // 空的 checkpoint/ 目录也一并移除（live：完成后 Files 面板残留
+        // 一个空目录，用户误以为有未恢复的状态）。
+        if let Some(dir) = cp_path.parent()
+            && std::fs::remove_dir(dir).is_ok() {
+            tracing::debug!("Empty checkpoint dir removed: {:?}", dir);
+        }
         // Also remove legacy per-slug checkpoint dirs left by older runs.
         for legacy in Self::legacy_checkpoint_dirs(&result_base) {
             if let Some(dir) = legacy.parent() {

@@ -2624,3 +2624,43 @@ core/kg/loop-pipeline/provider/telemetry/skill/tool/workflow/planning/memory/hyp
   WS loop 指定 agent 后 plan 与子任务事件角色均为 weather-agent
 - 修复 live bug：`SkillDiscovery` 记录相对路径导致 custom 归属判定恒 false
   （`is_user_skill` 两侧绝对化 + canonicalize 后比较）
+
+## A33. "#" 技能选择器 + 审查/修复并行化 + 跨厂商热切换（✅ 已完成）
+
+**日期**：2026-09-11（两轮端到端实测）
+
+### 目标
+1. 前端输入框输入 `#` 唤出技能选择器：中文介绍浏览、↑↓ 切换、Enter/Tab 选用并随任务调用
+2. 消除 loop 管线串行审查/修复瓶颈（docs/11 不足 #3）
+3. 429 限流退避耗尽后跨厂商热切换（live：MiniMax Token Plan 耗尽 → DeepSeek 402 → StepFun 无订阅三连故障暴露的韧性缺口）
+4. web_fetch 域级熔断（live：代理环境对 arxiv.org 连续失败仍反复重试）
+5. ask 超时后前端卡片失效（live：任务完成后 ask 卡仍挂着可交互输入框）
+
+### 前端（# 技能选择器）
+| 文件 | 改动 |
+|------|------|
+| `static/skills_zh.json`（新增） | 156 个内置技能的中文一句话介绍（`description_zh` 源） |
+| `routes.rs` | `/api/skills` 与 `/api/skills/{name}` 输出 `description_zh`（OnceLock 内嵌解析，未收录回退英文）；research/debate 模式接入 `append_forced_directives`（指令块拼 prompt，四种模式技能指定全覆盖） |
+| `app.js` | 光标处 `#token` 检测（词边界 + 空格闭合）、前缀>包含>中文介绍三级过滤排序、↑↓ 循环导航、Enter/Tab 选用（IME isComposing 防误触）、Esc/失焦关闭、选用转 chip；`sendMessage` 解析手打 `#技能名` 并入 `payload.skills`；技能面板/详情优先中文介绍 |
+| `styles.css` / `index.html` | `.skill-mention` 浮层（输入框上方、键盘提示栏、active 高亮） |
+
+### 性能（并行化）
+- `dispatch.rs`：critic/judge 分层审查 join_all 并发（permit 复用 `loop_dispatch_wave_concurrency`），保序输出，`reviewed` 事件顺序不变
+- `repair.rs`：失败任务根因诊断并行（Phase A join_all），重试执行保持串行顺序语义（Phase B）
+- `web_fetch.rs`：域级熔断——同 host 连续 3 次网络层失败（连接/5xx/429）→ 60s 快速失败并明示 agent 换源；成功/冷却过期复位（含状态机单测，修复"探测即清零"缺陷）
+
+### 韧性（跨厂商热切换）
+- `agent/lib.rs` `run_with_loop`：429 类重试耗尽 → `swap_to_fallback_family` 热切换 router（DeepSeek→StepFun→MiniMax 链，跳过已熔断族），每次 run 最多 2 次；回退族出现 401/402/403/无订阅 → `ban_family_by_name` 后继续换链；新厂商给满重试预算
+- `factory.rs`：`codegen_fallback_family_names`（族名镜像选择逻辑供日志/换链）
+
+### 修复
+- 前端 `finishStreamError` 漏复位 `isRunning`：失败任务后新任务被吞成对死任务的 steer（E2E 复现）
+- loop 强制技能注入不发射 `SkillInvoked`：前端 ⚙ 技能统计恒 0、trace 缺技能审计（现 per-subtask 发射，trigger=`forced:<task_id>`）
+- loop 完成后残留空 `checkpoint/` 目录（Files 面板误导）
+- `minimax.rs` 死赋值、debate/dispatch 死代码 `request` 构建、compaction trait lint——workspace warning 清零
+
+### 验证
+- `cargo test --workspace` 399 通过 0 失败（新增域熔断 2 测）
+- E2E-1（真实 LLM，loop 多智能体 + #literature-review）：16m33s、110 工具调用、4 子任务并行波次 + 修复重规划（重复 task 目录为证）、技能工作流特征产物（文献清单/参考来源节/PRISMA 图/citation_check 调用）、阶段 pills + 执行卡 + op 卡 + ask 卡全渲染
+- E2E-2（mock LLM + 真实工具，research 管线）：8 阶段全通（KG PMID 溯源/链路预测/假说/辩论/验证计划×2/GEO notebook 带叙述与真实输出/provenance/引用核验/报告审核 pass）、前端验证计划卡 + 分析执行卡 + ask 超时失效卡、SkillInvoked 事件流（⚙ 8）与 trace 审计、技能指令块注入 research 模式
+- 热切换链真实故障演练：MiniMax 429 → DeepSeek 402（熔断）→ StepFun 无订阅（熔断识别）日志完整

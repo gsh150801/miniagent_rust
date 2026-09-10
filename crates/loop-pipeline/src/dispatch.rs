@@ -369,17 +369,6 @@ async fn run_judge(
 }}"#
     );
 
-    let request = CompletionRequest {
-        system: "You are a strict but fair judge. Output ONLY valid JSON.".into(),
-        messages: vec![Message::user(&prompt)],
-        tools: vec![],
-        config: InferenceConfig {
-            temperature: Some(0.2),
-            max_tokens: Some(max_tokens),
-            ..Default::default()
-        },
-    };
-
     match complete_json_with_retry(
         provider,
         "You are a strict but fair judge. Output ONLY valid JSON.",
@@ -668,57 +657,75 @@ impl PipelineStage for DispatchStage {
         // simple: skip review entirely
         // medium: critic only (auto-pass, feedback recorded)
         // hard:   full 3-party (critic + judge)
+        //
+        // Reviews run concurrently（permit 数复用 dispatch 波次并发上限）：
+        // 串行逐个审查会让阶段尾延迟随计划规模线性增长（docs/11 不足 #3）。
+        // join_all 保序，critique_entries 与 all_results 顺序一致，前端
+        // `reviewed` 事件回放顺序不变。
         let flash_provider = ctx.agent.flash_provider();
         let pro_provider = ctx.agent.pro_provider();
-        let mut critique_entries: Vec<CritiqueEntry> = Vec::new();
-        for result in &all_results {
-            if !result.success { continue; }
+        let review_permits = Arc::new(tokio::sync::Semaphore::new(
+            ctx.config.loop_dispatch_wave_concurrency.max(1),
+        ));
+        let review_futs: Vec<_> = all_results.iter().filter(|r| r.success).map(|result| {
             let task_spec = plan.tasks.iter().find(|t| t.id == result.task_id);
-            let difficulty = task_spec.map(|t| t.difficulty.as_str()).unwrap_or("hard");
-            let desc = task_spec.map(|t| t.description.as_str()).unwrap_or(&result.task_id);
-            let expected = task_spec.map(|t| t.expected_output.as_str()).unwrap_or("");
+            let difficulty = task_spec.map(|t| t.difficulty.as_str()).unwrap_or("hard").to_string();
+            let desc = task_spec.map(|t| t.description.as_str()).unwrap_or(&result.task_id).to_string();
+            let expected = task_spec.map(|t| t.expected_output.as_str()).unwrap_or("").to_string();
 
-            match difficulty {
-                "simple" => {
-                    tracing::debug!(
-                        task_id = %result.task_id, difficulty = "simple",
-                        "Skipping review for simple task"
-                    );
-                }
-                "medium" => {
-                    let critique = run_critic(
-                        &result.task_id, &result.output, desc, expected,
-                        flash_provider.as_ref(), ctx.config.loop_critic_max_tokens, cancel.child_token(),
-                    ).await;
-                    tracing::info!(task_id = %result.task_id, "Medium task: critic review (auto-pass)");
-                    critique_entries.push(CritiqueEntry {
-                        task_id: result.task_id.clone(),
-                        critique,
-                        judge_verdict: "Auto-passed (medium difficulty)".into(),
-                        judge_passed: true,
-                        improvements: vec![],
-                    });
-                }
-                _ => {
-                    let critique = run_critic(
-                        &result.task_id, &result.output, desc, expected,
-                        flash_provider.as_ref(), ctx.config.loop_critic_max_tokens, cancel.child_token(),
-                    ).await;
-
-                    let judge_result = run_judge(
-                        &result.task_id, &result.output, &critique, desc, expected,
-                        pro_provider.as_ref(), ctx.config.loop_judge_max_tokens, cancel.child_token(),
-                    ).await;
-
-                    if !judge_result.passed {
-                        tracing::warn!(task_id = %result.task_id, verdict = %judge_result.verdict.chars().take(120).collect::<String>(), "Judge: quality check failed");
-                    } else {
-                        tracing::info!(task_id = %result.task_id, "Judge: quality check passed");
+            let flash = std::sync::Arc::clone(&flash_provider);
+            let pro = std::sync::Arc::clone(&pro_provider);
+            let permits = Arc::clone(&review_permits);
+            let cancel_review = cancel.child_token();
+            let critic_max = ctx.config.loop_critic_max_tokens;
+            let judge_max = ctx.config.loop_judge_max_tokens;
+            async move {
+                let _permit = permits.acquire_owned().await;
+                match difficulty.as_str() {
+                    "simple" => {
+                        tracing::debug!(
+                            task_id = %result.task_id, difficulty = "simple",
+                            "Skipping review for simple task"
+                        );
+                        None
                     }
-                    critique_entries.push(judge_result.into_entry(result.task_id.clone(), critique));
+                    "medium" => {
+                        let critique = run_critic(
+                            &result.task_id, &result.output, &desc, &expected,
+                            flash.as_ref(), critic_max, cancel_review,
+                        ).await;
+                        tracing::info!(task_id = %result.task_id, "Medium task: critic review (auto-pass)");
+                        Some(CritiqueEntry {
+                            task_id: result.task_id.clone(),
+                            critique,
+                            judge_verdict: "Auto-passed (medium difficulty)".into(),
+                            judge_passed: true,
+                            improvements: vec![],
+                        })
+                    }
+                    _ => {
+                        let critique = run_critic(
+                            &result.task_id, &result.output, &desc, &expected,
+                            flash.as_ref(), critic_max, cancel_review.clone(),
+                        ).await;
+
+                        let judge_result = run_judge(
+                            &result.task_id, &result.output, &critique, &desc, &expected,
+                            pro.as_ref(), judge_max, cancel_review,
+                        ).await;
+
+                        if !judge_result.passed {
+                            tracing::warn!(task_id = %result.task_id, verdict = %judge_result.verdict.chars().take(120).collect::<String>(), "Judge: quality check failed");
+                        } else {
+                            tracing::info!(task_id = %result.task_id, "Judge: quality check passed");
+                        }
+                        Some(judge_result.into_entry(result.task_id.clone(), critique))
+                    }
                 }
             }
-        }
+        }).collect();
+        let critique_entries: Vec<CritiqueEntry> =
+            futures_util::future::join_all(review_futs).await.into_iter().flatten().collect();
         // Apply judge decisions: failed quality checks mark the task as failed
         for entry in &critique_entries {
             if !entry.judge_passed
@@ -972,6 +979,14 @@ pub(crate) async fn execute_single_task(
                     system.push_str(&format!(
                         "\n## 指定技能: {name}（必须使用——按其工作流执行本任务）\n{body}\n"
                     ));
+                    // 技能事件对前端技能统计与 trace 审计可见（workflow 模式
+                    // 已发；loop 强制注入路径此前漏发 → 前端 ⚙ 恒 0）。
+                    let _ = agent.emit_event(
+                        miniagent_core::event::AgentEvent::SkillInvoked {
+                            skill_name: name.clone(),
+                            trigger: format!("forced:{}", task.id),
+                        },
+                    ).await;
                 }
                 None => {
                     system.push_str(&format!(

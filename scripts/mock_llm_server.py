@@ -291,6 +291,51 @@ def route(prompt: str) -> str:
     if "Convert this research question into a PubMed search query" in p \
             or "Corrected PubMed query" in p:
         return "amyotrophic lateral sclerosis AND (pathogenesis OR mechanism)"
+    if "Judge ONLY whether this corpus as a whole is on-topic" in p:
+        # 语料一致性门（corpus-coherence gate）：判定检索语料与研究问题
+        # 是否同题。mock 语料全部来自真实 PubMed 检索，直接判 coherent。
+        return json.dumps({
+            "coherent": True,
+            "on_topic_estimate": 90,
+            "reason": "mock corpus coherence verdict",
+        })
+    if "You are the Challenger in a completion review" in p:
+        # 三方裁决 challenger：无缺陷清单 → 裁决可直接 complete
+        return json.dumps({"unmet": [], "suggestions": []})
+    if "Rule on whether the work satisfies the goal" in p:
+        # 三方裁决 arbiter
+        return json.dumps({
+            "verdict": "complete",
+            "summary": "mock arbiter: evidence satisfies the goal",
+        })
+    if "You are selecting a public dataset" in p:
+        # GEO 数据集兼容性选择：取候选清单里第一个 GSE
+        m = re.search(r"(GSE\d+)", p)
+        return json.dumps({
+            "accession": m.group(1) if m else "GSE0",
+            "reason": "mock curator: first listed candidate",
+        })
+    if "You are a strict scientific report auditor" in p:
+        # 报告分节审核：通过
+        return json.dumps({
+            "verdict": "pass",
+            "issues": [],
+            "summary": "mock auditor: section consistent with sources",
+            "checks": [],
+        })
+    if "You are the **Evaluator**" in p:
+        # loop evaluate：全部完成，停止循环
+        return json.dumps({
+            "tasks_completed": 1,
+            "tasks_failed": 0,
+            "tasks_pending": 0,
+            "overall_progress_pct": 100,
+            "failed_task_ids": [],
+            "unmet_goals": [],
+            "should_continue": False,
+            "next_action": "complete",
+            "summary": "mock evaluator: all subtasks completed",
+        })
     if "Is this paper on-topic" in p:
         if "conflict of interest" in p.lower():
             return json.dumps({"score": 1, "reason": "editorial statement, not research"})

@@ -498,7 +498,7 @@ impl MiniMaxClient {
                             rest = &rest[start + len + "</mm:think>".len()..];
                         }
                         // 未闭合：其余内容整体丢弃（推理泄漏，非交付内容）
-                        None => { rest = ""; break; }
+                        None => break,
                     }
                 }
                 None => { out.push_str(rest); break; }

@@ -97,6 +97,7 @@ pub enum CompactionOutcome {
 pub trait HistoryCompactor: Send + Sync {
     fn name(&self) -> &'static str;
 
+    #[allow(async_fn_in_trait)]
     async fn compact(
         &self,
         agent: &Agent,

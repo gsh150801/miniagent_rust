@@ -58,11 +58,14 @@ impl PipelineStage for RepairStage {
 
         let mut retry_outcomes: Vec<String> = Vec::new();
 
-        for result in &failed_results {
-            if cancel.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
-
+        // ── Phase A：并行诊断（LLM 根因分析）──────────────────────
+        // 诊断彼此独立；串行会让多任务失败时 repair 阶段尾延迟线性堆叠
+        // （docs/11 不足 #3）。并发上限复用 dispatch 波次并发配置。
+        // join_all 保序，Phase B 按原失败顺序执行重试，语义与串行版一致。
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            ctx.config.loop_dispatch_wave_concurrency.max(1),
+        ));
+        let diagnose_futs: Vec<_> = failed_results.iter().map(|result| {
             let task_unit = state.plan.as_ref()
                 .and_then(|p| p.tasks.iter().find(|t| t.id == result.task_id).cloned());
 
@@ -121,56 +124,72 @@ Output before failure (may be partial/empty):
             );
 
             let provider = ctx.agent.pro_provider();
-            let request = CompletionRequest {
-                system: format!("You are an expert failure analyst. {} Diagnose issues and design concrete fixes. Output ONLY valid JSON.", miniagent_core::context_info::date_hint()),
-                messages: vec![Message::user(&prompt)],
-                tools: vec![],
-                config: InferenceConfig {
-                    temperature: Some(0.3),
-                    max_tokens: Some(ctx.config.loop_repair_max_tokens),
-                    ..Default::default()
-                },
-            };
+            let permits = std::sync::Arc::clone(&permits);
+            let cancel_diag = cancel.child_token();
+            let max_tokens = ctx.config.loop_repair_max_tokens;
+            async move {
+                let _permit = permits.acquire_owned().await;
+                let request = CompletionRequest {
+                    system: format!("You are an expert failure analyst. {} Diagnose issues and design concrete fixes. Output ONLY valid JSON.", miniagent_core::context_info::date_hint()),
+                    messages: vec![Message::user(&prompt)],
+                    tools: vec![],
+                    config: InferenceConfig {
+                        temperature: Some(0.3),
+                        max_tokens: Some(max_tokens),
+                        ..Default::default()
+                    },
+                };
 
-            let response = provider.complete(&request, cancel.child_token()).await;
-            let analysis = match response {
-                Ok(resp) => {
-                    let text: String = resp.content.iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
+                let response = provider.complete(&request, cancel_diag).await;
+                let analysis = match response {
+                    Ok(resp) => {
+                        let text: String = resp.content.iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
 
-                    let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
-                    serde_json::from_str::<RepairAnalysis>(&cleaned)
-                        .ok()
-                        .or_else(|| serde_json::from_str::<RepairAnalysis>(
-                            &miniagent_core::json_util::extract_and_repair(&text),
-                        ).ok())
-                        .unwrap_or_else(|| RepairAnalysis {
-                            failed_task_id: result.task_id.clone(),
-                            root_cause: "Unknown failure".into(),
-                            suggested_fix: "Retry the task".into(),
-                            requires_re_explore: false,
-                            requires_re_plan: false,
-                            suggested_new_approach: None,
-                            revised_prompt: None,
-                            retry_attempt: 0,
-                        })
-                }
-                Err(e) => RepairAnalysis {
-                    failed_task_id: result.task_id.clone(),
-                    root_cause: format!("LLM analysis failed: {e}"),
-                    suggested_fix: "Retry the task".into(),
-                    requires_re_explore: false,
-                    requires_re_plan: false,
-                    suggested_new_approach: None,
-                    revised_prompt: None,
-                    retry_attempt: 0,
-                },
-            };
+                        let cleaned = miniagent_core::json_util::strip_markdown_fences(&text);
+                        serde_json::from_str::<RepairAnalysis>(&cleaned)
+                            .ok()
+                            .or_else(|| serde_json::from_str::<RepairAnalysis>(
+                                &miniagent_core::json_util::extract_and_repair(&text),
+                            ).ok())
+                            .unwrap_or_else(|| RepairAnalysis {
+                                failed_task_id: result.task_id.clone(),
+                                root_cause: "Unknown failure".into(),
+                                suggested_fix: "Retry the task".into(),
+                                requires_re_explore: false,
+                                requires_re_plan: false,
+                                suggested_new_approach: None,
+                                revised_prompt: None,
+                                retry_attempt: 0,
+                            })
+                    }
+                    Err(e) => RepairAnalysis {
+                        failed_task_id: result.task_id.clone(),
+                        root_cause: format!("LLM analysis failed: {e}"),
+                        suggested_fix: "Retry the task".into(),
+                        requires_re_explore: false,
+                        requires_re_plan: false,
+                        suggested_new_approach: None,
+                        revised_prompt: None,
+                        retry_attempt: 0,
+                    },
+                };
+                (task_unit, analysis)
+            }
+        }).collect();
+        let diagnosed: Vec<(Option<crate::types::TaskUnit>, RepairAnalysis)> =
+            futures_util::future::join_all(diagnose_futs).await;
+
+        // ── Phase B：串行执行重试（依赖上游重试结果的顺序语义保持不变）──
+        for (result, (task_unit, analysis)) in failed_results.iter().zip(diagnosed.into_iter()) {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
 
             tracing::info!(task_id = %analysis.failed_task_id, root_cause = %analysis.root_cause.chars().take(80).collect::<String>(), "Repair analysis");
 

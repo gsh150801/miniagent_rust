@@ -138,6 +138,13 @@ function handleMsg(msg) {
       // 双向 ws：后端反问用户，渲染输入框/选项卡
       renderAsk(msg.task_id, msg.question, msg.options || []);
       break;
+    case 'ask_timeout': {
+      // ask 超时：任务已按默认假设继续，把未回答的 ask 卡置为失效态
+      //（输入框禁用，回复无人接收——避免用户误以为还在等待）。
+      if (msg.task_id && currentTaskId && msg.task_id !== currentTaskId) break;
+      expireAskCard(msg.task_id);
+      break;
+    }
     case 'stage_output': showStageOutput(msg.stage, msg.summary); break;
     // 流式输出按任务过滤：并发任务的 token 不得混入当前会话。
     case 'stream':
@@ -481,7 +488,7 @@ function renderSkillList() {
 
   const filtered = skills.filter(s => {
     if (!query) return true;
-    const haystack = [s.name, s.description, (s.triggers||[]).join(' '), (s.tags||[]).join(' ')].join(' ').toLowerCase();
+    const haystack = [s.name, s.description, s.description_zh, (s.triggers||[]).join(' '), (s.tags||[]).join(' ')].join(' ').toLowerCase();
     return haystack.includes(query);
   });
 
@@ -494,7 +501,8 @@ function renderSkillList() {
 
   el.innerHTML = filtered.map(s => {
     const selected = selectedSkills.has(s.name);
-    const desc = (s.description || '').slice(0, 80);
+    // 中文介绍优先，缺失（多为自定义技能）回退英文 description
+    const desc = (s.description_zh || s.description || '').slice(0, 80);
     const icon = selected ? '&#9989;' : '&#11036;';
     // 查看/删除操作按钮：点击不冒泡到 toggleSkill。仅用户目录技能
     //（custom=true，.miniagent/skills/）可删除；内置技能无删除钮。
@@ -538,6 +546,153 @@ function renderSkillChips() {
     });
     el.appendChild(chip);
   }
+}
+
+// ── "#" 技能选择器：输入 # 唤出浮层，↑↓ 切换、Enter/Tab 选用 ──
+// 选用后把 #token 替换为 "#技能名 " 并加入 selectedSkills（chips 随发送
+// 传给后端 ForcedDirectives / 指令块，任务执行时强制注入技能正文）。
+const SM_MAX_ITEMS = 12;
+const smState = { open: false, items: [], active: 0, start: -1, end: -1 };
+
+function skillDescZh(s) {
+  return (s && s.description_zh) ? s.description_zh : (s.description || '');
+}
+
+// 光标是否位于一个"活动"的 #token 内：# 前必须是行首/空白，token 内
+// 尚无空白（一旦空格闭合就不再匹配，正常写 #标签 文本不弹浮层）。
+function detectSkillToken(el) {
+  const caret = el.selectionStart;
+  if (caret == null) return null;
+  const val = el.value;
+  const upto = val.slice(0, caret);
+  const hash = upto.lastIndexOf('#');
+  if (hash < 0) return null;
+  if (hash > 0 && !/\s/.test(val[hash - 1])) return null;
+  const token = upto.slice(hash + 1);
+  if (/\s/.test(token)) return null;
+  return { start: hash, query: token.toLowerCase(), end: caret };
+}
+
+function updateSkillMention() {
+  const el = document.getElementById('input');
+  if (!el || !skills.length) { closeSkillMention(); return; }
+  const hit = detectSkillToken(el);
+  if (!hit) { closeSkillMention(); return; }
+  const q = hit.query;
+  let items;
+  if (!q) {
+    items = skills.slice(0, SM_MAX_ITEMS);
+  } else {
+    // 前缀命中 > 包含命中 > 中文/英文介绍命中
+    const scored = [];
+    for (const s of skills) {
+      const name = (s.name || '').toLowerCase();
+      const desc = skillDescZh(s).toLowerCase();
+      let score = -1;
+      if (name.startsWith(q)) score = 0;
+      else if (name.includes(q)) score = 1;
+      else if (desc.includes(q)) score = 2;
+      if (score >= 0) scored.push({ s, score });
+    }
+    scored.sort((a, b) => a.score - b.score);
+    items = scored.slice(0, SM_MAX_ITEMS).map(x => x.s);
+  }
+  if (!items.length) { closeSkillMention(); return; }
+  smState.open = true;
+  smState.items = items;
+  smState.start = hit.start;
+  smState.end = hit.end;
+  if (smState.active >= items.length) smState.active = 0;
+  renderSkillMention();
+}
+
+function renderSkillMention() {
+  const box = document.getElementById('skillMention');
+  if (!box) return;
+  box.innerHTML = smState.items.map((s, i) => `
+    <div class="sm-item ${i === smState.active ? 'active' : ''}" data-idx="${i}" role="option"
+         onmousedown="event.preventDefault(); smSelect(${i})" onmouseenter="smHover(${i})">
+      <span class="sm-icon">&#128295;</span>
+      <div class="sm-body">
+        <div class="sm-name"><span class="sm-hash">#</span>${escHtml(s.name)}</div>
+        <div class="sm-desc">${escHtml(skillDescZh(s))}</div>
+      </div>
+    </div>`).join('') +
+    `<div class="sm-hint"><span><kbd>&#8593;</kbd><kbd>&#8595;</kbd> 切换技能</span>` +
+    `<span><kbd>Enter</kbd>/<kbd>Tab</kbd> 选用</span><span><kbd>Esc</kbd> 关闭</span></div>`;
+  box.style.display = '';
+  const activeEl = box.querySelector('.sm-item.active');
+  if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+}
+
+function smHover(i) {
+  if (!smState.open || !smState.items[i]) return;
+  smState.active = i;
+  smRefreshActive();
+}
+
+function smRefreshActive() {
+  const box = document.getElementById('skillMention');
+  if (!box) return;
+  box.querySelectorAll('.sm-item').forEach(el =>
+    el.classList.toggle('active', +el.dataset.idx === smState.active));
+  const activeEl = box.querySelector('.sm-item.active');
+  if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+}
+
+function smSelect(i) {
+  const s = smState.items[i];
+  const el = document.getElementById('input');
+  if (!s || !el) return;
+  const val = el.value;
+  el.value = val.slice(0, smState.start) + '#' + s.name + ' ' + val.slice(smState.end);
+  const caret = smState.start + s.name.length + 2;
+  el.setSelectionRange(caret, caret);
+  selectedSkills.add(s.name);
+  renderSkillList();
+  renderSkillChips();
+  closeSkillMention();
+  autoResize(el);
+  el.focus();
+}
+
+function closeSkillMention() {
+  smState.open = false;
+  smState.items = [];
+  smState.active = 0;
+  smState.start = -1;
+  smState.end = -1;
+  const box = document.getElementById('skillMention');
+  if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+}
+
+// 返回 true 表示按键已被选择器消费（调用方不再处理）。
+function smKeydown(e) {
+  if (!smState.open || !smState.items.length) return false;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    smState.active = (smState.active + 1) % smState.items.length;
+    smRefreshActive();
+    return true;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    smState.active = (smState.active - 1 + smState.items.length) % smState.items.length;
+    smRefreshActive();
+    return true;
+  }
+  // IME 组合中的 Enter 是确认候选词，不是"选用技能"
+  if ((e.key === 'Enter' || e.key === 'Tab') && !e.isComposing) {
+    e.preventDefault();
+    smSelect(smState.active);
+    return true;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSkillMention();
+    return true;
+  }
+  return false;
 }
 
 // Incremental render: reuse existing nodes by data-id, only update changed bits.
@@ -594,6 +749,7 @@ function renderTaskList() {
 function renderAsk(taskId, question, options) {
   const card = document.createElement('div');
   card.className = 'msg-ask';
+  card.dataset.taskId = taskId || '';
 
   const q = document.createElement('div');
   q.className = 'ask-question';
@@ -660,6 +816,21 @@ function renderAsk(taskId, question, options) {
 
   insertCardBeforeResult(card);
   input.focus();
+}
+
+// ask 超时（服务端 ask_timeout 事件）：该任务已按默认假设继续，未回答的
+// ask 卡置为失效态——移除输入控件并提示，避免用户对着无人接收的输入框回复。
+function expireAskCard(taskId) {
+  const cards = document.querySelectorAll('.msg-ask:not(.answered):not(.expired)');
+  for (const card of cards) {
+    if (taskId && card.dataset.taskId && card.dataset.taskId !== taskId) continue;
+    card.querySelectorAll('button, input').forEach(el => el.remove());
+    const note = document.createElement('div');
+    note.className = 'ask-expired-note';
+    note.textContent = '⏱ 等待超时——任务已按默认假设继续执行，此问题不再等待回答。';
+    card.appendChild(note);
+    card.classList.add('expired');
+  }
 }
 
 function makeTaskNode(id, t, title, isActive) {
@@ -1227,6 +1398,9 @@ function finishStream(taskId, files) {
 }
 function finishStreamError(message) {
   isStreaming = false;
+  // 失败同样是"运行结束"：不复位 isRunning 会让下一次 sendMessage 走
+  // 转向分支，新任务被吞成给已死任务的 steer（live：E2E 第二轮复现）。
+  isRunning = false;
   const cancelBtn = document.getElementById('btnCancel');
   if (cancelBtn) cancelBtn.classList.remove('show');
   document.getElementById('btnSend').disabled = false;
@@ -1491,10 +1665,10 @@ function showStageOutput(stage, summary) {
 // debate（正方 vs 反方 → 裁判）
 let currentMode = 'workflow';
 const MODE_PLACEHOLDERS = {
-  workflow: 'Ask anything...',
-  loop: 'Loop pipeline: 迭代 explore→plan→dispatch→evaluate→repair',
-  debate: '辩论模式：输入议题，正方 vs 反方 → 裁判...',
-  research: '科研管线：输入疾病/研究问题，文献→知识图谱→致病机理假说→辩论→验证计划→数据分析 notebook',
+  workflow: 'Ask anything...（输入 # 选择技能）',
+  loop: 'Loop pipeline：迭代 explore→plan→dispatch→evaluate→repair（输入 # 选择技能）',
+  debate: '辩论模式：输入议题，正方 vs 反方 → 裁判...（输入 # 选择技能）',
+  research: '科研管线：输入疾病/研究问题，文献→知识图谱→致病机理假说→辩论→验证计划→数据分析 notebook（输入 # 选择技能）',
 };
 
 const MODE_LABELS = {
@@ -1553,6 +1727,11 @@ function sendMessage() {
   // Unknown values fall through to the workflow default on the server.
   payload.mode = currentMode;
   if (currentTaskId) payload.task_id = currentTaskId;
+  // 输入文本里手打的 "#技能名"（未经过选择器转 chip）在发送时同样生效：
+  // 与技能名精确匹配才纳入，避免把普通 # 标签误当技能。
+  for (const m of text.matchAll(/#([A-Za-z0-9_.\-]+)/g)) {
+    if (skills.some(s => s.name === m[1])) selectedSkills.add(m[1]);
+  }
   if (selectedSkills.size > 0) payload.skills = [...selectedSkills];
   // 用户指定的执行智能体（自定义角色 role_key；空 = 自动分配）。
   const agentSel = document.getElementById('agentSelect');
@@ -1563,7 +1742,9 @@ function sendMessage() {
   autoResize(input);
 }
 function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  // "#" 技能选择器优先消费导航/确认/关闭键
+  if (smKeydown(e)) return;
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); }
 }
 
 // ── File Upload ──
@@ -1603,7 +1784,18 @@ document.addEventListener('drop', async (e) => {
 
 // ── Auto-resize ──
 const inputEl = document.getElementById('input');
-inputEl.addEventListener('input', () => autoResize(inputEl));
+inputEl.addEventListener('input', () => { autoResize(inputEl); updateSkillMention(); });
+// 光标在 #token 内左右移动时同步浮层状态
+inputEl.addEventListener('keyup', (e) => {
+  if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateSkillMention();
+});
+// 点击输入框其他位置：落在 token 内则重新唤出，否则收起
+inputEl.addEventListener('click', () => updateSkillMention());
+inputEl.addEventListener('blur', () => setTimeout(() => {
+  // onmousedown 已 preventDefault，正常选用不触发 blur；点击页面其他处收起
+  if (!smState.open) return;
+  closeSkillMention();
+}, 150));
 function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 200) + 'px'; }
 
 // ── Right panel: tabs ──
@@ -3704,7 +3896,7 @@ async function viewSkill(name) {
               <div class="card-title">${escHtml(data.name)}
                 ${data.custom ? '<span class="status-tag muted">导入</span>' : '<span class="status-tag muted">内置</span>'}
               </div>
-              <div class="card-sub">${escHtml(data.description || '')}</div>
+              <div class="card-sub">${escHtml(data.description_zh || data.description || '')}</div>
             </div>
             <div class="card-actions">
               <button class="btn-action" onclick="toggleSkill('${escHtml(data.name)}'); closeSkillModal(); renderSkillList(); renderSkillChips();">${selectedSkills.has(data.name) ? '取消选用' : '选用'}</button>

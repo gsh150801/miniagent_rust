@@ -36,6 +36,21 @@ static INDEX_HTML: &str = include_str!("static/index.html");
 static STYLES_CSS: &str = include_str!("static/styles.css");
 static APP_JS: &str = include_str!("static/app.js");
 static MARKED_JS: &str = include_str!("static/marked.min.js");
+static SKILLS_ZH: &str = include_str!("static/skills_zh.json");
+
+/// 内置技能的中文介绍目录（name → 一句话介绍）。自定义/未收录技能回退
+/// 英文 description。`include_str!` 内嵌，进程内只解析一次。
+fn skills_zh_catalog() -> &'static serde_json::Map<String, serde_json::Value> {
+    static CATALOG: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>> =
+        std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str(SKILLS_ZH)
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "skills_zh.json parse failed — falling back to English-only");
+                serde_json::Map::new()
+            })
+    })
+}
 
 // ── Router ──
 
@@ -160,9 +175,14 @@ async fn skills_handler() -> Json<Vec<serde_json::Value>> {
 
     let skills: Vec<serde_json::Value> = bundles.iter().map(|b| {
         let custom = is_user_skill(&b.file_path);
+        let description_zh = skills_zh_catalog()
+            .get(&b.metadata.name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         serde_json::json!({
             "name": b.metadata.name,
             "description": b.metadata.description,
+            "description_zh": description_zh,
             "triggers": b.metadata.triggers,
             "tags": b.metadata.tags,
             "tools_needed": b.metadata.tools_needed,
@@ -1223,16 +1243,18 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     let handle = tokio::spawn(async move {
                         match mode.as_str() {
                             "debate" => {
-                                // 辩论模式：正方 vs 反方 → 裁判（角色模型来自 ⚙️ 设置）
-                                let _ = handle_debate_run(&sink2, &state2, req.prompt, task_id).await;
+                                // 辩论模式：正方 vs 反方 → 裁判（角色模型来自 ⚙️ 设置）。
+                                // 无 ForcedDirectives 通道——技能/智能体指令块拼入 prompt。
+                                let _ = handle_debate_run(&sink2, &state2, append_forced_directives(req.prompt, &forced), task_id).await;
                             }
                             "loop" | "loop_pipeline" | "loop-pipeline" => {
                                 // Loop pipeline: 迭代 Explore→Plan→Dispatch→Evaluate→Repair
                                 let _ = handle_run_loop(&sink2, &state2, req.prompt, task_id, forced).await;
                             }
                             "research" => {
-                                // Research pipeline: 文献→KG→致病机理假说→辩论→验证计划→数据分析 notebook
-                                let _ = handle_research_run(&sink2, &state2, req.prompt, task_id).await;
+                                // Research pipeline: 文献→KG→致病机理假说→辩论→验证计划→数据分析 notebook。
+                                // 技能/智能体指令块拼入 prompt（各阶段的 loop 子任务据此注入技能正文）。
+                                let _ = handle_research_run(&sink2, &state2, append_forced_directives(req.prompt, &forced), task_id).await;
                             }
                             _ => {
                                 // 默认：单智能体 ReAct + 计划 + 反馈（workflow 路径）
@@ -2225,6 +2247,13 @@ async fn ask_user(
         _ => {
             state.asks.remove(task_id);
             tracing::error!(task_id = task_id, "ask timed out or sender dropped");
+            // 通知前端把 ask 卡置为失效态：任务已按默认假设继续，
+            // 输入框再回复也无人接收（live：卡片永久挂着可交互输入）。
+            let _ = ws_send(socket, serde_json::json!({
+                "type": "ask_timeout",
+                "task_id": task_id,
+                "question": question,
+            })).await;
             (String::new(), false)
         }
     };
@@ -4364,7 +4393,7 @@ async fn memory_mode_handler(
 }
 
 async fn memory_mode_set_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     use miniagent_agent::compaction::{set_runtime_override, MemoryMode};
@@ -4863,6 +4892,10 @@ async fn skill_detail_handler(Path(name): Path<String>) -> Response {
     Json(serde_json::json!({
         "name": bundle.metadata.name,
         "description": bundle.metadata.description,
+        "description_zh": skills_zh_catalog()
+            .get(&bundle.metadata.name)
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
         "triggers": bundle.metadata.triggers,
         "tools_needed": bundle.metadata.tools_needed,
         "priority": bundle.metadata.priority,
@@ -4926,6 +4959,23 @@ fn absolute_skill_dir(file_path: &str) -> PathBuf {
 }
 
 // ── 指定智能体/技能 → workflow 模式指令块 ────────────────────────
+
+/// research/debate 模式的 ForcedDirectives 等价物：指令块追加到 prompt 末尾
+/// （这两条路径没有 loop 的确定性注入通道；块有清晰边界标记，避免污染
+/// research 需求抽取对 prompt 主体语义的解读）。
+fn append_forced_directives(
+    prompt: String,
+    forced: &miniagent_loop_pipeline::types::ForcedDirectives,
+) -> String {
+    let block = build_agent_directive_block(forced.agent.as_deref(), &forced.skills);
+    if block.is_empty() {
+        prompt
+    } else {
+        format!(
+            "{prompt}\n\n---\n（以下为用户指定的执行要求，与上面任务主体分离，不改变主体语义。）{block}"
+        )
+    }
+}
 
 /// 构建"指定智能体 + 指定技能"指令块（workflow 单智能体路径用：拼入
 /// prompt）。loop 模式不走这里（ForcedDirectives 确定性生效）。

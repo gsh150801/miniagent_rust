@@ -153,6 +153,34 @@ impl Agent {
         self.memory.as_deref()
     }
 
+    /// 429 限流退避重试耗尽后的跨厂商热切换：用配置里其他厂商族
+    /// （DeepSeek → StepFun → MiniMax，跳过已被 401/402/403 熔断的族）
+    /// 替换 flash+pro 路由。返回切换到的族名；无配置/无可回退族返回
+    /// None（调用方按原错误失败）。共享同一 Agent 的并发调用方随后
+    /// 的请求自动走新厂商。
+    fn swap_to_fallback_family(&self, reason: &str) -> Option<&'static str> {
+        let config = self.config.clone()?;
+        let names = miniagent_provider::factory::codegen_fallback_family_names(&config);
+        let mut chain = miniagent_provider::factory::codegen_fallback_providers(&config);
+        if chain.is_empty() || names.is_empty() {
+            return None;
+        }
+        let fallback = chain.remove(0);
+        let name = names[0];
+        let fallback: std::sync::Arc<dyn LlmProvider> = fallback.into();
+        *self.provider_router.write().unwrap() =
+            miniagent_provider::router::ProviderRouter::new_arc(
+                std::sync::Arc::clone(&fallback),
+                fallback,
+            );
+        tracing::warn!(
+            from = %reason.chars().take(120).collect::<String>(),
+            to = %name,
+            "rate-limit retries exhausted — hot-swapped provider family"
+        );
+        Some(name)
+    }
+
     pub fn tool_executor(&self) -> Option<std::sync::MutexGuard<'_, Option<Arc<ToolExecutor>>>> {
         self.tool_executor.lock().ok()
     }
@@ -361,6 +389,10 @@ impl Agent {
         let mut last_delta = None;
         let mut consecutive_errors: usize = 0;
         let mut pairing_retries: u32 = 0;
+        // 429 退避重试耗尽后允许跨厂商热切换（最多 2 次：DeepSeek → StepFun
+        // 链上某族可能 402/403 账户级不可用，熔断后继续切下一族）。
+        let mut failover_attempts: u32 = 0;
+        let mut failover_family: Option<&'static str> = None;
 
         // transcript 修复：循环开始前做双向配对修复（孤立 tool_use 补合成
         // 结果且紧邻插入；孤立/重复 tool result 丢弃——后者是 MiniMax 400
@@ -406,6 +438,34 @@ impl Agent {
                                     "transient LLM error, retrying with backoff"
                                 );
                                 tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            // 429 类限流重试耗尽 → 跨厂商热切换再试
+                            //（live：MiniMax 持续 429 数分钟，2/4/8s 退避全灭，
+                            // evaluate 阶段整轮中止。切换 DeepSeek/StepFun 恢复）。
+                            let is_rate_limited = err_str.contains("429")
+                                || err_str.contains("rate limit")
+                                || err_str.contains("overloaded");
+                            // 账户级错误（401/402/403）只对"热切换到的族"继续
+                            // 换链：原族配置错误不该由 fallback 掩盖。
+                            // StepFun 的"无订阅"是 400 但语义同账户不可用。
+                            let is_account_error = err_str.contains("401")
+                                || err_str.contains("402")
+                                || err_str.contains("403")
+                                || err_str.contains("Insufficient")
+                                || err_str.contains("Payment Required")
+                                || err_str.contains("no active step plan subscription");
+                            if is_account_error
+                                && let Some(family) = failover_family {
+                                // 当前回退族账户不可用 → 熔断，换下一族
+                                miniagent_provider::factory::ban_family_by_name(family, &err_str);
+                            }
+                            if (is_rate_limited || (is_account_error && failover_family.is_some()))
+                                && failover_attempts < 2
+                                && let Some(family) = self.swap_to_fallback_family(&err_str) {
+                                failover_attempts += 1;
+                                failover_family = Some(family);
+                                retry_count = 0; // 新厂商给满重试预算
                                 continue;
                             }
                             // tool 配对违例（MiniMax 2013 / OpenAI 严格校验）：

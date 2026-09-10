@@ -156,6 +156,31 @@ pub fn codegen_fallback_providers(config: &AppConfig) -> Vec<Box<dyn LlmProvider
     out
 }
 
+/// 与 [`codegen_fallback_providers`] 相同的族选择顺序，只返回族名
+/// （供热切换日志标识目标厂商，不构建客户端）。
+pub fn codegen_fallback_family_names(config: &AppConfig) -> Vec<&'static str> {
+    let active = if config.is_stepfun() {
+        CodegenFamily::StepFun
+    } else if config.is_minimax() {
+        CodegenFamily::MiniMax
+    } else {
+        CodegenFamily::DeepSeek
+    };
+    let available = [
+        config.deepseek_api_key.is_some(),
+        config.stepfun_api_key.is_some(),
+        config.minimax_api_key.is_some(),
+    ];
+    fallback_chain(active, available)
+        .into_iter()
+        .map(|f| match f {
+            CodegenFamily::DeepSeek => "deepseek",
+            CodegenFamily::StepFun => "stepfun",
+            CodegenFamily::MiniMax => "minimax",
+        })
+        .collect()
+}
+
 /// Vendor families usable for cross-family code generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodegenFamily {
@@ -202,6 +227,19 @@ pub fn ban_family(family: CodegenFamily, reason: &str) {
 pub fn is_family_banned(family: CodegenFamily) -> bool {
     use std::sync::atomic::Ordering;
     FAMILY_BANS.load(Ordering::SeqCst) & family_bit(family) != 0
+}
+
+/// 按族名（"deepseek" | "stepfun" | "minimax"）熔断。热切换路径只有
+/// 族名字符串（来自 codegen_fallback_family_names），不想在 agent 侧
+/// 再暴露枚举转换。未知名字静默忽略。
+pub fn ban_family_by_name(name: &str, reason: &str) {
+    let family = match name {
+        "deepseek" => CodegenFamily::DeepSeek,
+        "stepfun" => CodegenFamily::StepFun,
+        "minimax" => CodegenFamily::MiniMax,
+        _ => return,
+    };
+    ban_family(family, reason);
 }
 
 /// True when the HTTP status is an account-level failure that will not

@@ -1211,16 +1211,6 @@ Output ONLY valid JSON (no markdown fences):
   "ops": [{{"op":"merge|drop|revise","targets":["<uuid>"],"statement":"...","mechanism":"...","confidence":0.0,"rationale":"..."}}]
 }}"#
         );
-        let request = CompletionRequest {
-            system: "You are a precise debate chair. Output ONLY valid JSON.".into(),
-            messages: vec![Message::user(&prompt)],
-            tools: vec![],
-            config: miniagent_core::config::InferenceConfig {
-                temperature: Some(0.1),
-                max_tokens: Some(4_000),
-                ..Default::default()
-            },
-        };
         let Ok(resp) = complete_json_with_retry(
             self.judge.as_ref(),
             "You are a precise debate chair. Output ONLY valid JSON.",
